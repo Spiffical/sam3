@@ -165,6 +165,9 @@ various types of prompts:
   : Shows a few examples from SA-Co image evaluation set.
 - [`saco_veval_vis_example.ipynb`](examples/saco_veval_vis_example.ipynb) :
   Shows a few examples from SA-Co video evaluation set.
+- [`sam3_gradio_video_ui.py`](examples/sam3_gradio_video_ui.py):
+  Simple Gradio UI for uploading MP4 videos or JPEG frame folders, adding point
+  prompts, and propagating masklets across a clip.
 
 There are additional notebooks in the examples directory that demonstrate how to
 use SAM 3 for interactive instance segmentation in images and videos (SAM 1/2
@@ -180,6 +183,26 @@ pip install -e ".[notebooks]"
 # Start Jupyter notebook
 jupyter notebook examples/sam3_image_predictor_example.ipynb
 ```
+
+### Gradio-based interactive video UI
+
+If you prefer a lightweight frontend for underwater (or any) videos, you can
+launch the Gradio helper:
+
+```bash
+pip install -e ".[frontend]"
+python examples/sam3_gradio_video_ui.py --gpus 0 --port 7860
+```
+
+The UI lets you upload either an MP4 clip or a folder of JPEG frames, click on
+objects with positive/negative prompts, and propagate the resulting masklets
+throughout the video. Follow the same lifecycle used in the notebooks:
+
+1. **Start session** before adding prompts (each session is tied to one video).
+2. Use **Reset session** to clear prompts, and **Propagate video** to stream
+   masks across the clip.
+3. Always **Close session** before switching videos, and hit **Shutdown
+   predictor** once you're finished so the multi-GPU pool is released.
 
 ## Model
 

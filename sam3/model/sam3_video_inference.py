@@ -1040,7 +1040,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
 
         # if fetch just return from output
         if propagation_type == "propagation_fetch":
-            for frame_idx in tqdm(processing_order):
+            for frame_idx in processing_order:
                 if self.rank == 0:
                     obj_id_to_mask = inference_state["cached_frame_outputs"].get(
                         frame_idx, {}
@@ -1081,7 +1081,7 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     tracker_state, run_mem_encoder=True
                 )
 
-        for frame_idx in tqdm(processing_order):
+        for frame_idx in processing_order:
             # run Tracker propagation
             if propagation_type == "propagation_partial":
                 self._prepare_backbone_feats(inference_state, frame_idx, reverse)

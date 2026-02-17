@@ -458,12 +458,35 @@ class Attention(nn.Module):
 
         self.register_buffer("freqs_cis", freqs_cis)
 
-    def _apply_rope(self, q, k) -> Tuple[Tensor, Tensor]:
+    def _apply_rope(self, q: Tensor, k: Tensor, shape: Tuple[int, int]) -> Tuple[Tensor, Tensor]:
         if not self.use_rope:
             return q, k
 
         assert self.freqs_cis is not None
-        return apply_rotary_enc(q, k, freqs_cis=self.freqs_cis)
+        freqs_cis = self.freqs_cis
+        H, W = shape
+        if freqs_cis.shape[0] != H * W:
+            # recompute freqs_cis if shape does not match
+            scale_pos = 1.0
+            if self.rope_interp:
+                scale_pos = self.rope_pt_size[0] / H
+
+            freqs_cis = self.compute_cis(
+                end_x=W,
+                end_y=H,
+                scale_pos=scale_pos
+            ).to(q.device)
+
+            if self.cls_token:
+                t = torch.zeros(
+                    self.head_dim // 2,
+                    dtype=torch.float32,
+                    device=freqs_cis.device,
+                )
+                cls_freqs_cis = torch.polar(torch.ones_like(t), t)[None, :]
+                freqs_cis = torch.cat([cls_freqs_cis, freqs_cis], dim=0)
+
+        return apply_rotary_enc(q, k, freqs_cis=freqs_cis)
 
     def forward(self, x: Tensor) -> Tensor:
         s = 1 if self.cls_token else 0  # used to exclude cls_token
@@ -484,7 +507,7 @@ class Attention(nn.Module):
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
 
         # handle rope and rel pos embeddings
-        q, k = self._apply_rope(q, k)
+        q, k = self._apply_rope(q, k, (int(H), int(W)))
         if self.use_rel_pos:
             q, k = concat_rel_pos(
                 q.flatten(0, 1),
