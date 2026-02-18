@@ -212,17 +212,63 @@ def load_video_frames_from_video_file(
     compute_device=torch.device("cuda"),
 ):
     """Load the video frames from a video file."""
-    import decord
 
     img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
-    # Get the original video height and width
-    decord.bridge.set_bridge("torch")
-    video_height, video_width, _ = decord.VideoReader(video_path).next().shape
-    # Iterate over all frames in the video
+
     images = []
-    for frame in decord.VideoReader(video_path, width=image_size, height=image_size):
-        images.append(frame.permute(2, 0, 1))
+    video_height = None
+    video_width = None
+    decord_error = None
+    try:
+        import decord
+
+        # Get the original video height and width
+        decord.bridge.set_bridge("torch")
+        video_height, video_width, _ = decord.VideoReader(video_path).next().shape
+        # Iterate over all frames in the video
+        for frame in decord.VideoReader(video_path, width=image_size, height=image_size):
+            images.append(frame.permute(2, 0, 1))
+    except Exception as exc:
+        decord_error = exc
+
+    if not images:
+        # Fallback for environments without decord wheels (e.g., some HPC stacks).
+        import cv2
+        import numpy as np
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            if decord_error is not None:
+                raise RuntimeError(
+                    f"Could not open video '{video_path}' with decord ({decord_error}) "
+                    "or OpenCV."
+                )
+            raise RuntimeError(f"Could not open video '{video_path}' with OpenCV.")
+
+        video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_rgb = cv2.resize(
+                frame_rgb,
+                (image_size, image_size),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            frame_t = torch.from_numpy(np.ascontiguousarray(frame_rgb)).permute(2, 0, 1)
+            images.append(frame_t)
+        cap.release()
+
+    if not images:
+        if decord_error is not None:
+            raise RuntimeError(
+                f"Failed to decode any frames from '{video_path}'. "
+                f"decord error: {decord_error}"
+            )
+        raise RuntimeError(f"Failed to decode any frames from '{video_path}'.")
 
     images = torch.stack(images, dim=0).float() / 255.0
     if not offload_video_to_cpu:
