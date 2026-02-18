@@ -3,7 +3,6 @@
 
 #SBATCH --job-name=sam3_nibi_array
 #SBATCH --account=rpp-kmoran
-#SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=h100:4
 #SBATCH --cpus-per-task=16
@@ -57,9 +56,15 @@ if [[ ! -d "$VENV_PATH" ]]; then
 fi
 source "$VENV_PATH/bin/activate"
 
-export HF_HOME="${HF_HOME:-$PROJECT_CACHE_ROOT}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$PROJECT_CACHE_ROOT}"
-mkdir -p "$HF_HOME" "$TRANSFORMERS_CACHE"
+export HF_HOME="${HF_HOME:-$PROJECT_CACHE_ROOT/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$PROJECT_CACHE_ROOT/hub}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HUB_CACHE}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$PROJECT_CACHE_ROOT/transformers}"
+export TORCH_HOME="${TORCH_HOME:-$PROJECT_CACHE_ROOT/torch}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$PROJECT_CACHE_ROOT/xdg}"
+export TMPDIR="${TMPDIR:-${SLURM_TMPDIR:-$PROJECT_CACHE_ROOT/tmp}}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 
 VIDEOS_MANIFEST="${VIDEOS_MANIFEST:-nibi_model_compare/videos_manifest.txt}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
