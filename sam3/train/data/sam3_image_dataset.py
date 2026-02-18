@@ -17,7 +17,6 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import torch
 import torch.utils.data
 import torchvision
-from decord import cpu, VideoReader
 from iopath.common.file_io import g_pathmgr
 from PIL import Image as PILImage
 from PIL.Image import DecompressionBombError
@@ -25,6 +24,12 @@ from sam3.model.box_ops import box_xywh_to_xyxy
 from torchvision.datasets.vision import VisionDataset
 
 from .coco_json_loaders import COCO_FROM_JSON
+
+try:
+    from decord import cpu, VideoReader
+except ImportError:
+    cpu = None
+    VideoReader = None
 
 
 @dataclass
@@ -202,6 +207,11 @@ class CustomCocoDetectionAPI(VisionDataset):
             try:
                 if ".mp4" in path and path[-4:] == ".mp4":
                     # Going to load a video frame
+                    if VideoReader is None or cpu is None:
+                        raise RuntimeError(
+                            "decord is required to read mp4@frame dataset entries. "
+                            "Install decord or avoid mp4-backed dataset samples in this path."
+                        )
                     video_path, frame = path.split("@")
                     video = VideoReader(video_path, ctx=cpu(0))
                     # Convert to PIL image
