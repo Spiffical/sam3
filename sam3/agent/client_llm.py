@@ -4,6 +4,7 @@
 
 import base64
 import os
+import re
 from typing import Any, Optional
 
 from openai import OpenAI
@@ -105,26 +106,60 @@ def send_generate_request(
     # Create OpenAI client with custom base URL
     client = OpenAI(api_key=api_key, base_url=server_url)
 
-    try:
-        print(f"🔍 Calling model {model}...")
-        response = client.chat.completions.create(
-            model=model,
-            messages=processed_messages,
-            max_completion_tokens=max_tokens,
-            n=1,
-        )
-        # print(f"Received response: {response.choices[0].message}")
+    def _next_token_budget_from_error(error_text: str, current_budget: int) -> Optional[int]:
+        """
+        Parse vLLM/OpenAI-compatible context-window errors and compute a safer retry budget.
+        Expected fragment:
+          "You passed 4097 input tokens and requested 4096 output tokens... context length is only 8192..."
+        """
+        if "input tokens" not in error_text or "context length" not in error_text:
+            return None
 
-        # Extract the response content
-        if response.choices and len(response.choices) > 0:
-            return response.choices[0].message.content
-        else:
+        input_match = re.search(r"passed\s+(\d+)\s+input tokens", error_text)
+        context_match = re.search(r"context length is only\s+(\d+)\s+tokens", error_text)
+        if not input_match or not context_match:
+            return None
+
+        input_tokens = int(input_match.group(1))
+        context_tokens = int(context_match.group(1))
+        # Keep a small safety margin so follow-up/tool formatting does not hit the edge.
+        safe_budget = max(context_tokens - input_tokens - 64, 64)
+        if safe_budget >= current_budget:
+            return None
+        return safe_budget
+
+    budget = max_tokens
+    # Retry a few times only for context-budget errors.
+    for _attempt in range(4):
+        try:
+            print(f"🔍 Calling model {model}...")
+            response = client.chat.completions.create(
+                model=model,
+                messages=processed_messages,
+                max_completion_tokens=budget,
+                n=1,
+            )
+
+            if response.choices and len(response.choices) > 0:
+                return response.choices[0].message.content
+
             print(f"Unexpected response format: {response}")
             return None
 
-    except Exception as e:
-        print(f"Request failed: {e}")
-        return None
+        except Exception as e:
+            error_text = str(e)
+            next_budget = _next_token_budget_from_error(error_text, budget)
+            if next_budget is None:
+                print(f"Request failed: {e}")
+                return None
+            print(
+                "Request exceeded context budget. "
+                f"Retrying with max_completion_tokens={next_budget}."
+            )
+            budget = next_budget
+
+    print("Request failed after retries due to repeated context budget errors.")
+    return None
 
 
 def send_direct_request(
