@@ -16,9 +16,15 @@ from .state_manager import (
 )
 from .video_loader import _load_frames, _copy_frame_uploads
 from .assets import PLAYER_HTML, PLAYER_JS
-from .bioclip_utils import classify_crops
+try:
+    from .bioclip_utils import classify_crops
+except Exception:
+    classify_crops = None
 
 def on_run_bioclip(state_dict: Dict, candidates_str: str):
+    if classify_crops is None:
+         return state_dict, "BioCLIP is not installed in this environment."
+
     if state_dict is None or state_dict["session_id"] is None:
          raise gr.Error("No active session.")
     
