@@ -17,6 +17,11 @@ from functools import partial
 from typing import Any
 
 try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+try:
     import cv2
 except ImportError:
     cv2 = None
@@ -40,6 +45,8 @@ except ImportError:
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
+if load_dotenv is not None:
+    load_dotenv(os.path.join(REPO_ROOT, ".env"))
 
 def find_bpe_path() -> str:
     env_path = os.environ.get("SAM3_BPE_PATH")

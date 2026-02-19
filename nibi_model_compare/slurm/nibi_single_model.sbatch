@@ -41,6 +41,21 @@ LOG_ROOT="/home/$USER/sam3/logs"
 mkdir -p "$LOG_ROOT" "$PROJECT_ROOT" "$PROJECT_CACHE_ROOT"
 cd "$REPO_ROOT"
 
+ENV_FILE="${ENV_FILE:-$REPO_ROOT/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+if [[ -n "${HF_TOKEN:-}" && -z "${HUGGINGFACE_HUB_TOKEN:-}" ]]; then
+  export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+fi
+if [[ -n "${HUGGINGFACE_HUB_TOKEN:-}" && -z "${HF_TOKEN:-}" ]]; then
+  export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"
+fi
+
 echo "=== Cluster sanity ==="
 sinfo -o "%P %D %G %m %l" | head -n 30 || true
 
