@@ -2,7 +2,6 @@
 from __future__ import annotations
 import threading
 import torch
-import gradio as gr
 from contextlib import nullcontext
 from typing import Dict, List, Tuple
 
@@ -10,6 +9,13 @@ from sam3.model_builder import build_sam3_video_predictor
 from .state_manager import _detach_outputs
 import torch.nn.functional as F
 import numpy as np
+
+try:
+    import gradio as gr
+    GradioError = gr.Error
+except Exception:
+    gr = None
+    GradioError = RuntimeError
 
 def matrix_nms(masks_binary: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.7) -> torch.Tensor:
     """
@@ -104,7 +110,7 @@ class PredictorBackend:
 
     def _guard(self):
         if self._is_shutdown:
-            raise gr.Error("Predictor was shut down. Restart the script to use it again.")
+            raise GradioError("Predictor was shut down. Restart the script to use it again.")
 
     def _amp_context(self):
         if self._amp_dtype is None:

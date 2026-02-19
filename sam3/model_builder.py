@@ -3,9 +3,9 @@
 # pyre-unsafe
 
 import os
+from importlib import resources as importlib_resources
 from typing import Optional
 
-import pkg_resources
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
@@ -56,6 +56,17 @@ def _setup_tf32() -> None:
 
 
 _setup_tf32()
+
+
+def _default_bpe_path() -> str:
+    """Resolve packaged BPE vocab path without relying on pkg_resources."""
+    asset_relpath = os.path.join("assets", "bpe_simple_vocab_16e6.txt.gz")
+    try:
+        return str(importlib_resources.files("sam3").joinpath(asset_relpath))
+    except AttributeError:
+        # Python <3.9 compatibility path.
+        with importlib_resources.path("sam3.assets", "bpe_simple_vocab_16e6.txt.gz") as path:
+            return str(path)
 
 
 def _create_position_encoding(precompute_resolution=None):
@@ -583,9 +594,7 @@ def build_sam3_image_model(
         A SAM3 image model
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-        )
+        bpe_path = _default_bpe_path()
 
     # Create visual components
     compile_mode = "default" if compile else None
@@ -672,9 +681,7 @@ def build_sam3_video_model(
         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-        )
+        bpe_path = _default_bpe_path()
 
     # Build Tracker module
     tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
