@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import time
+from importlib import resources as importlib_resources
 from functools import partial
 from typing import Any
 
@@ -41,13 +42,32 @@ if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 
 def find_bpe_path() -> str:
+    env_path = os.environ.get("SAM3_BPE_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
     candidates = [
         os.path.join(REPO_ROOT, "assets/bpe_simple_vocab_16e6.txt.gz"),
+        os.path.join(REPO_ROOT, "sam3/assets/bpe_simple_vocab_16e6.txt.gz"),
         "assets/bpe_simple_vocab_16e6.txt.gz",
+        "sam3/assets/bpe_simple_vocab_16e6.txt.gz",
     ]
     for path in candidates:
         if os.path.exists(path):
             return path
+
+    # Fallback to packaged resource path when installed/editable.
+    try:
+        resource_path = str(
+            importlib_resources.files("sam3").joinpath(
+                "assets/bpe_simple_vocab_16e6.txt.gz"
+            )
+        )
+        if os.path.exists(resource_path):
+            return resource_path
+    except Exception:
+        pass
+
     raise FileNotFoundError(
         f"Could not find bpe_simple_vocab_16e6.txt.gz in: {candidates}"
     )
