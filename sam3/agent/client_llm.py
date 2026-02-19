@@ -3,14 +3,20 @@
 # pyre-unsafe
 
 import base64
+import io
 import os
 import re
 from typing import Any, Optional
 
 from openai import OpenAI
 
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
-def get_image_base64_and_mime(image_path):
+
+def get_image_base64_and_mime(image_path, max_edge: Optional[int] = None):
     """Convert image file to base64 string and get MIME type"""
     try:
         # Get MIME type based on file extension
@@ -25,7 +31,22 @@ def get_image_base64_and_mime(image_path):
         }
         mime_type = mime_types.get(ext, "image/jpeg")  # Default to JPEG
 
-        # Convert image to base64
+        # Optionally downscale large images to reduce multimodal token load.
+        if Image is not None and max_edge and max_edge > 0:
+            with Image.open(image_path) as img:
+                img = img.convert("RGB")
+                width, height = img.size
+                longest = max(width, height)
+                if longest > max_edge:
+                    scale = max_edge / float(longest)
+                    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=90, optimize=True)
+                base64_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return base64_data, "image/jpeg"
+
+        # Default: preserve original bytes.
         with open(image_path, "rb") as image_file:
             base64_data = base64.b64encode(image_file.read()).decode("utf-8")
             return base64_data, mime_type
@@ -54,6 +75,12 @@ def send_generate_request(
         str: The generated response text from the server.
     """
     # Process messages to convert image paths to base64
+    image_detail = os.environ.get("SAM3_IMAGE_DETAIL", "low")
+    try:
+        image_max_edge = int(os.environ.get("SAM3_AGENT_IMAGE_MAX_EDGE", "896"))
+    except ValueError:
+        image_max_edge = 896
+
     processed_messages = []
     for message in messages:
         processed_message = message.copy()
@@ -72,7 +99,8 @@ def send_generate_request(
                     # Read the image file and convert to base64
                     try:
                         base64_image, mime_type = get_image_base64_and_mime(
-                            new_image_path
+                            new_image_path,
+                            max_edge=image_max_edge,
                         )
                         if base64_image is None:
                             print(
@@ -86,7 +114,7 @@ def send_generate_request(
                                 "type": "image_url",
                                 "image_url": {
                                     "url": f"data:{mime_type};base64,{base64_image}",
-                                    "detail": "high",
+                                    "detail": image_detail,
                                 },
                             }
                         )
@@ -112,25 +140,30 @@ def send_generate_request(
         Expected fragment:
           "You passed 4097 input tokens and requested 4096 output tokens... context length is only 8192..."
         """
-        if "input tokens" not in error_text or "context length" not in error_text:
+        if "context length" not in error_text:
             return None
+
+        # Always back off aggressively on context errors.
+        fallback_budget = max(current_budget // 2, 64)
 
         input_match = re.search(r"passed\s+(\d+)\s+input tokens", error_text)
         context_match = re.search(r"context length is only\s+(\d+)\s+tokens", error_text)
         if not input_match or not context_match:
-            return None
+            if fallback_budget >= current_budget:
+                return None
+            return fallback_budget
 
         input_tokens = int(input_match.group(1))
         context_tokens = int(context_match.group(1))
-        # Keep a small safety margin so follow-up/tool formatting does not hit the edge.
-        safe_budget = max(context_tokens - input_tokens - 64, 64)
-        if safe_budget >= current_budget:
+        parsed_budget = max(context_tokens - input_tokens - 64, 64)
+        next_budget = min(parsed_budget, fallback_budget)
+        if next_budget >= current_budget:
             return None
-        return safe_budget
+        return next_budget
 
     budget = max_tokens
     # Retry a few times only for context-budget errors.
-    for _attempt in range(4):
+    for _attempt in range(6):
         try:
             print(f"🔍 Calling model {model}...")
             response = client.chat.completions.create(

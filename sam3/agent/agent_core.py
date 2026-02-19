@@ -5,6 +5,7 @@
 import copy
 import json
 import os
+import re
 
 import cv2
 from PIL import Image
@@ -53,6 +54,116 @@ def count_images(messages):
     return total
 
 
+_ALLOWED_TOOL_NAMES = frozenset(
+    {
+        "segment_phrase",
+        "examine_each_mask",
+        "select_masks_and_return",
+        "report_no_mask",
+    }
+)
+
+
+def _normalize_tool_call_dict(candidate):
+    """Normalize candidate tool-call JSON into {'name': str, 'parameters': dict}."""
+    if not isinstance(candidate, dict):
+        return None
+
+    tool_name = candidate.get("name") or candidate.get("tool_name")
+    if not isinstance(tool_name, str) or tool_name not in _ALLOWED_TOOL_NAMES:
+        return None
+
+    parameters = candidate.get("parameters")
+    if parameters is None and "arguments" in candidate:
+        parameters = candidate.get("arguments")
+    if isinstance(parameters, str):
+        try:
+            parameters = json.loads(parameters)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(parameters, dict):
+        return None
+
+    return {"name": tool_name, "parameters": parameters}
+
+
+def _extract_candidate_json_strings(generated_text):
+    """Extract potential JSON objects from varied tool-call output formats."""
+    candidates = []
+
+    # Canonical format expected by our prompts.
+    for tag in ("tool", "tool_call"):
+        pattern = rf"<{tag}>(.*?)</{tag}>"
+        for match in re.finditer(pattern, generated_text, flags=re.DOTALL):
+            payload = match.group(1).strip()
+            if payload:
+                candidates.append(payload)
+
+    # JSON fenced code blocks.
+    for match in re.finditer(
+        r"```(?:json)?\s*(\{.*?\})\s*```", generated_text, flags=re.DOTALL
+    ):
+        payload = match.group(1).strip()
+        if payload:
+            candidates.append(payload)
+
+    # Any JSON object present in free text.
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(generated_text):
+        if ch != "{":
+            continue
+        try:
+            _, end_idx = decoder.raw_decode(generated_text[i:])
+        except json.JSONDecodeError:
+            continue
+        payload = generated_text[i : i + end_idx].strip()
+        if payload:
+            candidates.append(payload)
+
+    # De-duplicate while preserving order.
+    return list(dict.fromkeys(candidates))
+
+
+def _parse_tool_call_from_generated_text(generated_text):
+    """Parse a tool call from generated text across multiple possible output shapes."""
+    if not generated_text:
+        return None
+
+    for candidate_str in _extract_candidate_json_strings(generated_text):
+        variations = [candidate_str]
+        # Some model outputs include one extra trailing brace.
+        if candidate_str.endswith("}}}"):
+            variations.append(candidate_str[:-1])
+        for item in variations:
+            try:
+                parsed = json.loads(item)
+            except json.JSONDecodeError:
+                continue
+            normalized = _normalize_tool_call_dict(parsed)
+            if normalized is None:
+                continue
+            canonical_text = f"<tool>{json.dumps(normalized, ensure_ascii=False)}</tool>"
+            return normalized, canonical_text
+    return None
+
+
+def _build_tool_format_repair_message(path_to_latest_output_json, initial_text_prompt):
+    if path_to_latest_output_json == "":
+        valid_names = '["segment_phrase", "report_no_mask"]'
+    else:
+        valid_names = (
+            '["segment_phrase", "examine_each_mask", '
+            '"select_masks_and_return", "report_no_mask"]'
+        )
+    return (
+        "Your previous response did not contain a valid tool call JSON. "
+        "Respond with exactly one tool call in this strict format and nothing else: "
+        '<tool>{"name":"TOOL_NAME","parameters":{...}}</tool>. '
+        f"The tool name must be one of: {valid_names}. "
+        f"The original user query is: '{initial_text_prompt}'."
+    )
+
+
 def _prune_messages_for_next_round(
     messages_list,
     used_text_prompts,
@@ -64,8 +175,8 @@ def _prune_messages_for_next_round(
     1) messages[:2] (with optional warning text added to the second message's content)
     2) the latest assistant message (and everything after it) that contains a segment_phrase tool call
     """
-    # There should not be more than 10 messages in the conversation history
-    assert len(messages_list) < 10
+    # Allow some slack for temporary format-repair retries before pruning.
+    assert len(messages_list) <= 20
 
     # Part 1: always keep the first two message JSONs
     part1 = copy.deepcopy(messages_list[:2])
@@ -200,23 +311,56 @@ def agent_inference(
     print("\n\n")
     generated_text = send_generate_request(messages)
     print(f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n")
+    malformed_tool_call_retries = 0
     while generated_text is not None:
         save_debug_messages(messages, debug, debug_folder_path, debug_jsonl_path)
-        assert (
-            "<tool>" in generated_text,
-            f"Generated text does not contain <tool> tag: {generated_text}",
-        )
-        generated_text = generated_text.split("</tool>", 1)[0] + "</tool>"
-        tool_call_json_str = (
-            generated_text.split("<tool>")[-1]
-            .split("</tool>")[0]
-            .strip()
-            .replace(r"}}}", r"}}")  # remove extra } if any
-        )
-        try:
-            tool_call = json.loads(tool_call_json_str)
-        except json.JSONDecodeError:
-            raise ValueError(f"Invalid JSON in tool call: {tool_call_json_str}")
+        parsed_tool_call = _parse_tool_call_from_generated_text(generated_text)
+        if parsed_tool_call is None:
+            malformed_tool_call_retries += 1
+            if malformed_tool_call_retries > 3:
+                raise ValueError(f"Invalid JSON in tool call: {generated_text}")
+
+            print(
+                "⚠️ Invalid tool-call format from model. "
+                f"Requesting a strict-format retry ({malformed_tool_call_retries}/3)."
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": generated_text}],
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": _build_tool_format_repair_message(
+                                PATH_TO_LATEST_OUTPUT_JSON, initial_text_prompt
+                            ),
+                        }
+                    ],
+                }
+            )
+
+            # Keep parse retries bounded within max_generations as well.
+            generation_count += 1
+            if generation_count > max_generations:
+                raise ValueError(
+                    f"Exceeded maximum number of allowed generation requests ({max_generations})"
+                )
+            print("\n\n")
+            print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
+            print("\n\n")
+            generated_text = send_generate_request(messages)
+            print(
+                f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
+            )
+            continue
+
+        malformed_tool_call_retries = 0
+        tool_call, generated_text = parsed_tool_call
 
         if PATH_TO_LATEST_OUTPUT_JSON == "":
             # The first tool call must be segment_phrase or report_no_mask

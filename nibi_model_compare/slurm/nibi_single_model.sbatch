@@ -75,15 +75,24 @@ if [[ ! -d "$VENV_PATH" ]]; then
 fi
 source "$VENV_PATH/bin/activate"
 
-export HF_HOME="${HF_HOME:-$PROJECT_CACHE_ROOT/hf}"
-export HF_HUB_CACHE="${HF_HUB_CACHE:-$PROJECT_CACHE_ROOT/hub}"
+PERSISTENT_CACHE_ROOT="${PERSISTENT_CACHE_ROOT:-$PROJECT_CACHE_ROOT}"
+JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-${SLURM_TMPDIR:-$PROJECT_CACHE_ROOT}/hf-cache}"
+mkdir -p "$PERSISTENT_CACHE_ROOT" "$JOB_CACHE_ROOT"
+
+export HF_HOME="${HF_HOME:-$JOB_CACHE_ROOT/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HUB_CACHE}"
-export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$PROJECT_CACHE_ROOT/transformers}"
-export TORCH_HOME="${TORCH_HOME:-$PROJECT_CACHE_ROOT/torch}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$PROJECT_CACHE_ROOT/xdg}"
-export TMPDIR="${TMPDIR:-${SLURM_TMPDIR:-$PROJECT_CACHE_ROOT/tmp}}"
+export HF_XET_CACHE="${HF_XET_CACHE:-$HF_HOME/xet}"
+export TORCH_HOME="${TORCH_HOME:-$HF_HOME/torch}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HF_HOME/xdg}"
+export TMPDIR="${TMPDIR:-${SLURM_TMPDIR:-$HF_HOME/tmp}}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
-mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+
+if command -v rsync >/dev/null 2>&1; then
+  mkdir -p "$PERSISTENT_CACHE_ROOT/hub"
+  rsync -a --ignore-existing "$PERSISTENT_CACHE_ROOT/hub/" "$HF_HUB_CACHE/" || true
+fi
 
 VIDEO_PATH="${VIDEO_PATH:-/project/rpp-kmoran/merileo/data/onc/pilot.mp4}"
 PROMPT="${PROMPT:-segment all visible marine organisms}"
@@ -163,6 +172,11 @@ python3 nibi_model_compare/summarize_runs.py \
 python3 nibi_model_compare/generate_paste_report.py \
   --summary_csv "$OUT_ROOT/summary.csv" \
   --output_path "$OUT_ROOT/PASTE_TO_CODEX.md"
+
+if command -v rsync >/dev/null 2>&1; then
+  mkdir -p "$PERSISTENT_CACHE_ROOT/hub"
+  rsync -a --ignore-existing "$HF_HUB_CACHE/" "$PERSISTENT_CACHE_ROOT/hub/" || true
+fi
 
 cat > "$OUT_ROOT/README.md" <<EOF
 # SAM3 Nibi Single-Run Output
