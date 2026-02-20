@@ -1,6 +1,8 @@
 
 from __future__ import annotations
+import os
 import threading
+import traceback
 import torch
 from contextlib import nullcontext
 from typing import Dict, List, Tuple
@@ -146,6 +148,14 @@ class PredictorBackend:
 
         # Warm-up: Perform a dummy click to initialize lazy components/compilation
         # This prevents the first user click from being slow.
+        if str(os.environ.get("SAM3_DISABLE_WARMUP", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            print(f"[DEBUG] Warm-up disabled by SAM3_DISABLE_WARMUP for {session_id}.")
+            return session_id
         try:
             print(f"[DEBUG] Warming up session {session_id}...")
             with self._lock:
@@ -174,7 +184,23 @@ class PredictorBackend:
                     )
             print(f"[DEBUG] Warm-up complete for {session_id}.")
         except Exception as e:
-            print(f"[WARNING] Warm-up failed: {e}")
+            # Keep serving even if warm-up fails, but log actionable diagnostics.
+            print(f"[WARNING] Warm-up failed: {type(e).__name__}: {repr(e)}")
+            traceback.print_exc()
+            # Recovery: reset prompt/object state to avoid carrying partial warm-up side effects.
+            try:
+                with self._lock:
+                    with self._amp_context():
+                        self.predictor.handle_request(
+                            request=dict(type="reset_session", session_id=session_id)
+                        )
+                print(f"[DEBUG] Warm-up recovery reset complete for {session_id}.")
+            except Exception as reset_exc:
+                print(
+                    "[WARNING] Warm-up recovery reset failed: "
+                    f"{type(reset_exc).__name__}: {repr(reset_exc)}"
+                )
+                traceback.print_exc()
 
         return session_id
 

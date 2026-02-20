@@ -36,9 +36,10 @@ safe_delete_dir() {
 }
 
 REPO_ROOT="${REPO_ROOT:-$PWD}"
-PROJECT_ROOT="${PROJECT_ROOT:-/project/rpp-kmoran/merileo/sam3}"
-PROJECT_CACHE_ROOT="${PROJECT_CACHE_ROOT:-/project/rpp-kmoran/merileo/hf-cache}"
-LOG_ROOT="/home/$USER/sam3/logs"
+PROJECT_ROOT="${PROJECT_ROOT:-$REPO_ROOT}"
+DEFAULT_PROJECT_PREFIX="${DEFAULT_PROJECT_PREFIX:-/project/${SLURM_ACCOUNT:-${ACCOUNT:-$USER}}/$USER}"
+PROJECT_CACHE_ROOT="${PROJECT_CACHE_ROOT:-$DEFAULT_PROJECT_PREFIX/hf-cache}"
+LOG_ROOT="${LOG_ROOT:-/home/$USER/sam3/logs}"
 mkdir -p "$LOG_ROOT" "$PROJECT_ROOT" "$PROJECT_CACHE_ROOT"
 cd "$REPO_ROOT"
 
@@ -89,11 +90,23 @@ if command -v rsync >/dev/null 2>&1; then
   rsync -a --ignore-existing "$PERSISTENT_CACHE_ROOT/hub/" "$HF_HUB_CACHE/" || true
 fi
 
-VIDEO_PATH="${VIDEO_PATH:-/project/rpp-kmoran/merileo/data/onc/pilot.mp4}"
+VIDEO_PATH="${VIDEO_PATH:-$REPO_ROOT/assets/videos/chinacreekclipped.mp4}"
 PROMPT="${PROMPT:-segment all visible marine organisms}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-397B-A17B}"
 SERVER_PORT="${SERVER_PORT:-8005}"
 export SERVER_PORT
+TP_SIZE="${TP_SIZE:-8}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
+LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-{\"image\":4,\"video\":2}}"
+IMAGE_SIZE="${IMAGE_SIZE:-1024}"
+MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-1024}"
+SAVE_PROMPTS="${SAVE_PROMPTS:-0}"
+DEBUG="${DEBUG:-0}"
+VLLM_CUDA_VISIBLE_DEVICES="${VLLM_CUDA_VISIBLE_DEVICES:-}"
+RUNNER_CUDA_VISIBLE_DEVICES="${RUNNER_CUDA_VISIBLE_DEVICES:-}"
+RUNNER_GPU_IDS="${RUNNER_GPU_IDS:-}"
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 OUT_ROOT="${OUT_ROOT:-$PROJECT_ROOT/runs/qwen35_tp8_${SLURM_JOB_ID}_${RUN_TS}}"
 
@@ -106,16 +119,32 @@ mkdir -p "$STAGE_OUT" "$FINAL_OUT" "$OUT_ROOT"
 
 GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
 GPU_IDS="${GPU_IDS:-$(seq -s, 0 $((GPU_COUNT - 1)))}"
+if [[ -n "$RUNNER_CUDA_VISIBLE_DEVICES" && -z "$RUNNER_GPU_IDS" ]]; then
+  RUNNER_GPU_IDS="0"
+fi
+RUNNER_GPU_IDS="${RUNNER_GPU_IDS:-$GPU_IDS}"
 echo "GPUs detected: $GPU_COUNT ; using $GPU_IDS"
 
-vllm serve "$MODEL_ID" \
-  --tensor-parallel-size 8 \
-  --trust-remote-code \
-  --allowed-local-media-path / \
-  --limit-mm-per-prompt '{"image":4,"video":2}' \
-  --gpu-memory-utilization 0.8 \
-  --max-model-len 32768 \
-  --port "$SERVER_PORT" &
+VLLM_CMD=(
+  vllm serve "$MODEL_ID"
+  --tensor-parallel-size "$TP_SIZE"
+  --trust-remote-code
+  --allowed-local-media-path /
+  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+  --max-model-len "$MAX_MODEL_LEN"
+  --port "$SERVER_PORT"
+)
+if [[ -n "$MAX_NUM_SEQS" ]]; then
+  VLLM_CMD+=(--max-num-seqs "$MAX_NUM_SEQS")
+fi
+if [[ -n "$LIMIT_MM_PER_PROMPT" ]]; then
+  VLLM_CMD+=(--limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT")
+fi
+if [[ -n "$VLLM_CUDA_VISIBLE_DEVICES" ]]; then
+  CUDA_VISIBLE_DEVICES="$VLLM_CUDA_VISIBLE_DEVICES" "${VLLM_CMD[@]}" &
+else
+  "${VLLM_CMD[@]}" &
+fi
 VLLM_PID=$!
 
 cleanup() {
@@ -144,13 +173,28 @@ else:
     raise RuntimeError(f"Timed out waiting for {url}")
 PY
 
-python3 nibi_model_compare/run_video_agent_openai.py \
-  --video_path "$VIDEO_PATH" \
-  --prompt "$PROMPT" \
-  --server_url "http://127.0.0.1:${SERVER_PORT}/v1" \
-  --model "$MODEL_ID" \
-  --output_dir "$STAGE_OUT" \
-  --gpus "$GPU_IDS"
+RUN_CMD=(
+  python3 nibi_model_compare/run_video_agent_openai.py
+  --video_path "$VIDEO_PATH"
+  --prompt "$PROMPT"
+  --server_url "http://127.0.0.1:${SERVER_PORT}/v1"
+  --model "$MODEL_ID"
+  --output_dir "$STAGE_OUT"
+  --gpus "$RUNNER_GPU_IDS"
+  --image_size "$IMAGE_SIZE"
+  --max_completion_tokens "$MAX_COMPLETION_TOKENS"
+)
+if [[ "$SAVE_PROMPTS" == "1" ]]; then
+  RUN_CMD+=(--save_prompts)
+fi
+if [[ "$DEBUG" == "1" ]]; then
+  RUN_CMD+=(--debug)
+fi
+if [[ -n "$RUNNER_CUDA_VISIBLE_DEVICES" ]]; then
+  CUDA_VISIBLE_DEVICES="$RUNNER_CUDA_VISIBLE_DEVICES" "${RUN_CMD[@]}"
+else
+  "${RUN_CMD[@]}"
+fi
 
 cp -a "$STAGE_OUT/." "$FINAL_OUT/"
 

@@ -18,6 +18,7 @@ It is designed for:
 - `slurm/nibi_single_model.sbatch`: template for one model + one video.
 - `slurm/nibi_matrix_array.sbatch`: template for job arrays over video list.
 - `slurm/nibi_qwen35_tp8_candidate.sbatch`: experimental TP8 script for Qwen3.5.
+- `slurm/submit_nibi_job.sh`: CLI wrapper to submit all templates with args.
 - `templates/paste_report_template.md`: manual report skeleton.
 
 ## Why This Layout
@@ -39,7 +40,7 @@ From your Nibi documentation:
 Operational implications for this bundle:
 - Slurm templates use Nibi-style GPU requests (`--gpus-per-node=h100:<N>`), in
   line with your existing `../yolo_segmentation` jobs.
-- Default persistent base path is `/project/rpp-kmoran/merileo`.
+- Cache/output defaults are user-generic; no username is hardcoded.
 - Run outputs should go to `/project`; avoid filling `/home`.
 - Default pilot remains 4 GPUs for practical throughput/cost.
 
@@ -80,19 +81,37 @@ python nibi_model_compare/run_model_matrix.py \
   --gpus 0,1,2,3
 ```
 
-For Slurm templates in `nibi_model_compare/slurm`, defaults now assume:
-- `PROJECT_ROOT=/project/rpp-kmoran/merileo/sam3`
-- `PROJECT_CACHE_ROOT=/project/rpp-kmoran/merileo/hf-cache`
-- Temporary per-job staging in `$SLURM_TMPDIR`
-- `#SBATCH --account=rpp-kmoran`
-- `#SBATCH --partition=gpu`
+3. Submit via Slurm wrapper (all key knobs are CLI args):
 
-3. Review outputs:
+```bash
+bash nibi_model_compare/slurm/submit_nibi_job.sh \
+  --template single \
+  --account <your-account> \
+  --video-path /project/<your-account>/$USER/data/onc/chinacreekclipped.mp4 \
+  --prompt "identify and segment small creatures in the underwater scene" \
+  --gpus-per-node h100:2 \
+  --tp-size 1 \
+  --vllm-cuda-visible-devices 0 \
+  --runner-cuda-visible-devices 1 \
+  --runner-gpu-ids 0 \
+  --max-completion-tokens 512 \
+  --debug
+```
+
+Defaults used by templates/wrapper:
+- `PROJECT_ROOT` defaults to `REPO_ROOT`.
+- `DEFAULT_PROJECT_PREFIX` defaults to `/project/${SLURM_ACCOUNT:-${ACCOUNT:-$USER}}/$USER`.
+- `PROJECT_CACHE_ROOT` defaults to `${DEFAULT_PROJECT_PREFIX}/hf-cache`.
+- Temporary per-job staging is under `$SLURM_TMPDIR` when available.
+- Slurm resources default to the current template profile (`single`, `array`, `tp8`) and can be overridden with CLI args.
+- Any extra env variable can be forwarded with `--set-env KEY=VALUE`.
+
+4. Review outputs:
 - `nibi_model_compare/runs/pilot_01/summary.csv`
 - `nibi_model_compare/runs/pilot_01/summary.md`
 - `nibi_model_compare/runs/pilot_01/PASTE_TO_CODEX.md`
 
-4. Copy and paste `PASTE_TO_CODEX.md` back to Codex for interpretation.
+5. Copy and paste `PASTE_TO_CODEX.md` back to Codex for interpretation.
 
 ## Output Structure
 
@@ -115,7 +134,7 @@ Each model gets one folder under `output_root`:
 
 When using Slurm templates, outputs are written in two phases:
 1. Stage artifacts in `$SLURM_TMPDIR`.
-2. Copy finalized results to `/project/rpp-kmoran/merileo/...`.
+2. Copy finalized results to your configured `OUT_ROOT` (usually under `/project/...`).
 
 ## Sources Used For Planning (Primary)
 

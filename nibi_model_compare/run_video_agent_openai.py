@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from importlib import resources as importlib_resources
 from functools import partial
 from typing import Any
@@ -47,6 +48,64 @@ if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 if load_dotenv is not None:
     load_dotenv(os.path.join(REPO_ROOT, ".env"))
+
+
+def configure_job_cache_defaults() -> None:
+    """Default Hugging Face/PyTorch caches to job-local storage on Slurm."""
+    if os.environ.get("SAM3_DISABLE_AUTO_CACHE_SETUP") == "1":
+        return
+
+    slurm_tmpdir = os.environ.get("SLURM_TMPDIR")
+    if not slurm_tmpdir:
+        return
+
+    # Respect explicit user configuration from environment or .env.
+    if any(
+        os.environ.get(key)
+        for key in (
+            "HF_HOME",
+            "HF_HUB_CACHE",
+            "HUGGINGFACE_HUB_CACHE",
+            "TRANSFORMERS_CACHE",
+            "TORCH_HOME",
+            "XDG_CACHE_HOME",
+        )
+    ):
+        return
+
+    cache_root = os.environ.get(
+        "SAM3_JOB_CACHE_ROOT", os.path.join(slurm_tmpdir, "hf-cache")
+    )
+    hf_home = os.path.join(cache_root, "hf")
+    hf_hub_cache = os.path.join(hf_home, "hub")
+    hf_xet_cache = os.path.join(hf_home, "xet")
+    torch_home = os.path.join(hf_home, "torch")
+    xdg_cache_home = os.path.join(hf_home, "xdg")
+    tmpdir = os.path.join(slurm_tmpdir, "tmp")
+
+    os.environ.setdefault("HF_HOME", hf_home)
+    os.environ.setdefault("HF_HUB_CACHE", hf_hub_cache)
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", hf_hub_cache)
+    os.environ.setdefault("HF_XET_CACHE", hf_xet_cache)
+    os.environ.setdefault("TORCH_HOME", torch_home)
+    os.environ.setdefault("XDG_CACHE_HOME", xdg_cache_home)
+    os.environ.setdefault("TMPDIR", tmpdir)
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.environ.setdefault("TRANSFORMERS_CACHE", hf_hub_cache)
+
+    for path in (
+        os.environ["HF_HOME"],
+        os.environ["HF_HUB_CACHE"],
+        os.environ["HF_XET_CACHE"],
+        os.environ["TORCH_HOME"],
+        os.environ["XDG_CACHE_HOME"],
+        os.environ["TMPDIR"],
+    ):
+        os.makedirs(path, exist_ok=True)
+
+
+configure_job_cache_defaults()
+
 
 def find_bpe_path() -> str:
     env_path = os.environ.get("SAM3_BPE_PATH")
@@ -398,11 +457,17 @@ def run() -> int:
         elif backend is None or session_id is None:
             metrics["status"] = "success_no_propagation"
         else:
-            for output in backend.propagate(
-                {"session_id": session_id, "type": "propagate_in_video"}
-            ):
-                frame_index = int(output["frame_index"])
-                results_by_frame[frame_index] = output["outputs"]
+            try:
+                for output in backend.propagate(
+                    {"session_id": session_id, "type": "propagate_in_video"}
+                ):
+                    frame_index = int(output["frame_index"])
+                    results_by_frame[frame_index] = output["outputs"]
+            except Exception as exc:
+                err_msg = str(exc).strip() or repr(exc) or type(exc).__name__
+                raise RuntimeError(
+                    f"propagate_in_video failed ({type(exc).__name__}): {err_msg}"
+                ) from exc
 
             out_path = os.path.join(args.output_dir, "output_video.mp4")
             cap = cv2.VideoCapture(args.video_path)
@@ -448,9 +513,12 @@ def run() -> int:
 
     except Exception as exc:
         metrics["status"] = "failed"
-        metrics["error"] = str(exc)
+        metrics["error"] = str(exc).strip() or repr(exc) or type(exc).__name__
+        metrics["error_type"] = type(exc).__name__
+        metrics["traceback"] = traceback.format_exc()
         return_code = 1
-        print(f"[error] {exc}")
+        print(f"[error] {metrics['error']}")
+        print(metrics["traceback"])
 
     finally:
         if backend is not None:
