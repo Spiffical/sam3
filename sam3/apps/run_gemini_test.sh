@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # Ensure we are in the root directory if running from there, or handle paths
 # Script location
@@ -11,13 +12,14 @@ echo "Video: assets/videos/chinacreekclipped.mp4"
 
 # Pass first argument as API key if provided, otherwise assume it's in .env or vars
 EXTRA_ARGS=""
-if [ ! -z "$1" ]; then
-    EXTRA_ARGS="--api_key $1"
+if [ -n "${1-}" ]; then
+    EXTRA_ARGS="--api_key ${1}"
 fi
 
 .venv/bin/python sam3/apps/gemini_video_agent.py \
     --video_path assets/videos/chinacreekclipped.mp4 \
     --prompt "Identify and segment small creatures in the underwater scene." \
+    --model "${GEMINI_MODEL:-gemini-2.5-flash}" \
     --output_dir sam3_video_agent_out \
     --save_prompts \
     $EXTRA_ARGS

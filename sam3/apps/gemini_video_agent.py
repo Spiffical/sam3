@@ -2,6 +2,8 @@
 import os
 import argparse
 import json
+from importlib import resources as importlib_resources
+import re
 import cv2
 import torch
 import numpy as np
@@ -14,10 +16,12 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Adjust path to find sam3 if running from root
+# Resolve repo root robustly and keep sam3 importable regardless of cwd.
 import sys
-if os.getcwd() not in sys.path:
-    sys.path.append(os.getcwd())
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.append(REPO_ROOT)
 
 from sam3.agent.agent_core import agent_inference
 from sam3.agent.client_sam3 import sam3_inference, remove_overlapping_masks
@@ -27,6 +31,58 @@ from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.apps.interactive_video.backend import PredictorBackend
 
 # -- Gemini Client Adapter --
+
+
+def find_bpe_path() -> str:
+    env_path = os.environ.get("SAM3_BPE_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
+    candidates = [
+        os.path.join(REPO_ROOT, "assets", "bpe_simple_vocab_16e6.txt.gz"),
+        os.path.join(REPO_ROOT, "sam3", "assets", "bpe_simple_vocab_16e6.txt.gz"),
+        "assets/bpe_simple_vocab_16e6.txt.gz",
+        "sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    # Fallback when installed as package/editable.
+    try:
+        resource_path = str(
+            importlib_resources.files("sam3").joinpath(
+                "assets/bpe_simple_vocab_16e6.txt.gz"
+            )
+        )
+        if os.path.exists(resource_path):
+            return resource_path
+    except Exception:
+        pass
+
+    raise FileNotFoundError(
+        f"Could not find bpe_simple_vocab_16e6.txt.gz in: {candidates}"
+    )
+
+
+def _load_image_for_gemini(img_path: str):
+    """
+    Load image as RGB PIL and optionally downscale to reduce multimodal token load.
+    """
+    with Image.open(img_path) as img:
+        img = img.convert("RGB")
+        try:
+            max_edge = int(os.environ.get("SAM3_GEMINI_IMAGE_MAX_EDGE", "896"))
+        except ValueError:
+            max_edge = 896
+        if max_edge > 0:
+            w, h = img.size
+            longest = max(w, h)
+            if longest > max_edge:
+                scale = max_edge / float(longest)
+                new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+        return img.copy()
 
 def _convert_openai_messages_to_gemini(messages: List[Dict[str, Any]]):
     gemini_history = []
@@ -46,13 +102,24 @@ def _convert_openai_messages_to_gemini(messages: List[Dict[str, Any]]):
             for item in content:
                 if isinstance(item, dict):
                     if item.get("type") == "text":
-                        parts.append(item["text"])
+                        text = item["text"]
+                        # Keep assistant history concise and action-focused to
+                        # reduce prompt ambiguity and token load on later rounds.
+                        if role == "model":
+                            tool_match = re.search(
+                                r"<tool>.*?</tool>", text, flags=re.DOTALL
+                            )
+                            if tool_match:
+                                text = tool_match.group(0)
+                            else:
+                                text = text[-2000:]
+                        parts.append(text)
                     elif item.get("type") == "image":
                         # Load image
                         img_path = item["image"]
                         try:
                             # Gemini accepts PIL Image
-                            img = Image.open(img_path)
+                            img = _load_image_for_gemini(img_path)
                             parts.append(img)
                         except Exception as e:
                             print(f"[Warn] Could not load image {img_path} for Gemini: {e}")
@@ -70,6 +137,128 @@ def get_gemini_client(api_key, model_name="gemini-2.5-flash"):
         print(f"[Warn] Failed to initialize model '{model_name}'. Falling back to 'gemini-1.5-flash'. Error: {e}")
         model = genai.GenerativeModel("gemini-1.5-flash")
     return model
+
+
+def _extract_text_from_gemini_response(response):
+    """Best-effort text extraction across Gemini SDK response shapes."""
+    # Fast path.
+    try:
+        txt = response.text
+        if txt and str(txt).strip():
+            return str(txt).strip()
+    except Exception:
+        pass
+
+    # Fallback path for responses where .text accessor fails.
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) if content is not None else None
+        if not parts:
+            continue
+        chunks = []
+        for part in parts:
+            part_text = getattr(part, "text", None)
+            if part_text and str(part_text).strip():
+                chunks.append(str(part_text).strip())
+                continue
+            if isinstance(part, dict):
+                dict_text = part.get("text")
+                if dict_text and str(dict_text).strip():
+                    chunks.append(str(dict_text).strip())
+        merged = "\n".join(chunks).strip()
+        if merged:
+            return merged
+
+    return None
+
+
+def _debug_print_gemini_response(response):
+    """Concise diagnostics for empty/invalid Gemini outputs."""
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        print("[Debug] Gemini response has no candidates.")
+    else:
+        first = candidates[0]
+        finish_reason = getattr(first, "finish_reason", None)
+        content = getattr(first, "content", None)
+        parts = getattr(content, "parts", None) if content is not None else None
+        num_parts = len(parts) if parts is not None else 0
+        print(f"[Debug] Finish Reason: {finish_reason}")
+        print(f"[Debug] Num Parts: {num_parts}")
+    print(f"[Debug] Prompt Feedback: {getattr(response, 'prompt_feedback', None)}")
+
+    # Optional verbose dump for deeper local debugging.
+    if os.environ.get("SAM3_GEMINI_DEBUG_RESPONSE", "0") == "1":
+        try:
+            payload = response.to_dict()
+            print("[Debug] Raw response JSON:")
+            print(json.dumps(payload, indent=2))
+        except Exception as e:
+            print(f"[Debug] Could not serialize raw response: {e}")
+
+
+def _make_generation_config():
+    # Keep legacy behavior unless explicitly enabled.
+    if os.environ.get("SAM3_GEMINI_USE_GENERATION_CONFIG", "0") != "1":
+        return None
+
+    try:
+        max_output_tokens = int(
+            os.environ.get("SAM3_GEMINI_MAX_OUTPUT_TOKENS", "2048")
+        )
+    except ValueError:
+        max_output_tokens = 2048
+    try:
+        temperature = float(os.environ.get("SAM3_GEMINI_TEMPERATURE", "0.2"))
+    except ValueError:
+        temperature = 0.2
+
+    # google.generativeai accepts either dict or GenerationConfig.
+    return {
+        "max_output_tokens": max_output_tokens,
+        "temperature": temperature,
+    }
+
+
+def _recovery_generate_request(model, gemini_messages):
+    """
+    Last-resort recovery call when Gemini returns STOP with empty content.
+    Uses a minimal, explicit instruction and only the most relevant context.
+    """
+    if not gemini_messages:
+        return None
+
+    # Prefer latest user message; also include first user message for raw image/query.
+    first_user = next((m for m in gemini_messages if m.get("role") == "user"), None)
+    last_user = None
+    for m in reversed(gemini_messages):
+        if m.get("role") == "user":
+            last_user = m
+            break
+
+    recovery_parts = [
+        (
+            "Return exactly one valid tool call and nothing else in this format: "
+            '<tool>{"name":"TOOL_NAME","parameters":{...}}</tool>. '
+            "Allowed tool names: segment_phrase, examine_each_mask, "
+            "select_masks_and_return, report_no_mask."
+        )
+    ]
+    if first_user is not None:
+        recovery_parts.extend(first_user.get("parts", []))
+    if last_user is not None and last_user is not first_user:
+        recovery_parts.extend(last_user.get("parts", []))
+
+    try:
+        gen_cfg = _make_generation_config()
+        if gen_cfg is None:
+            return model.generate_content(recovery_parts)
+        return model.generate_content(recovery_parts, generation_config=gen_cfg)
+    except Exception as e:
+        print(f"[Warn] Recovery generate_content failed: {e}")
+        return None
+
 
 def gemini_send_request(messages, model):
     """
@@ -100,6 +289,7 @@ def gemini_send_request(messages, model):
 
     # Retry loop for rate limiting
     max_retries = 5
+    generation_config = _make_generation_config()
     for attempt in range(max_retries):
         try:
             # Separate history and last message
@@ -111,23 +301,54 @@ def gemini_send_request(messages, model):
                 time.sleep(2)
             
             chat = model.start_chat(history=history)
-            response = chat.send_message(last_msg['parts'])
-            
-            try:
-                text = response.text
+            if generation_config is None:
+                response = chat.send_message(last_msg['parts'])
+            else:
+                response = chat.send_message(
+                    last_msg['parts'],
+                    generation_config=generation_config,
+                )
+
+            text = _extract_text_from_gemini_response(response)
+            if text:
                 return text
-            except Exception as e:
-                # If we get a response but can't read text (e.g. finish reason STOP but empty),
-                # it might be safety or just weirdness.
-                print(f"[Error] Failed to get text from Gemini response (Attempt {attempt+1}/{max_retries}). Error: {e}")
-                if response.candidates:
-                    print(f"[Debug] Finish Reason: {response.candidates[0].finish_reason}")
-                    print(f"[Debug] Safety Ratings: {response.prompt_feedback}")
-                
-                # If it's a finish_reason issue that isn't transient, retrying might not help unless we change params.
-                # But if it's completely empty, maybe retry helps.
-                time.sleep(5)
-                continue
+
+            print(
+                f"[Error] Gemini returned no usable text in chat mode "
+                f"(Attempt {attempt+1}/{max_retries})."
+            )
+            _debug_print_gemini_response(response)
+
+            # Fallback: non-chat generation sometimes succeeds when chat returns empty parts.
+            try:
+                if generation_config is None:
+                    fallback_response = model.generate_content(gemini_messages)
+                else:
+                    fallback_response = model.generate_content(
+                        gemini_messages,
+                        generation_config=generation_config,
+                    )
+                fallback_text = _extract_text_from_gemini_response(fallback_response)
+                if fallback_text:
+                    print("[Info] Recovered response via generate_content fallback.")
+                    return fallback_text
+                print("[Warn] Fallback generate_content also returned no usable text.")
+                _debug_print_gemini_response(fallback_response)
+
+                # Last-resort recovery call with minimal context and strict format.
+                recovery_response = _recovery_generate_request(model, gemini_messages)
+                recovery_text = _extract_text_from_gemini_response(recovery_response)
+                if recovery_text:
+                    print("[Info] Recovered response via strict recovery request.")
+                    return recovery_text
+                if recovery_response is not None:
+                    print("[Warn] Recovery request also returned no usable text.")
+                    _debug_print_gemini_response(recovery_response)
+            except Exception as fallback_e:
+                print(f"[Warn] Fallback generate_content failed: {fallback_e}")
+
+            time.sleep(5)
+            continue
                 
         except Exception as e:
             err_str = str(e)
@@ -242,6 +463,7 @@ def main():
     parser.add_argument("--video_path", type=str, required=True, help="Path to video file")
     parser.add_argument("--prompt", type=str, default="Identify and segment any biological creatures.", help="Initial prompt for Agent")
     parser.add_argument("--api_key", type=str, help="Gemini API Key")
+    parser.add_argument("--model", type=str, default=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), help="Gemini model name")
     parser.add_argument("--output_dir", type=str, default="sam3_video_agent_out")
     parser.add_argument("--gpus", type=str, default="0", help="GPUs to use")
     parser.add_argument("--save_prompts", action="store_true", help="Save prompts to JSON and exit without propagation")
@@ -256,21 +478,10 @@ def main():
     # 1. Setup Models
     print("Loading SAM3 Image Model (for Agent)...")
     
-    # Try multiple paths for BPE vocab
-    possible_bpe_paths = [
-        "assets/bpe_simple_vocab_16e6.txt.gz",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../assets/bpe_simple_vocab_16e6.txt.gz"),
-        os.path.join(os.getcwd(), "assets/bpe_simple_vocab_16e6.txt.gz")
-    ]
-    
-    bpe_path = None
-    for p in possible_bpe_paths:
-        if os.path.exists(p):
-            bpe_path = p
-            break
-            
-    if not bpe_path:
-        print(f"Error: Could not find bpe_simple_vocab_16e6.txt.gz. Checked: {possible_bpe_paths}")
+    try:
+        bpe_path = find_bpe_path()
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
         return
 
     print(f"Using BPE path: {bpe_path}")
@@ -279,8 +490,8 @@ def main():
     image_processor = Sam3Processor(image_model, confidence_threshold=0.4)
     local_service = LocalSam3Service(image_processor, os.path.join(args.output_dir, "sam_service"))
     
-    print("Loading Gemini...")
-    gemini_model = get_gemini_client(api_key)
+    print(f"Loading Gemini model: {args.model}")
+    gemini_model = get_gemini_client(api_key, model_name=args.model)
     
     # 2. Extract Frame 0
     cap = cv2.VideoCapture(args.video_path)

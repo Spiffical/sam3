@@ -16,6 +16,50 @@ except Exception:
     Image = None
 
 
+def _cap_images_in_processed_messages(
+    processed_messages: list[dict[str, Any]], max_images: Optional[int]
+) -> list[dict[str, Any]]:
+    """
+    Keep at most `max_images` image_url parts across all messages, preserving
+    the most recent image(s). Text parts are preserved.
+    """
+    if max_images is None or max_images <= 0:
+        return processed_messages
+
+    image_positions: list[tuple[int, int]] = []
+    for msg_idx, message in enumerate(processed_messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for content_idx, item in enumerate(content):
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                image_positions.append((msg_idx, content_idx))
+
+    if len(image_positions) <= max_images:
+        return processed_messages
+
+    keep_positions = set(image_positions[-max_images:])
+    trimmed_messages: list[dict[str, Any]] = []
+    for msg_idx, message in enumerate(processed_messages):
+        msg_copy = message.copy()
+        content = message.get("content")
+        if message.get("role") == "user" and isinstance(content, list):
+            new_content = []
+            for content_idx, item in enumerate(content):
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "image_url"
+                    and (msg_idx, content_idx) not in keep_positions
+                ):
+                    continue
+                new_content.append(item)
+            msg_copy["content"] = new_content
+        trimmed_messages.append(msg_copy)
+    return trimmed_messages
+
+
 def get_image_base64_and_mime(image_path, max_edge: Optional[int] = None):
     """Convert image file to base64 string and get MIME type"""
     try:
@@ -134,6 +178,17 @@ def send_generate_request(
     # Create OpenAI client with custom base URL
     client = OpenAI(api_key=api_key, base_url=server_url)
 
+    def _parse_max_images_from_error(error_text: str) -> Optional[int]:
+        # Example:
+        # "At most 1 image(s) may be provided in one prompt."
+        image_limit_match = re.search(
+            r"At most\s+(\d+)\s+image\(s\)\s+may be provided in one prompt",
+            error_text,
+        )
+        if not image_limit_match:
+            return None
+        return int(image_limit_match.group(1))
+
     def _next_token_budget_from_error(error_text: str, current_budget: int) -> Optional[int]:
         """
         Parse vLLM/OpenAI-compatible context-window errors and compute a safer retry budget.
@@ -162,13 +217,24 @@ def send_generate_request(
         return next_budget
 
     budget = max_tokens
+    forced_max_images: Optional[int] = None
+    max_images_env = os.environ.get("SAM3_MAX_IMAGES_PER_REQUEST")
+    if max_images_env:
+        try:
+            forced_max_images = int(max_images_env)
+        except ValueError:
+            forced_max_images = None
+
     # Retry a few times only for context-budget errors.
     for _attempt in range(6):
         try:
+            request_messages = _cap_images_in_processed_messages(
+                processed_messages, forced_max_images
+            )
             print(f"🔍 Calling model {model}...")
             response = client.chat.completions.create(
                 model=model,
-                messages=processed_messages,
+                messages=request_messages,
                 max_completion_tokens=budget,
                 n=1,
             )
@@ -181,6 +247,18 @@ def send_generate_request(
 
         except Exception as e:
             error_text = str(e)
+            max_images_from_error = _parse_max_images_from_error(error_text)
+            if max_images_from_error is not None:
+                if forced_max_images == max_images_from_error:
+                    print(f"Request failed: {e}")
+                    return None
+                forced_max_images = max_images_from_error
+                print(
+                    "Server multimodal limit detected. "
+                    f"Retrying with at most {forced_max_images} image(s) per request."
+                )
+                continue
+
             next_budget = _next_token_budget_from_error(error_text, budget)
             if next_budget is None:
                 print(f"Request failed: {e}")
