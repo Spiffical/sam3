@@ -169,12 +169,22 @@ def mask_list_from_outputs(outputs: dict[str, Any]) -> list[np.ndarray]:
     if masks is None:
         masks = outputs.get("video_res_masks")
     if masks is None:
+        # Video propagation path returns post-processed masks here.
+        masks = outputs.get("out_binary_masks")
+    if masks is None and isinstance(outputs.get("obj_id_to_mask"), dict):
+        # Some code paths may expose raw object-id keyed masks.
+        masks = list(outputs["obj_id_to_mask"].values())
+    if masks is None:
         return []
+    if isinstance(masks, dict):
+        masks = list(masks.values())
     if isinstance(masks, torch.Tensor):
         masks = masks.detach().cpu().numpy()
     parsed: list[np.ndarray] = []
     for mask in masks:
         arr = np.asarray(mask)
+        if arr.ndim == 4:
+            arr = arr[0]
         if arr.ndim == 3:
             arr = arr[0]
         parsed.append(arr > 0)
