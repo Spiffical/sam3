@@ -164,6 +164,72 @@ def _build_tool_format_repair_message(path_to_latest_output_json, initial_text_p
     )
 
 
+def _extract_mask_verdict(generated_text):
+    """Extract Accept/Reject verdict from mask-check text, if present."""
+    if not isinstance(generated_text, str) or not generated_text.strip():
+        return None
+
+    tag_match = re.search(
+        r"<\s*verdict\s*>\s*(accept|reject)\s*<\s*/\s*verdict\s*>",
+        generated_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if tag_match:
+        return tag_match.group(1).capitalize()
+
+    # Fallback for non-tagged outputs: use the last explicit occurrence.
+    plain_matches = re.findall(r"\b(accept|reject)\b", generated_text, flags=re.IGNORECASE)
+    if plain_matches:
+        return plain_matches[-1].capitalize()
+    return None
+
+
+def _request_mask_verdict_with_retry(send_generate_request_fn, iterative_messages, max_retries=2):
+    """
+    Request a mask verdict and retry with strict formatting instructions if missing.
+
+    Returns:
+        tuple[str | None, str | None]: (model_text, verdict)
+    """
+    model_text = send_generate_request_fn(iterative_messages)
+    verdict = _extract_mask_verdict(model_text)
+    if verdict is not None:
+        return model_text, verdict
+
+    for retry_idx in range(max_retries):
+        iterative_messages.append(
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": str(model_text)}],
+            }
+        )
+        iterative_messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Your previous response did not include a valid verdict. "
+                            "Respond with exactly one of these tags and nothing else: "
+                            "<verdict>Accept</verdict> or <verdict>Reject</verdict>."
+                        ),
+                    }
+                ],
+            }
+        )
+        model_text = send_generate_request_fn(iterative_messages)
+        verdict = _extract_mask_verdict(model_text)
+        if verdict is not None:
+            return model_text, verdict
+        print(
+            "⚠️ Missing mask verdict format. "
+            f"Retrying iterative-check verdict extraction ({retry_idx + 1}/{max_retries})."
+        )
+
+    return model_text, None
+
+
 def _prune_messages_for_next_round(
     messages_list,
     used_text_prompts,
@@ -498,8 +564,10 @@ def agent_inference(
                         ],
                     },
                 ]
-                checking_generated_text = send_generate_request(
-                    iterative_checking_messages
+                checking_generated_text, verdict = _request_mask_verdict_with_retry(
+                    send_generate_request,
+                    iterative_checking_messages,
+                    max_retries=2,
                 )
 
                 # Process the generated text to determine if the mask should be kept or rejected
@@ -508,21 +576,28 @@ def agent_inference(
                         "Generated text is None, which is unexpected. Please check the Qwen server and the input parameters."
                     )
                 print(f"Generated text for mask {i + 1}: {checking_generated_text}")
-                verdict = (
-                    checking_generated_text.split("<verdict>")[-1]
-                    .split("</verdict>")[0]
-                    .strip()
-                )
-                if "Accept" in verdict:
-                    assert not "Reject" in verdict
+                if verdict is None:
+                    fallback_verdict = (
+                        os.environ.get("SAM3_MASK_CHECK_DEFAULT_VERDICT", "Reject")
+                        .strip()
+                        .capitalize()
+                    )
+                    if fallback_verdict not in {"Accept", "Reject"}:
+                        fallback_verdict = "Reject"
+                    print(
+                        "⚠️ Could not parse Accept/Reject verdict after retries. "
+                        f"Falling back to {fallback_verdict} for mask {i + 1}."
+                    )
+                    verdict = fallback_verdict
+
+                if verdict == "Accept":
                     print(f"Mask {i + 1} accepted, keeping it in the outputs.")
                     masks_to_keep.append(i)
-                elif "Reject" in verdict:
-                    assert not "Accept" in verdict
+                elif verdict == "Reject":
                     print(f"Mask {i + 1} rejected, removing it from the outputs.")
                 else:
                     raise ValueError(
-                        f"Unexpected verdict in generated text: {checking_generated_text}. Expected 'Accept' or 'Reject'."
+                        f"Unexpected verdict value '{verdict}' for generated text: {checking_generated_text}. Expected 'Accept' or 'Reject'."
                     )
 
             updated_outputs = {

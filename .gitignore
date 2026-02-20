@@ -158,3 +158,4 @@ sam3_video_agent_out
 debug_crops/
 videos/
 frame_0.jpg
+output_video.mp4
