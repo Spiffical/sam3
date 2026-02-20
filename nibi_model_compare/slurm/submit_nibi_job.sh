@@ -51,7 +51,7 @@ Runtime overrides (forwarded as env vars):
   --max-model-len <n>
   --max-num-seqs <n>
   --limit-mm-per-prompt <json>     e.g. '{"image":1,"video":0}'
-  --image-size <n>
+  --image-size <n>                SAM3 video predictor size (use 1008 for current checkpoint)
   --max-completion-tokens <n>
   --save-prompts / --no-save-prompts
   --debug / --no-debug
@@ -136,7 +136,7 @@ gpu_memory_utilization=""
 max_model_len=""
 max_num_seqs=""
 limit_mm_per_prompt=""
-image_size="1024"
+image_size="1008"
 max_completion_tokens="1024"
 save_prompts="0"
 debug="0"

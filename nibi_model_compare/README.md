@@ -89,6 +89,7 @@ bash nibi_model_compare/slurm/submit_nibi_job.sh \
   --account <your-account> \
   --video-path /project/<your-account>/$USER/data/onc/chinacreekclipped.mp4 \
   --prompt "identify and segment small creatures in the underwater scene" \
+  --image-size 1008 \
   --gpus-per-node h100:2 \
   --tp-size 1 \
   --vllm-cuda-visible-devices 0 \
@@ -102,6 +103,7 @@ Defaults used by templates/wrapper:
 - `PROJECT_ROOT` defaults to `REPO_ROOT`.
 - `DEFAULT_PROJECT_PREFIX` defaults to `/project/${SLURM_ACCOUNT:-${ACCOUNT:-$USER}}/$USER`.
 - `PROJECT_CACHE_ROOT` defaults to `${DEFAULT_PROJECT_PREFIX}/hf-cache`.
+- `IMAGE_SIZE` defaults to `1008` for the current SAM3 video checkpoint.
 - Temporary per-job staging is under `$SLURM_TMPDIR` when available.
 - Slurm resources default to the current template profile (`single`, `array`, `tp8`) and can be overridden with CLI args.
 - Any extra env variable can be forwarded with `--set-env KEY=VALUE`.

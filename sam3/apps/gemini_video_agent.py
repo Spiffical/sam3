@@ -553,7 +553,7 @@ def main():
         # Start session
         img0 = cv2.imread(frame_0_path)
         height, width = img0.shape[:2]
-        image_size = 1024 # Standard SAM image size
+        image_size = 1008  # SAM3 video predictor fixed processing size
         
         try:
             session_id = backend.start_session(

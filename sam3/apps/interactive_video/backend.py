@@ -122,7 +122,7 @@ class PredictorBackend:
     def start_session(
         self,
         resource_path: str,
-        image_size: int = 1024,
+        image_size: int = 1008,
         offload_video_to_cpu: bool = False,
     ) -> str:
         self._guard()

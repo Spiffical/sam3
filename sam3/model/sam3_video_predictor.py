@@ -61,7 +61,7 @@ class Sam3VideoPredictor:
             return self.start_session(
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
-                image_size=request.get("image_size", 1024),
+                image_size=request.get("image_size", 1008),
                 offload_video_to_cpu=request.get("offload_video_to_cpu", False),
             )
         elif request_type == "add_prompt":
@@ -106,7 +106,7 @@ class Sam3VideoPredictor:
         self,
         resource_path,
         session_id=None,
-        image_size=1024,
+        image_size=1008,
         offload_video_to_cpu=False,
     ):
         """
@@ -118,8 +118,26 @@ class Sam3VideoPredictor:
         session. If it is not defined, the start_session function will create
         a session id and return it.
         """
+        # The SAM3 video tracker is initialized with a fixed processing resolution.
+        # Changing only self.model.image_size can desync it from tracker internals
+        # (prompt encoder / image embedding grid), causing downstream assertions.
+        tracker = getattr(self.model, "tracker", None)
+        tracker_image_size = getattr(tracker, "image_size", None)
+        model_image_size = getattr(self.model, "image_size", None)
+        expected_image_size = tracker_image_size or model_image_size
+
+        if image_size is None:
+            image_size = expected_image_size
+
+        if expected_image_size is not None and image_size != expected_image_size:
+            raise ValueError(
+                "Requested image_size="
+                f"{image_size}, but this predictor is fixed at image_size="
+                f"{expected_image_size}. Use image_size={expected_image_size}."
+            )
+
         if image_size is not None:
-             self.model.image_size = image_size
+            self.model.image_size = image_size
         
         # get an initial inference_state from the model
         inference_state = self.model.init_state(

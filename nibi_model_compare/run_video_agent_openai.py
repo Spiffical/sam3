@@ -253,7 +253,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api_key", type=str, default=None)
     parser.add_argument("--output_dir", default="nibi_model_compare/run_out", type=str)
     parser.add_argument("--gpus", default="0", type=str)
-    parser.add_argument("--image_size", default=1024, type=int)
+    parser.add_argument(
+        "--image_size",
+        default=1008,
+        type=int,
+        help="Video predictor processing size. For current SAM3 checkpoint, use 1008.",
+    )
     parser.add_argument("--max_completion_tokens", default=1024, type=int)
     parser.add_argument("--save_prompts", action="store_true")
     parser.add_argument("--debug", action="store_true")
