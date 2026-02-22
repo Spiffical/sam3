@@ -191,6 +191,89 @@ def mask_list_from_outputs(outputs: dict[str, Any]) -> list[np.ndarray]:
     return parsed
 
 
+def object_color(obj_id: int) -> tuple[int, int, int]:
+    # Deterministic BGR color per object id.
+    return (
+        int((obj_id * 47) % 255),
+        int((obj_id * 89 + 37) % 255),
+        int((obj_id * 131 + 73) % 255),
+    )
+
+
+def iter_output_masks_with_ids(
+    outputs: dict[str, Any], frame_h: int, frame_w: int
+) -> list[tuple[int, np.ndarray]]:
+    if not isinstance(outputs, dict):
+        return []
+
+    if "out_binary_masks" in outputs:
+        raw_masks = outputs.get("out_binary_masks")
+        raw_ids = outputs.get("out_obj_ids")
+        if isinstance(raw_masks, torch.Tensor):
+            raw_masks = raw_masks.detach().cpu().numpy()
+        if isinstance(raw_ids, torch.Tensor):
+            raw_ids = raw_ids.detach().cpu().numpy()
+        if raw_masks is None:
+            return []
+
+        out: list[tuple[int, np.ndarray]] = []
+        for i, raw_mask in enumerate(raw_masks):
+            arr = np.asarray(raw_mask)
+            while arr.ndim > 2:
+                arr = arr[0]
+            if arr.shape != (frame_h, frame_w):
+                arr = cv2.resize(
+                    arr.astype(np.float32),
+                    (frame_w, frame_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            mask = arr > 0.5
+            if raw_ids is not None and len(raw_ids) > i:
+                obj_id = int(raw_ids[i])
+            else:
+                obj_id = i + 1
+            out.append((obj_id, mask))
+        return out
+
+    # Fallback for legacy outputs without object ids.
+    return [(i + 1, m) for i, m in enumerate(mask_list_from_outputs(outputs))]
+
+
+def overlay_masks_on_frame(video_frame: np.ndarray, outputs: dict[str, Any]) -> np.ndarray:
+    frame_h, frame_w = video_frame.shape[:2]
+    masks_with_ids = iter_output_masks_with_ids(outputs, frame_h, frame_w)
+    if not masks_with_ids:
+        return video_frame
+
+    max_area_ratio = float(os.environ.get("SAM3_OVERLAY_MAX_MASK_AREA_RATIO", "0.95"))
+    alpha = float(os.environ.get("SAM3_OVERLAY_ALPHA", "0.35"))
+
+    overlay = np.zeros_like(video_frame)
+    drawn_any = False
+
+    for obj_id, mask in masks_with_ids:
+        if mask.shape != (frame_h, frame_w):
+            continue
+        area_ratio = float(mask.mean())
+        # Guard against runaway masks that can wash out the whole frame.
+        if area_ratio <= 0.0 or area_ratio > max_area_ratio:
+            continue
+
+        color = object_color(obj_id)
+        overlay[mask] = color
+
+        # Draw crisp contours for readability.
+        mask_u8 = (mask.astype(np.uint8) * 255)
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(video_frame, contours, -1, color, 2)
+        drawn_any = True
+
+    if not drawn_any:
+        return video_frame
+
+    return cv2.addWeighted(video_frame, 1.0, overlay, alpha, 0.0)
+
+
 def write_json(path: str, payload: dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
@@ -500,15 +583,7 @@ def run() -> int:
                     break
                 output = results_by_frame.get(frame_index)
                 if output:
-                    overlay = np.zeros_like(video_frame)
-                    for obj_idx, mask in enumerate(mask_list_from_outputs(output)):
-                        color = (
-                            int((obj_idx * 47) % 255),
-                            int((obj_idx * 89 + 37) % 255),
-                            int((obj_idx * 131 + 73) % 255),
-                        )
-                        overlay[mask] = color
-                    video_frame = cv2.addWeighted(video_frame, 1.0, overlay, 0.5, 0.0)
+                    video_frame = overlay_masks_on_frame(video_frame, output)
                 writer.write(video_frame)
                 frame_index += 1
 

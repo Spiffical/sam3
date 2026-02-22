@@ -9,18 +9,133 @@ This README captures the working setup used in this repo for running SAM3 video-
 - Run an interactive end-to-end test (`vllm serve` + `run_video_agent_openai.py`).
 - Avoid `/home` quota failures by using `$SLURM_TMPDIR` and `/project` caches.
 
+## TL;DR Copy/Paste (2-GPU Interactive, Recommended)
+
+Use this when you already have an interactive Nibi allocation with `h100:2`.
+It runs `vllm` on GPU0 and SAM3 tracking on GPU1 to avoid OOM.
+
+```bash
+cd ~/sam3
+source .venv/bin/activate
+set -a; source .env; set +a
+
+export ACCOUNT="${ACCOUNT:-rpp-kmoran}"
+export MODEL_ID="Qwen/Qwen3-VL-30B-A3B-Instruct"
+export PORT=8001
+export VIDEO_PATH="/project/${ACCOUNT}/${USER}/data/onc/chinacreekclipped.mp4"
+export OUT_DIR="/project/${ACCOUNT}/${USER}/sam3/runs/interactive_${SLURM_JOB_ID}_$(date +%Y%m%d_%H%M%S)"
+
+# Keep all HF/PyTorch cache off $HOME
+export JOB_CACHE_ROOT="${SLURM_TMPDIR:-/tmp}/sam3-cache"
+export HF_HOME="${JOB_CACHE_ROOT}/hf"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
+export HF_XET_CACHE="${HF_HOME}/xet"
+export TORCH_HOME="${HF_HOME}/torch"
+export XDG_CACHE_HOME="${HF_HOME}/xdg"
+export TMPDIR="${SLURM_TMPDIR:-${JOB_CACHE_ROOT}/tmp}"
+export HF_HUB_DISABLE_XET=1
+unset TRANSFORMERS_CACHE
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+
+pkill -f "vllm serve" || true
+
+# GPU0: vLLM server
+CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL_ID" \
+  --tensor-parallel-size 1 \
+  --allowed-local-media-path / \
+  --gpu-memory-utilization 0.92 \
+  --max-model-len 16384 \
+  --max-num-seqs 1 \
+  --limit-mm-per-prompt '{"image":1,"video":0}' \
+  --port "$PORT" >"/tmp/vllm_${SLURM_JOB_ID}.log" 2>&1 &
+VLLM_PID=$!
+
+# Wait for server readiness and fail fast if it dies
+for _ in $(seq 1 120); do
+  if curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null; then
+    break
+  fi
+  if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+    echo "vLLM failed to start. Last log lines:"
+    tail -n 120 "/tmp/vllm_${SLURM_JOB_ID}.log"
+    exit 1
+  fi
+  sleep 2
+done
+curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null
+
+# GPU1: SAM3 agent + propagation
+CUDA_VISIBLE_DEVICES=1 \
+SAM3_DISABLE_WARMUP=1 \
+SAM3_MAX_IMAGES_PER_REQUEST=1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python nibi_model_compare/run_video_agent_openai.py \
+  --video_path "$VIDEO_PATH" \
+  --prompt "identify and segment small creatures in the underwater scene" \
+  --server_url "http://127.0.0.1:${PORT}/v1" \
+  --model "$MODEL_ID" \
+  --output_dir "$OUT_DIR" \
+  --gpus 0 \
+  --image_size 1008 \
+  --max_completion_tokens 1024 \
+  --debug 2>&1 | tee "/tmp/sam3_runner_${SLURM_JOB_ID}.log"
+
+cat "$OUT_DIR/run_metrics.json"
+echo "Output video: $OUT_DIR/output_video.mp4"
+echo "Prompts JSON: $OUT_DIR/generated_prompts.json"
+
+kill "$VLLM_PID" 2>/dev/null || true
+```
+
+## TL;DR Copy/Paste (Submit Batch Job)
+
+If you prefer `sbatch` instead of interactive runs:
+
+```bash
+cd ~/sam3
+export ACCOUNT="${ACCOUNT:-rpp-kmoran}"
+
+nibi_model_compare/slurm/submit_nibi_job.sh \
+  --template single \
+  --account "$ACCOUNT" \
+  --gpus-per-node h100:2 \
+  --cpus-per-task 16 \
+  --mem 128000M \
+  --time 02:00:00 \
+  --tp-size 1 \
+  --vllm-cuda-visible-devices 0 \
+  --runner-cuda-visible-devices 1 \
+  --runner-gpu-ids 0 \
+  --max-model-len 16384 \
+  --image-size 1008 \
+  --max-completion-tokens 1024 \
+  --video-path "/project/${ACCOUNT}/${USER}/data/onc/chinacreekclipped.mp4" \
+  --prompt "identify and segment small creatures in the underwater scene" \
+  --debug \
+  --set-env SAM3_DISABLE_WARMUP=1 \
+  --set-env SAM3_MAX_IMAGES_PER_REQUEST=1 \
+  --set-env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
 ## 1) Interactive Allocation
+
+Set your Alliance account once:
+
+```bash
+export ACCOUNT="${ACCOUNT:-rpp-kmoran}"
+```
 
 Quick single-GPU smoke test:
 
 ```bash
-salloc --account=rpp-kmoran --nodes=1 --gpus-per-node=h100:1 --cpus-per-task=8 --mem=64G --time=01:00:00
+salloc --account="$ACCOUNT" --nodes=1 --gpus-per-node=h100:1 --cpus-per-task=8 --mem=64G --time=01:00:00
 ```
 
 Larger-context test (recommended for Qwen3-VL-30B):
 
 ```bash
-salloc --account=rpp-kmoran --nodes=1 --gpus-per-node=h100:2 --cpus-per-task=16 --mem=128G --time=02:00:00
+salloc --account="$ACCOUNT" --nodes=1 --gpus-per-node=h100:2 --cpus-per-task=16 --mem=128G --time=02:00:00
 ```
 
 Notes:
@@ -44,9 +159,10 @@ module load opencv/4.12.0
 python -m venv .venv
 source .venv/bin/activate
 
+export ACCOUNT="${ACCOUNT:-rpp-kmoran}"
 export PYTHONNOUSERSITE=1
 export PIP_NO_USER=1
-export PIP_CACHE_DIR=/project/rpp-kmoran/merileo/pip-cache
+export PIP_CACHE_DIR="/project/${ACCOUNT}/${USER}/pip-cache"
 mkdir -p "$PIP_CACHE_DIR"
 ```
 
@@ -135,7 +251,8 @@ You must have access approved for:
 Use node-local cache during the job:
 
 ```bash
-export JOB_CACHE_ROOT="${SLURM_TMPDIR:-/project/rpp-kmoran/merileo/hf-cache/tmp}/hf-cache"
+export ACCOUNT="${ACCOUNT:-rpp-kmoran}"
+export JOB_CACHE_ROOT="${SLURM_TMPDIR:-/project/${ACCOUNT}/${USER}/hf-cache/tmp}/hf-cache"
 export HF_HOME="${JOB_CACHE_ROOT}/hf"
 export HF_HUB_CACHE="${HF_HOME}/hub"
 export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
@@ -163,6 +280,7 @@ cd ~/sam3
 source .venv/bin/activate
 set -a; source .env; set +a
 
+export ACCOUNT="${ACCOUNT:-rpp-kmoran}"
 export MODEL_ID="Qwen/Qwen3-VL-30B-A3B-Instruct"
 export PORT=8001
 export SAM3_IMAGE_DETAIL=low
@@ -197,8 +315,8 @@ print("vLLM not ready; check /tmp/vllm_run.log")
 raise SystemExit(1)
 PY
 
-VIDEO_PATH="/project/rpp-kmoran/merileo/data/onc/chinacreekclipped.mp4"
-OUT_DIR="/project/rpp-kmoran/merileo/sam3/runs/interactive_${SLURM_JOB_ID}_$(date +%Y%m%d_%H%M%S)"
+VIDEO_PATH="/project/${ACCOUNT}/${USER}/data/onc/chinacreekclipped.mp4"
+OUT_DIR="/project/${ACCOUNT}/${USER}/sam3/runs/interactive_${SLURM_JOB_ID}_$(date +%Y%m%d_%H%M%S)"
 
 python nibi_model_compare/run_video_agent_openai.py \
   --video_path "$VIDEO_PATH" \
