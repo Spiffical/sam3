@@ -274,6 +274,95 @@ def overlay_masks_on_frame(video_frame: np.ndarray, outputs: dict[str, Any]) -> 
     return cv2.addWeighted(video_frame, 1.0, overlay, alpha, 0.0)
 
 
+def _to_serializable_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:
+            pass
+    if isinstance(value, list):
+        return value
+    return list(value)
+
+
+def _encode_binary_mask_to_rle(mask: np.ndarray) -> dict[str, Any]:
+    from pycocotools import mask as mask_util
+
+    arr = np.asarray(mask)
+    while arr.ndim > 2:
+        arr = arr[0]
+    arr = (arr > 0).astype(np.uint8)
+    rle = mask_util.encode(np.asfortranarray(arr))
+    counts = rle.get("counts")
+    if isinstance(counts, bytes):
+        rle["counts"] = counts.decode("utf-8")
+    return {"size": list(rle.get("size", arr.shape)), "counts": rle["counts"]}
+
+
+def serialize_frame_output(frame_index: int, outputs: dict[str, Any]) -> dict[str, Any]:
+    masks_with_ids = iter_output_masks_with_ids(
+        outputs, frame_h=outputs.get("_frame_h", 0), frame_w=outputs.get("_frame_w", 0)
+    )
+    # If caller did not provide helper dimensions, derive from first mask.
+    if masks_with_ids and (outputs.get("_frame_h", 0) == 0 or outputs.get("_frame_w", 0) == 0):
+        sample_mask = masks_with_ids[0][1]
+        frame_h, frame_w = int(sample_mask.shape[0]), int(sample_mask.shape[1])
+    else:
+        frame_h = int(outputs.get("_frame_h", 0))
+        frame_w = int(outputs.get("_frame_w", 0))
+
+    out_obj_ids = _to_serializable_list(outputs.get("out_obj_ids"))
+    out_probs = _to_serializable_list(outputs.get("out_probs"))
+    out_boxes_xywh = _to_serializable_list(outputs.get("out_boxes_xywh"))
+
+    rle_masks: list[dict[str, Any]] = []
+    obj_ids: list[int] = []
+    for obj_id, mask in masks_with_ids:
+        if frame_h > 0 and frame_w > 0 and mask.shape != (frame_h, frame_w):
+            mask = cv2.resize(
+                mask.astype(np.float32),
+                (frame_w, frame_h),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 0.5
+        obj_ids.append(int(obj_id))
+        rle_masks.append(_encode_binary_mask_to_rle(mask))
+
+    return {
+        "frame_index": int(frame_index),
+        "out_obj_ids": out_obj_ids if out_obj_ids else obj_ids,
+        "out_probs": out_probs,
+        "out_boxes_xywh": out_boxes_xywh,
+        "out_binary_masks_rle": rle_masks,
+    }
+
+
+def save_frame_outputs_json(
+    output_path: str,
+    results_by_frame: dict[int, dict[str, Any]],
+    frame_h: int,
+    frame_w: int,
+) -> None:
+    frames_payload: list[dict[str, Any]] = []
+    for frame_index in sorted(results_by_frame.keys()):
+        frame_outputs = dict(results_by_frame[frame_index])
+        frame_outputs["_frame_h"] = frame_h
+        frame_outputs["_frame_w"] = frame_w
+        frames_payload.append(serialize_frame_output(frame_index, frame_outputs))
+    payload = {
+        "format_version": 1,
+        "frame_size_hw": [int(frame_h), int(frame_w)],
+        "num_frames_with_outputs": len(frames_payload),
+        "frames": frames_payload,
+    }
+    write_json(output_path, payload)
+
+
 def write_json(path: str, payload: dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
@@ -352,7 +441,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Video predictor processing size. For current SAM3 checkpoint, use 1008.",
     )
-    parser.add_argument("--max_completion_tokens", default=1024, type=int)
+    parser.add_argument("--max_completion_tokens", default=8000, type=int)
+    parser.add_argument(
+        "--save_frame_outputs_json",
+        action="store_true",
+        help="Save propagated per-frame outputs (obj IDs, boxes, masks as RLE) to JSON.",
+    )
+    parser.add_argument(
+        "--frame_outputs_json_path",
+        default="",
+        type=str,
+        help="Optional explicit path for per-frame outputs JSON.",
+    )
     parser.add_argument("--save_prompts", action="store_true")
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
@@ -538,7 +638,8 @@ def run() -> int:
                     frame_idx=0,
                     obj_id=index + 1,
                     points=[(float(point[0]), float(point[1]), 1)],
-                    frame_size=(frame_h, frame_w),
+                    # PredictorBackend expects frame_size as (width, height).
+                    frame_size=(frame_w, frame_h),
                 )
 
         prompts_path = os.path.join(args.output_dir, "generated_prompts.json")
@@ -549,6 +650,7 @@ def run() -> int:
 
         results_by_frame: dict[int, dict[str, Any]] = {}
         output_video_path = ""
+        frame_outputs_json_path = ""
 
         if args.save_prompts:
             metrics["status"] = "success_prompts_only"
@@ -568,6 +670,22 @@ def run() -> int:
                 ) from exc
 
             out_path = os.path.join(args.output_dir, "output_video.mp4")
+            should_save_frame_outputs = args.save_frame_outputs_json or os.environ.get(
+                "SAM3_SAVE_FRAME_OUTPUTS_JSON", "1"
+            ) == "1"
+            if should_save_frame_outputs:
+                frame_outputs_json_path = (
+                    args.frame_outputs_json_path
+                    or os.path.join(args.output_dir, "frame_outputs_rle.json")
+                )
+                save_frame_outputs_json(
+                    frame_outputs_json_path,
+                    results_by_frame,
+                    frame_h=frame_h,
+                    frame_w=frame_w,
+                )
+                metrics["frame_outputs_json_path"] = frame_outputs_json_path
+
             cap = cv2.VideoCapture(args.video_path)
             writer = cv2.VideoWriter(
                 out_path,

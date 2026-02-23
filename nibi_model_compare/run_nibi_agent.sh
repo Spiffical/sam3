@@ -49,6 +49,7 @@ SAM3 env toggles (forwarded in both modes):
   --sam3-disable-warmup <0|1>                  Default: 1
   --sam3-max-images-per-request <n>            Default: 1
   --pytorch-cuda-alloc-conf <value>            Default: expandable_segments:True
+  --sam3-save-frame-outputs-json <0|1>         Default: 1
   --sam3-overlay-max-mask-area-ratio <float>   Optional
   --sam3-overlay-alpha <float>                 Optional
 
@@ -101,6 +102,7 @@ debug=0
 sam3_disable_warmup="1"
 sam3_max_images_per_request="1"
 pytorch_cuda_alloc_conf="expandable_segments:True"
+sam3_save_frame_outputs_json="1"
 sam3_overlay_max_mask_area_ratio=""
 sam3_overlay_alpha=""
 
@@ -141,6 +143,7 @@ while [[ $# -gt 0 ]]; do
     --sam3-disable-warmup) sam3_disable_warmup="$2"; shift 2 ;;
     --sam3-max-images-per-request) sam3_max_images_per_request="$2"; shift 2 ;;
     --pytorch-cuda-alloc-conf) pytorch_cuda_alloc_conf="$2"; shift 2 ;;
+    --sam3-save-frame-outputs-json) sam3_save_frame_outputs_json="$2"; shift 2 ;;
     --sam3-overlay-max-mask-area-ratio) sam3_overlay_max_mask_area_ratio="$2"; shift 2 ;;
     --sam3-overlay-alpha) sam3_overlay_alpha="$2"; shift 2 ;;
 
@@ -223,6 +226,7 @@ run_interactive() {
   export SAM3_DISABLE_WARMUP="$sam3_disable_warmup"
   export SAM3_MAX_IMAGES_PER_REQUEST="$sam3_max_images_per_request"
   export PYTORCH_CUDA_ALLOC_CONF="$pytorch_cuda_alloc_conf"
+  export SAM3_SAVE_FRAME_OUTPUTS_JSON="$sam3_save_frame_outputs_json"
   if [[ -n "$sam3_overlay_max_mask_area_ratio" ]]; then
     export SAM3_OVERLAY_MAX_MASK_AREA_RATIO="$sam3_overlay_max_mask_area_ratio"
   fi
@@ -343,6 +347,7 @@ run_submit() {
     --set-env "SAM3_DISABLE_WARMUP=${sam3_disable_warmup}"
     --set-env "SAM3_MAX_IMAGES_PER_REQUEST=${sam3_max_images_per_request}"
     --set-env "PYTORCH_CUDA_ALLOC_CONF=${pytorch_cuda_alloc_conf}"
+    --set-env "SAM3_SAVE_FRAME_OUTPUTS_JSON=${sam3_save_frame_outputs_json}"
   )
   if [[ -n "$sam3_overlay_max_mask_area_ratio" ]]; then
     submit_cmd+=(--set-env "SAM3_OVERLAY_MAX_MASK_AREA_RATIO=${sam3_overlay_max_mask_area_ratio}")
@@ -375,4 +380,3 @@ case "$mode" in
     exit 1
     ;;
 esac
-

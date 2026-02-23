@@ -104,7 +104,7 @@ def send_generate_request(
     server_url=None,
     model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
     api_key=None,
-    max_tokens=4096,
+    max_tokens=8000,
 ):
     """
     Sends a request to the OpenAI-compatible API endpoint using the OpenAI client library.

@@ -25,6 +25,9 @@ Slurm resource overrides:
   --job-name <name>
   --output <path>
   --error <path>
+  --mail-user <email>              Default: spencer.bialek@gmail.com
+  --mail-type <types>              Default: BEGIN,END,FAIL
+  --no-mail                        Disable Slurm email notifications
   --sbatch-opt <raw-opt>           Repeatable extra sbatch option
 
 Runtime overrides (forwarded as env vars):
@@ -109,6 +112,9 @@ array_spec=""
 job_name=""
 output_path=""
 error_path=""
+mail_user="${SLURM_MAIL_USER:-spencer.bialek@gmail.com}"
+mail_type="${SLURM_MAIL_TYPE:-BEGIN,END,FAIL}"
+enable_mail=1
 sbatch_extra_opts=()
 
 # Runtime options
@@ -166,6 +172,9 @@ while [[ $# -gt 0 ]]; do
     --job-name) job_name="$2"; shift 2 ;;
     --output) output_path="$2"; shift 2 ;;
     --error) error_path="$2"; shift 2 ;;
+    --mail-user) mail_user="$2"; shift 2 ;;
+    --mail-type) mail_type="$2"; shift 2 ;;
+    --no-mail) enable_mail=0; shift ;;
     --sbatch-opt) sbatch_extra_opts+=("$2"); shift 2 ;;
 
     --repo-root) repo_root="$2"; shift 2 ;;
@@ -278,6 +287,33 @@ if [[ ! -f "$template_script" ]]; then
   exit 1
 fi
 
+# Default Slurm logs under $SCRATCH in a SAM3-specific folder unless overridden.
+scratch_root="${SCRATCH:-/scratch/${USER}}"
+default_slurm_log_dir="${scratch_root%/}/sam3/slurm_logs"
+if [[ -z "$output_path" || -z "$error_path" ]]; then
+  if ! mkdir -p "$default_slurm_log_dir" 2>/dev/null; then
+    fallback_slurm_log_dir="${TMPDIR:-/tmp}/${USER}/sam3/slurm_logs"
+    mkdir -p "$fallback_slurm_log_dir"
+    echo "[Warn] Could not create scratch log dir '${default_slurm_log_dir}'. Falling back to '${fallback_slurm_log_dir}'."
+    default_slurm_log_dir="$fallback_slurm_log_dir"
+  fi
+fi
+if [[ -z "$output_path" ]]; then
+  if [[ "$template" == "array" ]]; then
+    output_path="${default_slurm_log_dir}/%x-%A_%a.out"
+  else
+    output_path="${default_slurm_log_dir}/%x-%j.out"
+  fi
+fi
+if [[ -z "$error_path" ]]; then
+  if [[ "$template" == "array" ]]; then
+    error_path="${default_slurm_log_dir}/%x-%A_%a.err"
+  else
+    error_path="${default_slurm_log_dir}/%x-%j.err"
+  fi
+fi
+mkdir -p "$(dirname "$output_path")" "$(dirname "$error_path")"
+
 sbatch_cmd=(sbatch --parsable)
 [[ -n "$account" ]] && sbatch_cmd+=(--account "$account")
 [[ -n "$partition" ]] && sbatch_cmd+=(--partition "$partition")
@@ -290,6 +326,10 @@ sbatch_cmd=(sbatch --parsable)
 [[ -n "$job_name" ]] && sbatch_cmd+=(--job-name "$job_name")
 [[ -n "$output_path" ]] && sbatch_cmd+=(--output "$output_path")
 [[ -n "$error_path" ]] && sbatch_cmd+=(--error "$error_path")
+if [[ "$enable_mail" == "1" ]]; then
+  [[ -n "$mail_user" ]] && sbatch_cmd+=(--mail-user "$mail_user")
+  [[ -n "$mail_type" ]] && sbatch_cmd+=(--mail-type "$mail_type")
+fi
 for opt in "${sbatch_extra_opts[@]}"; do
   sbatch_cmd+=("$opt")
 done
@@ -334,6 +374,12 @@ env_vars+=("${extra_env_vars[@]}")
 
 echo "Template: $template"
 echo "Script:   $template_script"
+echo "Logs:     out=${output_path} err=${error_path}"
+if [[ "$enable_mail" == "1" ]]; then
+  echo "Mail:     user=${mail_user} type=${mail_type}"
+else
+  echo "Mail:     disabled"
+fi
 
 if [[ "$dry_run" == "1" ]]; then
   echo "---- env ----"
