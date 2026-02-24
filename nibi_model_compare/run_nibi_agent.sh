@@ -21,6 +21,7 @@ Core options:
   --video-path <path>                Default: /project/$ACCOUNT/$USER/data/onc/chinacreekclipped.mp4
   --prompt <text>                    Default: identify and segment small creatures in the underwater scene
   --model-id <hf-model-id>           Default: Qwen/Qwen3-VL-30B-A3B-Instruct
+  --model-revision <rev>             Optional HF revision/tag/branch
   --output-dir <path>                Interactive mode output directory
   --output-root <path>               Submit mode root (passed to submit wrapper)
   --env-file <path>                  Default: <repo>/.env
@@ -78,6 +79,7 @@ account="${ACCOUNT:-rpp-kmoran}"
 video_path=""
 prompt="identify and segment small creatures in the underwater scene"
 model_id="Qwen/Qwen3-VL-30B-A3B-Instruct"
+model_revision=""
 output_dir=""
 output_root=""
 env_file="${REPO_ROOT}/.env"
@@ -119,6 +121,7 @@ while [[ $# -gt 0 ]]; do
     --video-path) video_path="$2"; shift 2 ;;
     --prompt) prompt="$2"; shift 2 ;;
     --model-id) model_id="$2"; shift 2 ;;
+    --model-revision) model_revision="$2"; shift 2 ;;
     --output-dir) output_dir="$2"; shift 2 ;;
     --output-root) output_root="$2"; shift 2 ;;
     --env-file) env_file="$2"; shift 2 ;;
@@ -161,6 +164,18 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Accept repo:revision shorthand and normalize to separate flags.
+if [[ -z "$model_revision" && "$model_id" == *:* ]]; then
+  model_revision="${model_id#*:}"
+  model_id="${model_id%%:*}"
+  echo "[Info] Parsed model selector: --model-id '${model_id}' --model-revision '${model_revision}'"
+fi
+if [[ "$model_id" == *:* ]]; then
+  echo "Invalid --model-id '${model_id}': ':' is not allowed in HF repo IDs."
+  echo "Use --model-id <repo> and --model-revision <rev>."
+  exit 1
+fi
 
 if [[ -z "$video_path" ]]; then
   video_path="/project/${account}/${USER}/data/onc/chinacreekclipped.mp4"
@@ -207,6 +222,7 @@ run_interactive() {
 
   export ACCOUNT="$account"
   export MODEL_ID="$model_id"
+  export MODEL_REVISION="$model_revision"
   export PORT="$port"
   export VIDEO_PATH="$video_path"
   export OUT_DIR="$output_dir"
@@ -250,6 +266,9 @@ run_interactive() {
     --limit-mm-per-prompt "$limit_mm_per_prompt"
     --port "$PORT"
   )
+  if [[ -n "$MODEL_REVISION" ]]; then
+    vllm_cmd+=(--revision "$MODEL_REVISION")
+  fi
 
   runner_cmd=(
     python "$RUNNER_PY"
@@ -272,6 +291,9 @@ run_interactive() {
   echo "=== Interactive run configuration ==="
   echo "video: $VIDEO_PATH"
   echo "model: $MODEL_ID"
+  if [[ -n "$MODEL_REVISION" ]]; then
+    echo "model revision: $MODEL_REVISION"
+  fi
   echo "out:   $OUT_DIR"
   echo "vllm cuda visible: $vllm_cuda_visible_devices"
   echo "runner cuda visible: $runner_cuda_visible_devices"
@@ -328,6 +350,7 @@ run_submit() {
     --video-path "$video_path"
     --prompt "$prompt"
     --model-id "$model_id"
+    --model-revision "$model_revision"
     --server-port "$port"
     --tp-size "$tp_size"
     --vllm-cuda-visible-devices "$vllm_cuda_visible_devices"
