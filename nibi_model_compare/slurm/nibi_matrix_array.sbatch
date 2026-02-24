@@ -103,6 +103,16 @@ fi
 
 VIDEOS_MANIFEST="${VIDEOS_MANIFEST:-nibi_model_compare/videos_manifest.txt}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
+MODEL_REVISION="${MODEL_REVISION:-}"
+if [[ -z "$MODEL_REVISION" && "$MODEL_ID" == *:* ]]; then
+  MODEL_REVISION="${MODEL_ID#*:}"
+  MODEL_ID="${MODEL_ID%%:*}"
+  echo "Interpreting MODEL_ID suffix as revision: MODEL_ID='${MODEL_ID}' MODEL_REVISION='${MODEL_REVISION}'"
+fi
+if [[ "$MODEL_ID" == *:* ]]; then
+  echo "Invalid MODEL_ID '${MODEL_ID}'. Use plain repo id, and pass revision as MODEL_REVISION."
+  exit 1
+fi
 SERVER_PORT="${SERVER_PORT:-8001}"
 TP_SIZE="${TP_SIZE:-4}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
@@ -159,6 +169,9 @@ if [[ -n "$MAX_MODEL_LEN" ]]; then
 fi
 if [[ -n "$MAX_NUM_SEQS" ]]; then
   VLLM_CMD+=(--max-num-seqs "$MAX_NUM_SEQS")
+fi
+if [[ -n "$MODEL_REVISION" ]]; then
+  VLLM_CMD+=(--revision "$MODEL_REVISION")
 fi
 if [[ -n "$LIMIT_MM_PER_PROMPT" ]]; then
   VLLM_CMD+=(--limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT")

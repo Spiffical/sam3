@@ -103,6 +103,16 @@ fi
 VIDEO_PATH="${VIDEO_PATH:-$REPO_ROOT/assets/videos/chinacreekclipped.mp4}"
 PROMPT="${PROMPT:-segment all visible marine organisms}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-397B-A17B}"
+MODEL_REVISION="${MODEL_REVISION:-}"
+if [[ -z "$MODEL_REVISION" && "$MODEL_ID" == *:* ]]; then
+  MODEL_REVISION="${MODEL_ID#*:}"
+  MODEL_ID="${MODEL_ID%%:*}"
+  echo "Interpreting MODEL_ID suffix as revision: MODEL_ID='${MODEL_ID}' MODEL_REVISION='${MODEL_REVISION}'"
+fi
+if [[ "$MODEL_ID" == *:* ]]; then
+  echo "Invalid MODEL_ID '${MODEL_ID}'. Use plain repo id, and pass revision as MODEL_REVISION."
+  exit 1
+fi
 SERVER_PORT="${SERVER_PORT:-8005}"
 export SERVER_PORT
 TP_SIZE="${TP_SIZE:-8}"
@@ -146,6 +156,9 @@ VLLM_CMD=(
 )
 if [[ -n "$MAX_NUM_SEQS" ]]; then
   VLLM_CMD+=(--max-num-seqs "$MAX_NUM_SEQS")
+fi
+if [[ -n "$MODEL_REVISION" ]]; then
+  VLLM_CMD+=(--revision "$MODEL_REVISION")
 fi
 if [[ -n "$LIMIT_MM_PER_PROMPT" ]]; then
   VLLM_CMD+=(--limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT")

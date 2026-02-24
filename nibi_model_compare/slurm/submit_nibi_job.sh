@@ -44,6 +44,7 @@ Runtime overrides (forwarded as env vars):
   --videos-manifest <path>
   --prompt <text>
   --model-id <hf-model-id>
+  --model-revision <rev>
   --server-port <port>
   --tp-size <n>
   --gpu-ids <ids>                  e.g. 0,1,2,3 (passed to run_video_agent_openai.py)
@@ -132,6 +133,7 @@ video_path="${repo_root}/assets/videos/chinacreekclipped.mp4"
 videos_manifest="nibi_model_compare/videos_manifest.txt"
 prompt="segment all visible marine organisms"
 model_id=""
+model_revision=""
 server_port=""
 tp_size=""
 gpu_ids=""
@@ -190,6 +192,7 @@ while [[ $# -gt 0 ]]; do
     --videos-manifest) videos_manifest="$2"; shift 2 ;;
     --prompt) prompt="$2"; shift 2 ;;
     --model-id) model_id="$2"; shift 2 ;;
+    --model-revision) model_revision="$2"; shift 2 ;;
     --server-port) server_port="$2"; shift 2 ;;
     --tp-size) tp_size="$2"; shift 2 ;;
     --gpu-ids) gpu_ids="$2"; shift 2 ;;
@@ -290,6 +293,22 @@ if [[ ! -f "$template_script" ]]; then
   exit 1
 fi
 
+# Normalize model IDs that embed a suffix (e.g., repo:revision).
+if [[ -z "$model_revision" && "$model_id" == *:* ]]; then
+  model_revision="${model_id#*:}"
+  model_id="${model_id%%:*}"
+  echo "[Info] Parsed model selector into --model-id='${model_id}' --model-revision='${model_revision}'."
+fi
+if [[ "$model_id" == *:* ]]; then
+  echo "Invalid --model-id '${model_id}': ':' is not allowed in repository IDs."
+  echo "Use --model-id <repo> and --model-revision <rev>."
+  exit 1
+fi
+if [[ "$model_id" == *-GGUF && -n "$model_revision" ]]; then
+  echo "[Warn] '${model_id}:${model_revision}' looks like a GGUF quant selector."
+  echo "[Warn] These Slurm templates are tuned for HF Transformers checkpoints; GGUF variants may not start in this workflow."
+fi
+
 if [[ -z "$default_project_prefix" && -n "$account" ]]; then
   default_project_prefix="/project/${account}/${USER}"
 fi
@@ -352,6 +371,7 @@ env_vars=(
   "VIDEOS_MANIFEST=$videos_manifest"
   "PROMPT=$prompt"
   "MODEL_ID=$model_id"
+  "MODEL_REVISION=$model_revision"
   "SERVER_PORT=$server_port"
   "TP_SIZE=$tp_size"
   "IMAGE_SIZE=$image_size"
