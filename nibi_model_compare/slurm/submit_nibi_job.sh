@@ -233,6 +233,7 @@ template_script=""
 case "$template" in
   single)
     template_script="${SCRIPT_DIR}/nibi_single_model.sbatch"
+    : "${account:=rpp-kmoran}"
     : "${model_id:=Qwen/Qwen3-VL-30B-A3B-Instruct}"
     : "${server_port:=8001}"
     : "${tp_size:=4}"
@@ -246,6 +247,7 @@ case "$template" in
     ;;
   array)
     template_script="${SCRIPT_DIR}/nibi_matrix_array.sbatch"
+    : "${account:=rpp-kmoran}"
     : "${model_id:=Qwen/Qwen3-VL-30B-A3B-Instruct}"
     : "${server_port:=8001}"
     : "${tp_size:=4}"
@@ -260,6 +262,7 @@ case "$template" in
     ;;
   tp8)
     template_script="${SCRIPT_DIR}/nibi_qwen35_tp8_candidate.sbatch"
+    : "${account:=rpp-kmoran}"
     : "${model_id:=Qwen/Qwen3.5-397B-A17B}"
     : "${server_port:=8005}"
     : "${tp_size:=8}"
@@ -285,6 +288,10 @@ esac
 if [[ ! -f "$template_script" ]]; then
   echo "Template script not found: $template_script"
   exit 1
+fi
+
+if [[ -z "$default_project_prefix" && -n "$account" ]]; then
+  default_project_prefix="/project/${account}/${USER}"
 fi
 
 # Default Slurm logs under $SCRATCH in a SAM3-specific folder unless overridden.
@@ -336,6 +343,7 @@ done
 sbatch_cmd+=("$template_script")
 
 env_vars=(
+  "ACCOUNT=$account"
   "REPO_ROOT=$repo_root"
   "PROJECT_ROOT=$project_root"
   "ENV_FILE=$env_file"
