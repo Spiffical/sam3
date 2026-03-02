@@ -22,6 +22,8 @@ Core options:
   --prompt <text>                    Default: identify and segment small creatures in the underwater scene
   --model-id <hf-model-id>           Default: Qwen/Qwen3-VL-30B-A3B-Instruct
   --model-revision <rev>             Optional HF revision/tag/branch
+  --vllm-runtime <auto|venv|apptainer> Default: auto (auto=>apptainer for Qwen3.5)
+  --apptainer-image <path>           Optional SIF path (used when runtime=apptainer)
   --output-dir <path>                Interactive mode output directory
   --output-root <path>               Submit mode root (passed to submit wrapper)
   --env-file <path>                  Default: <repo>/.env
@@ -80,6 +82,8 @@ video_path=""
 prompt="identify and segment small creatures in the underwater scene"
 model_id="Qwen/Qwen3-VL-30B-A3B-Instruct"
 model_revision=""
+vllm_runtime="auto"
+apptainer_image=""
 output_dir=""
 output_root=""
 env_file="${REPO_ROOT}/.env"
@@ -122,6 +126,8 @@ while [[ $# -gt 0 ]]; do
     --prompt) prompt="$2"; shift 2 ;;
     --model-id) model_id="$2"; shift 2 ;;
     --model-revision) model_revision="$2"; shift 2 ;;
+    --vllm-runtime) vllm_runtime="$2"; shift 2 ;;
+    --apptainer-image) apptainer_image="$2"; shift 2 ;;
     --output-dir) output_dir="$2"; shift 2 ;;
     --output-root) output_root="$2"; shift 2 ;;
     --env-file) env_file="$2"; shift 2 ;;
@@ -177,6 +183,22 @@ if [[ "$model_id" == *:* ]]; then
   exit 1
 fi
 
+if [[ "$vllm_runtime" == "auto" ]]; then
+  model_id_lc="${model_id,,}"
+  if [[ "$model_id_lc" == *"qwen3.5"* ]]; then
+    vllm_runtime="apptainer"
+  else
+    vllm_runtime="venv"
+  fi
+fi
+if [[ "$vllm_runtime" != "venv" && "$vllm_runtime" != "apptainer" ]]; then
+  echo "Invalid --vllm-runtime '${vllm_runtime}'. Expected one of: auto, venv, apptainer."
+  exit 1
+fi
+if [[ -z "$apptainer_image" ]]; then
+  apptainer_image="${SCRATCH:-/scratch/${USER}}/vllm-openai-nightly.sif"
+fi
+
 if [[ -z "$video_path" ]]; then
   video_path="/project/${account}/${USER}/data/onc/chinacreekclipped.mp4"
 fi
@@ -226,18 +248,71 @@ run_interactive() {
   export PORT="$port"
   export VIDEO_PATH="$video_path"
   export OUT_DIR="$output_dir"
+  export VLLM_RUNTIME="$vllm_runtime"
+  export APPTAINER_IMAGE="$apptainer_image"
 
-  export JOB_CACHE_ROOT="${SLURM_TMPDIR:-/tmp}/sam3-cache"
+  if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
+    export JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-${SCRATCH:-/scratch/${USER}}/sam3-cache/${SLURM_JOB_ID:-manual}}"
+  else
+    export JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-${SLURM_TMPDIR:-/tmp}/sam3-cache}"
+  fi
   export HF_HOME="${JOB_CACHE_ROOT}/hf"
   export HF_HUB_CACHE="${HF_HOME}/hub"
   export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
   export HF_XET_CACHE="${HF_HOME}/xet"
+  export HF_ASSETS_CACHE="${HF_HOME}/assets"
   export TORCH_HOME="${HF_HOME}/torch"
   export XDG_CACHE_HOME="${HF_HOME}/xdg"
   export TMPDIR="${SLURM_TMPDIR:-${JOB_CACHE_ROOT}/tmp}"
+  export VLLM_CACHE_ROOT="${JOB_CACHE_ROOT}/vllm"
+  export TRITON_CACHE_DIR="${JOB_CACHE_ROOT}/triton"
+  export TORCHINDUCTOR_CACHE_DIR="${JOB_CACHE_ROOT}/torchinductor"
+  export NUMBA_CACHE_DIR="${JOB_CACHE_ROOT}/numba"
   export HF_HUB_DISABLE_XET=1
   unset TRANSFORMERS_CACHE
-  mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+  mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$HF_ASSETS_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR" \
+    "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$NUMBA_CACHE_DIR"
+  echo "Cache dirs: HF_HOME=$HF_HOME HF_HUB_CACHE=$HF_HUB_CACHE VLLM_CACHE_ROOT=$VLLM_CACHE_ROOT TMPDIR=$TMPDIR"
+
+  if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
+    if ! type module >/dev/null 2>&1; then
+      echo "Environment module system is unavailable; cannot load apptainer runtime."
+      exit 1
+    fi
+    module load apptainer
+
+    export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-${SCRATCH:-/scratch/${USER}}/apptainer-cache}"
+    export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${SLURM_TMPDIR:-$JOB_CACHE_ROOT/apptainer-tmp}}"
+    export APPTAINER_HOME="${APPTAINER_HOME:-$JOB_CACHE_ROOT/apptainer-home}"
+    export APPTAINER_BINDPATH="${APPTAINER_BINDPATH:-$JOB_CACHE_ROOT,$APPTAINER_HOME,$APPTAINER_CACHEDIR,$APPTAINER_TMPDIR}"
+    if [[ -n "${SLURM_TMPDIR:-}" ]]; then
+      APPTAINER_BINDPATH="${APPTAINER_BINDPATH},${SLURM_TMPDIR}:${SLURM_TMPDIR}"
+    fi
+    mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR" "$APPTAINER_HOME"
+
+    if [[ ! -f "$APPTAINER_IMAGE" ]]; then
+      echo "Apptainer image missing; pulling: $APPTAINER_IMAGE"
+      apptainer pull "$APPTAINER_IMAGE" docker://vllm/vllm-openai:nightly
+    fi
+
+    export APPTAINERENV_HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"
+    export APPTAINERENV_HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}"
+    export APPTAINERENV_HF_HOME="$HF_HOME"
+    export APPTAINERENV_HF_HUB_CACHE="$HF_HUB_CACHE"
+    export APPTAINERENV_HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
+    export APPTAINERENV_HF_XET_CACHE="$HF_XET_CACHE"
+    export APPTAINERENV_HF_ASSETS_CACHE="$HF_ASSETS_CACHE"
+    export APPTAINERENV_XDG_CACHE_HOME="$XDG_CACHE_HOME"
+    export APPTAINERENV_TMPDIR="$TMPDIR"
+    export APPTAINERENV_VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT"
+    export APPTAINERENV_TRITON_CACHE_DIR="$TRITON_CACHE_DIR"
+    export APPTAINERENV_TORCHINDUCTOR_CACHE_DIR="$TORCHINDUCTOR_CACHE_DIR"
+    export APPTAINERENV_NUMBA_CACHE_DIR="$NUMBA_CACHE_DIR"
+    export APPTAINERENV_TRANSFORMERS_CACHE="$HF_HUB_CACHE"
+    export APPTAINERENV_REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+    export APPTAINERENV_CURL_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+    export APPTAINERENV_SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
+  fi
 
   export SAM3_DISABLE_WARMUP="$sam3_disable_warmup"
   export SAM3_MAX_IMAGES_PER_REQUEST="$sam3_max_images_per_request"
@@ -253,19 +328,33 @@ run_interactive() {
   mkdir -p "$OUT_DIR"
   pkill -f "vllm serve" || true
 
-  vllm_log="/tmp/vllm_${SLURM_JOB_ID}.log"
-  runner_log="/tmp/sam3_runner_${SLURM_JOB_ID}.log"
+  vllm_log="${TMPDIR}/vllm_${SLURM_JOB_ID}.log"
+  runner_log="${TMPDIR}/sam3_runner_${SLURM_JOB_ID}.log"
 
-  vllm_cmd=(
-    vllm serve "$MODEL_ID"
-    --tensor-parallel-size "$tp_size"
-    --allowed-local-media-path /
-    --gpu-memory-utilization "$gpu_memory_utilization"
-    --max-model-len "$max_model_len"
-    --max-num-seqs "$max_num_seqs"
-    --limit-mm-per-prompt "$limit_mm_per_prompt"
-    --port "$PORT"
-  )
+  if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
+    vllm_cmd=(
+      apptainer exec --cleanenv --nv --bind "$APPTAINER_BINDPATH" --home "$APPTAINER_HOME" "$APPTAINER_IMAGE"
+      vllm serve "$MODEL_ID"
+      --tensor-parallel-size "$tp_size"
+      --allowed-local-media-path /
+      --gpu-memory-utilization "$gpu_memory_utilization"
+      --max-model-len "$max_model_len"
+      --max-num-seqs "$max_num_seqs"
+      --limit-mm-per-prompt "$limit_mm_per_prompt"
+      --port "$PORT"
+    )
+  else
+    vllm_cmd=(
+      vllm serve "$MODEL_ID"
+      --tensor-parallel-size "$tp_size"
+      --allowed-local-media-path /
+      --gpu-memory-utilization "$gpu_memory_utilization"
+      --max-model-len "$max_model_len"
+      --max-num-seqs "$max_num_seqs"
+      --limit-mm-per-prompt "$limit_mm_per_prompt"
+      --port "$PORT"
+    )
+  fi
   if [[ -n "$MODEL_REVISION" ]]; then
     vllm_cmd+=(--revision "$MODEL_REVISION")
   fi
@@ -294,17 +383,29 @@ run_interactive() {
   if [[ -n "$MODEL_REVISION" ]]; then
     echo "model revision: $MODEL_REVISION"
   fi
+  echo "vllm runtime: $VLLM_RUNTIME"
+  if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
+    echo "apptainer image: $APPTAINER_IMAGE"
+  fi
   echo "out:   $OUT_DIR"
   echo "vllm cuda visible: $vllm_cuda_visible_devices"
   echo "runner cuda visible: $runner_cuda_visible_devices"
 
   if [[ "$dry_run" == "1" ]]; then
-    echo "CUDA_VISIBLE_DEVICES=${vllm_cuda_visible_devices} ${vllm_cmd[*]} >${vllm_log} 2>&1 &"
+    if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
+      echo "APPTAINERENV_CUDA_VISIBLE_DEVICES=${vllm_cuda_visible_devices} ${vllm_cmd[*]} >${vllm_log} 2>&1 &"
+    else
+      echo "CUDA_VISIBLE_DEVICES=${vllm_cuda_visible_devices} ${vllm_cmd[*]} >${vllm_log} 2>&1 &"
+    fi
     echo "CUDA_VISIBLE_DEVICES=${runner_cuda_visible_devices} ${runner_cmd[*]} 2>&1 | tee ${runner_log}"
     exit 0
   fi
 
-  CUDA_VISIBLE_DEVICES="$vllm_cuda_visible_devices" "${vllm_cmd[@]}" >"$vllm_log" 2>&1 &
+  if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
+    APPTAINERENV_CUDA_VISIBLE_DEVICES="$vllm_cuda_visible_devices" "${vllm_cmd[@]}" >"$vllm_log" 2>&1 &
+  else
+    CUDA_VISIBLE_DEVICES="$vllm_cuda_visible_devices" "${vllm_cmd[@]}" >"$vllm_log" 2>&1 &
+  fi
   vllm_pid=$!
 
   cleanup() {
@@ -367,6 +468,8 @@ run_submit() {
     --repo-root "$REPO_ROOT"
     --project-root "$REPO_ROOT"
     --out-root "$output_root"
+    --vllm-runtime "$vllm_runtime"
+    --apptainer-image "$apptainer_image"
     --set-env "SAM3_DISABLE_WARMUP=${sam3_disable_warmup}"
     --set-env "SAM3_MAX_IMAGES_PER_REQUEST=${sam3_max_images_per_request}"
     --set-env "PYTORCH_CUDA_ALLOC_CONF=${pytorch_cuda_alloc_conf}"

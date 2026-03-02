@@ -45,6 +45,8 @@ Runtime overrides (forwarded as env vars):
   --prompt <text>
   --model-id <hf-model-id>
   --model-revision <rev>
+  --vllm-runtime <auto|venv|apptainer>
+  --apptainer-image <path>
   --server-port <port>
   --tp-size <n>
   --gpu-ids <ids>                  e.g. 0,1,2,3 (passed to run_video_agent_openai.py)
@@ -134,6 +136,8 @@ videos_manifest="nibi_model_compare/videos_manifest.txt"
 prompt="segment all visible marine organisms"
 model_id=""
 model_revision=""
+vllm_runtime="auto"
+apptainer_image=""
 server_port=""
 tp_size=""
 gpu_ids=""
@@ -193,6 +197,8 @@ while [[ $# -gt 0 ]]; do
     --prompt) prompt="$2"; shift 2 ;;
     --model-id) model_id="$2"; shift 2 ;;
     --model-revision) model_revision="$2"; shift 2 ;;
+    --vllm-runtime) vllm_runtime="$2"; shift 2 ;;
+    --apptainer-image) apptainer_image="$2"; shift 2 ;;
     --server-port) server_port="$2"; shift 2 ;;
     --tp-size) tp_size="$2"; shift 2 ;;
     --gpu-ids) gpu_ids="$2"; shift 2 ;;
@@ -309,6 +315,22 @@ if [[ "$model_id" == *-GGUF && -n "$model_revision" ]]; then
   echo "[Warn] These Slurm templates are tuned for HF Transformers checkpoints; GGUF variants may not start in this workflow."
 fi
 
+if [[ "$vllm_runtime" == "auto" ]]; then
+  model_id_lc="${model_id,,}"
+  if [[ "$model_id_lc" == *"qwen3.5"* ]]; then
+    vllm_runtime="apptainer"
+  else
+    vllm_runtime="venv"
+  fi
+fi
+if [[ "$vllm_runtime" != "venv" && "$vllm_runtime" != "apptainer" ]]; then
+  echo "Invalid --vllm-runtime '${vllm_runtime}'. Expected one of: auto, venv, apptainer."
+  exit 1
+fi
+if [[ -z "$apptainer_image" ]]; then
+  apptainer_image="${SCRATCH:-/scratch/${USER}}/vllm-openai-nightly.sif"
+fi
+
 if [[ -z "$default_project_prefix" && -n "$account" ]]; then
   default_project_prefix="/project/${account}/${USER}"
 fi
@@ -372,6 +394,8 @@ env_vars=(
   "PROMPT=$prompt"
   "MODEL_ID=$model_id"
   "MODEL_REVISION=$model_revision"
+  "VLLM_RUNTIME=$vllm_runtime"
+  "APPTAINER_IMAGE=$apptainer_image"
   "SERVER_PORT=$server_port"
   "TP_SIZE=$tp_size"
   "IMAGE_SIZE=$image_size"

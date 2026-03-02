@@ -89,11 +89,19 @@ export HF_HOME="${HF_HOME:-$JOB_CACHE_ROOT/hf}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HUB_CACHE}"
 export HF_XET_CACHE="${HF_XET_CACHE:-$HF_HOME/xet}"
+export HF_ASSETS_CACHE="${HF_ASSETS_CACHE:-$HF_HOME/assets}"
 export TORCH_HOME="${TORCH_HOME:-$HF_HOME/torch}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HF_HOME/xdg}"
 export TMPDIR="${TMPDIR:-${SLURM_TMPDIR:-$HF_HOME/tmp}}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$JOB_CACHE_ROOT/vllm}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$JOB_CACHE_ROOT/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$JOB_CACHE_ROOT/torchinductor}"
+export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-$JOB_CACHE_ROOT/numba}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
-mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+unset TRANSFORMERS_CACHE
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$HF_ASSETS_CACHE" "$TORCH_HOME" "$XDG_CACHE_HOME" "$TMPDIR" \
+  "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$NUMBA_CACHE_DIR"
+echo "Cache dirs: HF_HOME=$HF_HOME HF_HUB_CACHE=$HF_HUB_CACHE VLLM_CACHE_ROOT=$VLLM_CACHE_ROOT TMPDIR=$TMPDIR"
 
 if command -v rsync >/dev/null 2>&1; then
   mkdir -p "$PERSISTENT_CACHE_ROOT/hub"
@@ -113,6 +121,20 @@ if [[ "$MODEL_ID" == *:* ]]; then
   echo "Invalid MODEL_ID '${MODEL_ID}'. Use plain repo id, and pass revision as MODEL_REVISION."
   exit 1
 fi
+VLLM_RUNTIME="${VLLM_RUNTIME:-auto}"
+if [[ "$VLLM_RUNTIME" == "auto" ]]; then
+  model_id_lc="${MODEL_ID,,}"
+  if [[ "$model_id_lc" == *"qwen3.5"* ]]; then
+    VLLM_RUNTIME="apptainer"
+  else
+    VLLM_RUNTIME="venv"
+  fi
+fi
+if [[ "$VLLM_RUNTIME" != "venv" && "$VLLM_RUNTIME" != "apptainer" ]]; then
+  echo "Invalid VLLM_RUNTIME '${VLLM_RUNTIME}'. Expected one of: auto, venv, apptainer."
+  exit 1
+fi
+APPTAINER_IMAGE="${APPTAINER_IMAGE:-${SCRATCH:-/scratch/$USER}/vllm-openai-nightly.sif}"
 SERVER_PORT="${SERVER_PORT:-8005}"
 export SERVER_PORT
 TP_SIZE="${TP_SIZE:-8}"
@@ -145,15 +167,60 @@ fi
 RUNNER_GPU_IDS="${RUNNER_GPU_IDS:-$GPU_IDS}"
 echo "GPUs detected: $GPU_COUNT ; using $GPU_IDS"
 
-VLLM_CMD=(
-  vllm serve "$MODEL_ID"
-  --tensor-parallel-size "$TP_SIZE"
-  --trust-remote-code
-  --allowed-local-media-path /
-  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
-  --max-model-len "$MAX_MODEL_LEN"
-  --port "$SERVER_PORT"
-)
+echo "vLLM runtime: $VLLM_RUNTIME"
+if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
+  module load apptainer
+  export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-${SCRATCH:-/scratch/$USER}/apptainer-cache}"
+  export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${SLURM_TMPDIR:-$JOB_CACHE_ROOT/apptainer-tmp}}"
+  export APPTAINER_HOME="${APPTAINER_HOME:-$JOB_CACHE_ROOT/apptainer-home}"
+  export APPTAINER_BINDPATH="${APPTAINER_BINDPATH:-$JOB_CACHE_ROOT,$APPTAINER_HOME,$APPTAINER_CACHEDIR,$APPTAINER_TMPDIR}"
+  if [[ -n "${SLURM_TMPDIR:-}" ]]; then
+    APPTAINER_BINDPATH="${APPTAINER_BINDPATH},${SLURM_TMPDIR}:${SLURM_TMPDIR}"
+  fi
+  mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR" "$APPTAINER_HOME"
+  if [[ ! -f "$APPTAINER_IMAGE" ]]; then
+    echo "Apptainer image missing; pulling: $APPTAINER_IMAGE"
+    apptainer pull "$APPTAINER_IMAGE" docker://vllm/vllm-openai:nightly
+  fi
+  export APPTAINERENV_HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"
+  export APPTAINERENV_HUGGINGFACE_HUB_TOKEN="${HUGGINGFACE_HUB_TOKEN:-${HF_TOKEN:-}}"
+  export APPTAINERENV_HF_HOME="$HF_HOME"
+  export APPTAINERENV_HF_HUB_CACHE="$HF_HUB_CACHE"
+  export APPTAINERENV_HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
+  export APPTAINERENV_HF_XET_CACHE="$HF_XET_CACHE"
+  export APPTAINERENV_HF_ASSETS_CACHE="$HF_ASSETS_CACHE"
+  export APPTAINERENV_XDG_CACHE_HOME="$XDG_CACHE_HOME"
+  export APPTAINERENV_TMPDIR="$TMPDIR"
+  export APPTAINERENV_VLLM_CACHE_ROOT="$VLLM_CACHE_ROOT"
+  export APPTAINERENV_TRITON_CACHE_DIR="$TRITON_CACHE_DIR"
+  export APPTAINERENV_TORCHINDUCTOR_CACHE_DIR="$TORCHINDUCTOR_CACHE_DIR"
+  export APPTAINERENV_NUMBA_CACHE_DIR="$NUMBA_CACHE_DIR"
+  export APPTAINERENV_TRANSFORMERS_CACHE="$HF_HUB_CACHE"
+  export APPTAINERENV_HF_HUB_DISABLE_XET="$HF_HUB_DISABLE_XET"
+  export APPTAINERENV_REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+  export APPTAINERENV_CURL_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+  export APPTAINERENV_SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
+  VLLM_CMD=(
+    apptainer exec --cleanenv --nv --bind "$APPTAINER_BINDPATH" --home "$APPTAINER_HOME" "$APPTAINER_IMAGE"
+    vllm serve "$MODEL_ID"
+    --tensor-parallel-size "$TP_SIZE"
+    --trust-remote-code
+    --allowed-local-media-path /
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+    --max-model-len "$MAX_MODEL_LEN"
+    --port "$SERVER_PORT"
+  )
+else
+  VLLM_CMD=(
+    vllm serve "$MODEL_ID"
+    --tensor-parallel-size "$TP_SIZE"
+    --trust-remote-code
+    --allowed-local-media-path /
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+    --max-model-len "$MAX_MODEL_LEN"
+    --port "$SERVER_PORT"
+  )
+fi
 if [[ -n "$MAX_NUM_SEQS" ]]; then
   VLLM_CMD+=(--max-num-seqs "$MAX_NUM_SEQS")
 fi
@@ -163,10 +230,18 @@ fi
 if [[ -n "$LIMIT_MM_PER_PROMPT" ]]; then
   VLLM_CMD+=(--limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT")
 fi
-if [[ -n "$VLLM_CUDA_VISIBLE_DEVICES" ]]; then
-  CUDA_VISIBLE_DEVICES="$VLLM_CUDA_VISIBLE_DEVICES" "${VLLM_CMD[@]}" &
+if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
+  if [[ -n "$VLLM_CUDA_VISIBLE_DEVICES" ]]; then
+    APPTAINERENV_CUDA_VISIBLE_DEVICES="$VLLM_CUDA_VISIBLE_DEVICES" "${VLLM_CMD[@]}" &
+  else
+    "${VLLM_CMD[@]}" &
+  fi
 else
-  "${VLLM_CMD[@]}" &
+  if [[ -n "$VLLM_CUDA_VISIBLE_DEVICES" ]]; then
+    CUDA_VISIBLE_DEVICES="$VLLM_CUDA_VISIBLE_DEVICES" "${VLLM_CMD[@]}" &
+  else
+    "${VLLM_CMD[@]}" &
+  fi
 fi
 VLLM_PID=$!
 
