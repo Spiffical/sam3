@@ -43,6 +43,7 @@ Runtime overrides (forwarded as env vars):
   --video-path <path>
   --videos-manifest <path>
   --prompt <text>
+  --prompt-profile <name>           Agent prompt profile (e.g. general, underwater)
   --model-id <hf-model-id>
   --model-revision <rev>
   --vllm-runtime <auto|venv|apptainer>
@@ -134,6 +135,7 @@ venv_path="${repo_root}/.venv"
 video_path="${repo_root}/assets/videos/chinacreekclipped.mp4"
 videos_manifest="nibi_model_compare/videos_manifest.txt"
 prompt="segment all visible marine organisms"
+prompt_profile="underwater"
 model_id=""
 model_revision=""
 vllm_runtime="auto"
@@ -195,6 +197,7 @@ while [[ $# -gt 0 ]]; do
     --video-path) video_path="$2"; shift 2 ;;
     --videos-manifest) videos_manifest="$2"; shift 2 ;;
     --prompt) prompt="$2"; shift 2 ;;
+    --prompt-profile) prompt_profile="$2"; shift 2 ;;
     --model-id) model_id="$2"; shift 2 ;;
     --model-revision) model_revision="$2"; shift 2 ;;
     --vllm-runtime) vllm_runtime="$2"; shift 2 ;;
@@ -392,6 +395,7 @@ env_vars=(
   "VIDEO_PATH=$video_path"
   "VIDEOS_MANIFEST=$videos_manifest"
   "PROMPT=$prompt"
+  "SAM3_AGENT_PROMPT_PROFILE=$prompt_profile"
   "MODEL_ID=$model_id"
   "MODEL_REVISION=$model_revision"
   "VLLM_RUNTIME=$vllm_runtime"

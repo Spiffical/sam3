@@ -163,6 +163,7 @@ fi
 
 VIDEO_PATH="${VIDEO_PATH:-$REPO_ROOT/assets/videos/chinacreekclipped.mp4}"
 PROMPT="${PROMPT:-segment all visible marine organisms}"
+PROMPT_PROFILE="${PROMPT_PROFILE:-${SAM3_AGENT_PROMPT_PROFILE:-underwater}}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-397B-A17B}"
 MODEL_REVISION="${MODEL_REVISION:-}"
 if [[ -z "$MODEL_REVISION" && "$MODEL_ID" == *:* ]]; then
@@ -332,6 +333,7 @@ RUN_CMD=(
   python3 nibi_model_compare/run_video_agent_openai.py
   --video_path "$VIDEO_PATH"
   --prompt "$PROMPT"
+  --prompt-profile "$PROMPT_PROFILE"
   --server_url "http://127.0.0.1:${SERVER_PORT}/v1"
   --model "$MODEL_ID"
   --output_dir "$STAGE_OUT"

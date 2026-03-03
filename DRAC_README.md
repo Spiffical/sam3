@@ -73,6 +73,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python nibi_model_compare/run_video_agent_openai.py \
   --video_path "$VIDEO_PATH" \
   --prompt "identify and segment small creatures in the underwater scene" \
+  --prompt-profile underwater \
   --server_url "http://127.0.0.1:${PORT}/v1" \
   --model "$MODEL_ID" \
   --output_dir "$OUT_DIR" \
@@ -112,6 +113,7 @@ nibi_model_compare/slurm/submit_nibi_job.sh \
   --max-completion-tokens 1024 \
   --video-path "/project/${ACCOUNT}/${USER}/data/onc/chinacreekclipped.mp4" \
   --prompt "identify and segment small creatures in the underwater scene" \
+  --prompt-profile underwater \
   --debug \
   --set-env SAM3_DISABLE_WARMUP=1 \
   --set-env SAM3_MAX_IMAGES_PER_REQUEST=1 \
@@ -618,6 +620,7 @@ nibi_model_compare/run_nibi_agent.sh \
   --mode submit \
   --account "$ACCOUNT" \
   --venv-path "$HOME/sam3/.venv-qwen35" \
+  --prompt-profile underwater \
   --vllm-runtime apptainer \
   --apptainer-image "${SCRATCH:-/scratch/$USER}/vllm-openai-nightly.sif" \
   --gpus-per-node h100:2 \
@@ -637,6 +640,7 @@ Templates in `nibi_model_compare/slurm` are configured to:
 - map `HF_TOKEN` into `HUGGINGFACE_HUB_TOKEN` if needed,
 - use `$SLURM_TMPDIR`-backed cache by default with optional `/project` prewarm/sync.
 - support `VLLM_RUNTIME=auto|venv|apptainer` (auto routes Qwen3.5 models to Apptainer).
+- support `SAM3_AGENT_PROMPT_PROFILE` (default `underwater` in Nibi wrappers/templates). Use `general` to revert to base prompts.
 
 ## 11) Security
 

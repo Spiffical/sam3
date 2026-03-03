@@ -15,6 +15,63 @@ from .client_sam3 import call_sam_service
 from .viz import visualize
 
 
+def _read_prompt_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def _load_system_prompts(current_dir):
+    base_system_prompt_path = os.path.join(current_dir, "system_prompts/system_prompt.txt")
+    base_iterative_prompt_path = os.path.join(
+        current_dir, "system_prompts/system_prompt_iterative_checking.txt"
+    )
+    profile = os.environ.get("SAM3_AGENT_PROMPT_PROFILE", "general").strip().lower()
+    system_prompt_override = os.environ.get("SAM3_SYSTEM_PROMPT_PATH", "").strip()
+    iterative_prompt_override = os.environ.get(
+        "SAM3_ITERATIVE_SYSTEM_PROMPT_PATH", ""
+    ).strip()
+
+    if system_prompt_override:
+        system_prompt = _read_prompt_file(system_prompt_override)
+    else:
+        system_prompt = _read_prompt_file(base_system_prompt_path)
+
+    if iterative_prompt_override:
+        iterative_checking_system_prompt = _read_prompt_file(iterative_prompt_override)
+    else:
+        iterative_checking_system_prompt = _read_prompt_file(base_iterative_prompt_path)
+
+    if profile == "underwater":
+        underwater_system_addendum_path = os.path.join(
+            current_dir, "system_prompts/system_prompt_underwater_addendum.txt"
+        )
+        underwater_iterative_addendum_path = os.path.join(
+            current_dir,
+            "system_prompts/system_prompt_iterative_checking_underwater_addendum.txt",
+        )
+        if not system_prompt_override and os.path.exists(underwater_system_addendum_path):
+            system_prompt = (
+                _read_prompt_file(underwater_system_addendum_path)
+                + "\n\n"
+                + system_prompt
+            )
+        if not iterative_prompt_override and os.path.exists(
+            underwater_iterative_addendum_path
+        ):
+            iterative_checking_system_prompt = (
+                _read_prompt_file(underwater_iterative_addendum_path)
+                + "\n\n"
+                + iterative_checking_system_prompt
+            )
+    elif profile not in {"", "general", "default", "base"}:
+        print(
+            f"[Warn] Unknown SAM3_AGENT_PROMPT_PROFILE='{profile}'. "
+            "Falling back to base prompts."
+        )
+
+    return system_prompt, iterative_checking_system_prompt, profile
+
+
 def save_debug_messages(messages_list, debug, debug_folder_path, debug_jsonl_path):
     """Save messages to debug jsonl file if debug is enabled"""
     if debug and debug_jsonl_path:
@@ -352,12 +409,6 @@ def agent_inference(
     os.makedirs(error_save_dir, exist_ok=True)
     os.makedirs(debug_save_dir, exist_ok=True)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    MLLM_SYSTEM_PROMPT_PATH = os.path.join(
-        current_dir, "system_prompts/system_prompt.txt"
-    )
-    ITERATIVE_CHECKING_SYSTEM_PROMPT_PATH = os.path.join(
-        current_dir, "system_prompts/system_prompt_iterative_checking.txt"
-    )
     # init variables
     PATH_TO_LATEST_OUTPUT_JSON = ""
     LATEST_SAM3_TEXT_PROMPT = ""
@@ -377,10 +428,12 @@ def agent_inference(
         os.makedirs(debug_folder_path, exist_ok=True)
 
     # The helper functions are now defined outside the agent_inference function
-    with open(MLLM_SYSTEM_PROMPT_PATH, "r") as f:
-        system_prompt = f.read().strip()
-    with open(ITERATIVE_CHECKING_SYSTEM_PROMPT_PATH, "r") as f:
-        iterative_checking_system_prompt = f.read().strip()
+    (
+        system_prompt,
+        iterative_checking_system_prompt,
+        prompt_profile,
+    ) = _load_system_prompts(current_dir)
+    print(f"> Prompt profile: {prompt_profile}")
 
     # Construct the initial message list
     messages = [

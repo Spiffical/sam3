@@ -21,6 +21,7 @@ Core options:
   --video-path <path>                Default: /project/$ACCOUNT/$USER/data/onc/chinacreekclipped.mp4
   --prompt <text>                    Default: identify and segment small creatures in the underwater scene
   --model-id <hf-model-id>           Default: Qwen/Qwen3-VL-30B-A3B-Instruct
+  --prompt-profile <name>            Default: underwater (profiles: general, underwater)
   --model-revision <rev>             Optional HF revision/tag/branch
   --vllm-runtime <auto|venv|apptainer> Default: auto (auto=>apptainer for Qwen3.5)
   --apptainer-image <path>           Optional SIF path (used when runtime=apptainer)
@@ -134,6 +135,7 @@ account="${ACCOUNT:-rpp-kmoran}"
 video_path=""
 prompt="identify and segment small creatures in the underwater scene"
 model_id="Qwen/Qwen3-VL-30B-A3B-Instruct"
+prompt_profile="underwater"
 model_revision=""
 vllm_runtime="auto"
 apptainer_image=""
@@ -178,6 +180,7 @@ while [[ $# -gt 0 ]]; do
     --video-path) video_path="$2"; shift 2 ;;
     --prompt) prompt="$2"; shift 2 ;;
     --model-id) model_id="$2"; shift 2 ;;
+    --prompt-profile) prompt_profile="$2"; shift 2 ;;
     --model-revision) model_revision="$2"; shift 2 ;;
     --vllm-runtime) vllm_runtime="$2"; shift 2 ;;
     --apptainer-image) apptainer_image="$2"; shift 2 ;;
@@ -299,6 +302,7 @@ run_interactive() {
   export ACCOUNT="$account"
   export MODEL_ID="$model_id"
   export MODEL_REVISION="$model_revision"
+  export SAM3_AGENT_PROMPT_PROFILE="$prompt_profile"
   export PORT="$port"
   export VIDEO_PATH="$video_path"
   export OUT_DIR="$output_dir"
@@ -423,6 +427,7 @@ run_interactive() {
     --prompt "$prompt"
     --server_url "http://127.0.0.1:${PORT}/v1"
     --model "$MODEL_ID"
+    --prompt-profile "$SAM3_AGENT_PROMPT_PROFILE"
     --output_dir "$OUT_DIR"
     --gpus "$runner_gpu_ids"
     --image_size "$image_size"
@@ -438,6 +443,7 @@ run_interactive() {
   echo "=== Interactive run configuration ==="
   echo "video: $VIDEO_PATH"
   echo "model: $MODEL_ID"
+  echo "prompt profile: $SAM3_AGENT_PROMPT_PROFILE"
   if [[ -n "$MODEL_REVISION" ]]; then
     echo "model revision: $MODEL_REVISION"
   fi
@@ -509,6 +515,7 @@ run_submit() {
     --video-path "$video_path"
     --prompt "$prompt"
     --model-id "$model_id"
+    --prompt-profile "$prompt_profile"
     --model-revision "$model_revision"
     --server-port "$port"
     --tp-size "$tp_size"

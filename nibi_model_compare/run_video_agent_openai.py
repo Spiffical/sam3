@@ -433,6 +433,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server_url", required=True, type=str)
     parser.add_argument("--model", required=True, type=str)
     parser.add_argument("--api_key", type=str, default=None)
+    parser.add_argument(
+        "--prompt-profile",
+        default=os.environ.get("SAM3_AGENT_PROMPT_PROFILE", "general"),
+        type=str,
+        help="Agent system-prompt profile (e.g., general, underwater).",
+    )
     parser.add_argument("--output_dir", default="nibi_model_compare/run_out", type=str)
     parser.add_argument("--gpus", default="0", type=str)
     parser.add_argument(
@@ -460,12 +466,14 @@ def parse_args() -> argparse.Namespace:
 
 def run() -> int:
     args = parse_args()
+    os.environ["SAM3_AGENT_PROMPT_PROFILE"] = args.prompt_profile
     os.makedirs(args.output_dir, exist_ok=True)
     start_ts = time.time()
     metrics: dict[str, Any] = {
         "status": "started",
         "video_path": os.path.abspath(args.video_path),
         "prompt": args.prompt,
+        "prompt_profile": args.prompt_profile,
         "server_url": args.server_url,
         "model": args.model,
         "gpus": args.gpus,

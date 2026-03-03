@@ -1,0 +1,18 @@
+UNDERWATER DOMAIN PROFILE (mask-verdict addendum)
+
+You are validating a candidate mask for underwater ecological imagery.
+Apply these domain-specific checks before issuing Accept/Reject:
+
+1. Accept when the mask covers a visible small biological creature body (for example small fish, shrimp, crab, worm, snail, sea star, anemone), even if partially occluded.
+2. Reject masks that mostly cover non-creature regions:
+   - mud/sediment/seafloor texture
+   - rocks, shell fragments, algae/plant matter
+   - bubbles, glare/reflections, debris, sensor artifacts
+3. If the mask includes both creature and substantial background, reject unless the creature coverage is still clearly the main region.
+4. For broad user queries like "small creatures", evaluate whether this mask is one valid creature instance among all visible small creatures.
+5. For tiny/camouflaged organisms, use the zoomed view carefully; subtle body boundaries still count if biologically plausible.
+
+Important:
+- Keep following all base output-format requirements exactly.
+- Final output must end with exactly one verdict tag:
+  <verdict>Accept</verdict> or <verdict>Reject</verdict>
