@@ -524,6 +524,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--invalid_frame_source",
+        default="hybrid",
+        choices=["heuristic", "mllm", "hybrid"],
+        help=(
+            "Invalid-frame detection source: heuristic-only, mllm-only, "
+            "or hybrid union (default)."
+        ),
+    )
+    parser.add_argument(
         "--invalid_frame_black_mean_threshold",
         default=8.0,
         type=float,
@@ -547,6 +556,83 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help="Frame-quality threshold: low normalized entropy cutoff.",
     )
+    parser.add_argument(
+        "--mllm_invalid_window_size",
+        default=4,
+        type=int,
+        help="Number of frames per MLLM invalid-frame classification window.",
+    )
+    parser.add_argument(
+        "--mllm_invalid_window_stride",
+        default=4,
+        type=int,
+        help=(
+            "Frame stride between MLLM invalid-frame windows. "
+            "Use <= window_size for full-video coverage."
+        ),
+    )
+    parser.add_argument(
+        "--mllm_invalid_max_completion_tokens",
+        default=512,
+        type=int,
+        help="Completion token budget for MLLM invalid-frame classification calls.",
+    )
+    parser.add_argument(
+        "--mllm_invalid_use_collage",
+        dest="mllm_invalid_use_collage",
+        action="store_true",
+        help="Use a collage image per invalid-frame classification window.",
+    )
+    parser.add_argument(
+        "--no_mllm_invalid_use_collage",
+        dest="mllm_invalid_use_collage",
+        action="store_false",
+        help="Disable collage mode for MLLM invalid-frame classification windows.",
+    )
+    parser.set_defaults(mllm_invalid_use_collage=True)
+    parser.add_argument(
+        "--mllm_invalid_collage_cols",
+        default=2,
+        type=int,
+        help="Number of columns in invalid-frame classification collages.",
+    )
+    parser.add_argument(
+        "--mllm_invalid_collage_tile_max_edge",
+        default=512,
+        type=int,
+        help="Max edge (px) for each tile in invalid-frame classification collages.",
+    )
+    parser.add_argument(
+        "--mllm_invalid_prompt_path",
+        default="",
+        type=str,
+        help=(
+            "Optional path to frame-validity MLLM system prompt template. "
+            "If unset, uses profile-specific default."
+        ),
+    )
+    parser.add_argument(
+        "--mllm_invalid_max_json_retries",
+        default=2,
+        type=int,
+        help="Retries per invalid-frame window when output is not valid strict JSON.",
+    )
+    parser.add_argument(
+        "--mllm_invalid_fill_missing_with_heuristic",
+        dest="mllm_invalid_fill_missing_with_heuristic",
+        action="store_true",
+        help=(
+            "For frames without MLLM vote, use heuristic quality fallback to ensure "
+            "every frame has a validity label."
+        ),
+    )
+    parser.add_argument(
+        "--no_mllm_invalid_fill_missing_with_heuristic",
+        dest="mllm_invalid_fill_missing_with_heuristic",
+        action="store_false",
+        help="Do not use heuristic fallback for frames missing MLLM votes.",
+    )
+    parser.set_defaults(mllm_invalid_fill_missing_with_heuristic=True)
     parser.add_argument(
         "--discovery_mode",
         default="hybrid",
@@ -658,6 +744,7 @@ def run() -> int:
             )
 
         from frame_quality import scan_video_frame_quality
+        from frame_quality_mllm import discover_invalid_frames_with_mllm
         from keyframe_discovery import discover_keyframes_from_motion
         from keyframe_discovery_mllm import discover_keyframes_with_mllm
         from track_id_matching import assign_object_ids_by_iou
@@ -772,6 +859,13 @@ def run() -> int:
             api_key=api_key,
             max_tokens=args.mllm_discovery_max_completion_tokens,
         )
+        send_req_invalid_frames = partial(
+            send_generate_request_orig,
+            server_url=args.server_url,
+            model=args.model,
+            api_key=api_key,
+            max_tokens=args.mllm_invalid_max_completion_tokens,
+        )
         # Keep frame_0 extraction for compatibility and debugging.
         frame_0_path = os.path.join(args.output_dir, "frame_0.jpg")
         Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).save(frame_0_path)
@@ -779,28 +873,99 @@ def run() -> int:
         invalid_frame_indices: list[int] = []
         keyframe_indices: list[int] = [0]
         keyframe_event_candidates: list[dict[str, Any]] = []
+        heuristic_invalid_frame_indices: list[int] = []
+        mllm_invalid_frame_indices: list[int] = []
 
         should_scan_frame_quality = (
             args.temporal_keyframe_pipeline or args.drop_invalid_frames
         )
         if should_scan_frame_quality:
-            quality = scan_video_frame_quality(
-                args.video_path,
-                black_mean_threshold=args.invalid_frame_black_mean_threshold,
-                white_mean_threshold=args.invalid_frame_white_mean_threshold,
-                low_std_threshold=args.invalid_frame_low_std_threshold,
-                low_entropy_threshold=args.invalid_frame_low_entropy_threshold,
+            if args.invalid_frame_source in {"mllm", "hybrid"}:
+                mllm_quality = discover_invalid_frames_with_mllm(
+                    video_path=args.video_path,
+                    send_generate_request_fn=send_req_invalid_frames,
+                    initial_text_prompt=args.prompt,
+                    total_frames=total_frames,
+                    output_dir=os.path.join(args.output_dir, "mllm_frame_validity"),
+                    window_size=args.mllm_invalid_window_size,
+                    window_stride=args.mllm_invalid_window_stride,
+                    use_collage=args.mllm_invalid_use_collage,
+                    collage_cols=args.mllm_invalid_collage_cols,
+                    collage_tile_max_edge=args.mllm_invalid_collage_tile_max_edge,
+                    prompt_profile=args.prompt_profile,
+                    prompt_template_path=(
+                        args.mllm_invalid_prompt_path.strip() or None
+                    ),
+                    max_json_retries=args.mllm_invalid_max_json_retries,
+                    fill_missing_with_heuristic=(
+                        args.mllm_invalid_fill_missing_with_heuristic
+                    ),
+                )
+                mllm_invalid_frame_indices = sorted(
+                    set(mllm_quality.get("invalid_frame_indices", []))
+                )
+                write_json(
+                    os.path.join(args.output_dir, "frame_quality_scan_mllm.json"),
+                    mllm_quality,
+                )
+                metrics["mllm_invalid_frame_count"] = len(mllm_invalid_frame_indices)
+                metrics["mllm_invalid_frame_ratio"] = float(
+                    mllm_quality.get("invalid_frame_ratio", 0.0)
+                )
+
+            if args.invalid_frame_source in {"heuristic", "hybrid"}:
+                heuristic_quality = scan_video_frame_quality(
+                    args.video_path,
+                    black_mean_threshold=args.invalid_frame_black_mean_threshold,
+                    white_mean_threshold=args.invalid_frame_white_mean_threshold,
+                    low_std_threshold=args.invalid_frame_low_std_threshold,
+                    low_entropy_threshold=args.invalid_frame_low_entropy_threshold,
+                )
+                heuristic_invalid_frame_indices = sorted(
+                    set(heuristic_quality.get("invalid_frame_indices", []))
+                )
+                write_json(
+                    os.path.join(args.output_dir, "frame_quality_scan_heuristic.json"),
+                    heuristic_quality,
+                )
+                metrics["heuristic_invalid_frame_count"] = len(
+                    heuristic_invalid_frame_indices
+                )
+                metrics["heuristic_invalid_frame_ratio"] = float(
+                    heuristic_quality.get("invalid_frame_ratio", 0.0)
+                )
+
+            if args.invalid_frame_source == "heuristic":
+                invalid_frame_indices = list(heuristic_invalid_frame_indices)
+            elif args.invalid_frame_source == "mllm":
+                invalid_frame_indices = list(mllm_invalid_frame_indices)
+            else:
+                invalid_frame_indices = sorted(
+                    set(heuristic_invalid_frame_indices)
+                    | set(mllm_invalid_frame_indices)
+                )
+
+            invalid_ratio = (
+                len(invalid_frame_indices) / float(total_frames)
+                if total_frames > 0
+                else 0.0
             )
-            invalid_frame_indices = sorted(
-                set(quality.get("invalid_frame_indices", []))
-            )
+            metrics["invalid_frame_source"] = args.invalid_frame_source
             metrics["invalid_frame_count"] = len(invalid_frame_indices)
-            metrics["invalid_frame_ratio"] = quality.get("invalid_frame_ratio", 0.0)
+            metrics["invalid_frame_ratio"] = invalid_ratio
             if len(invalid_frame_indices) > 0:
                 metrics["invalid_frame_sample"] = invalid_frame_indices[:20]
+
             write_json(
                 os.path.join(args.output_dir, "frame_quality_scan.json"),
-                quality,
+                {
+                    "mode": args.invalid_frame_source,
+                    "total_video_frames": int(total_frames),
+                    "invalid_frame_indices": invalid_frame_indices,
+                    "invalid_frame_ratio": float(invalid_ratio),
+                    "heuristic_invalid_frame_indices": heuristic_invalid_frame_indices,
+                    "mllm_invalid_frame_indices": mllm_invalid_frame_indices,
+                },
             )
 
         if args.temporal_keyframe_pipeline:
@@ -918,6 +1083,20 @@ def run() -> int:
             "collage_tile_max_edge": int(args.mllm_discovery_collage_tile_max_edge),
             "max_json_retries": int(args.mllm_discovery_max_json_retries),
             "prompt_path": args.mllm_discovery_prompt_path,
+        }
+        metrics["mllm_invalid_frame_config"] = {
+            "source": args.invalid_frame_source,
+            "window_size": int(args.mllm_invalid_window_size),
+            "window_stride": int(args.mllm_invalid_window_stride),
+            "max_completion_tokens": int(args.mllm_invalid_max_completion_tokens),
+            "use_collage": bool(args.mllm_invalid_use_collage),
+            "collage_cols": int(args.mllm_invalid_collage_cols),
+            "collage_tile_max_edge": int(args.mllm_invalid_collage_tile_max_edge),
+            "max_json_retries": int(args.mllm_invalid_max_json_retries),
+            "prompt_path": args.mllm_invalid_prompt_path,
+            "fill_missing_with_heuristic": bool(
+                args.mllm_invalid_fill_missing_with_heuristic
+            ),
         }
         metrics["total_video_frames"] = total_frames
 

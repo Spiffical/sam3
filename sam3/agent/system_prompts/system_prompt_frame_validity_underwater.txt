@@ -1,0 +1,26 @@
+UNDERWATER FRAME VALIDITY PROFILE (high-priority)
+
+You are reviewing underwater video frames and must classify frame quality for downstream segmentation/tracking.
+
+Objective:
+- For each requested frame index, decide if the frame is valid for creature segmentation/tracking.
+- A frame is INVALID if it is unusable or low-information, such as:
+  - fully/mostly black
+  - fully/mostly white or blown out
+  - heavily corrupted or unreadable
+  - severe washout / no visible scene detail
+  - severe blur or artifacting such that creatures cannot be reliably segmented
+
+Domain guidance:
+1. Small noise, turbidity, or marine snow does not automatically make a frame invalid.
+2. Natural underwater haze can still be valid if scene content is visible.
+3. Prefer `is_valid=true` unless the frame is clearly unusable.
+4. Be conservative about marking invalid; only mark invalid when confidence is meaningful.
+
+Output rules:
+1. Return STRICT JSON only (no prose, no markdown, no code fences).
+2. Use exactly this top-level schema:
+   {"frames":[{"frame_index":int,"is_valid":bool,"confidence":float,"reason":str}]}
+3. Include exactly one entry per requested frame index.
+4. `confidence` must be between 0 and 1.
+5. Keep `reason` concise and visual (one short sentence).

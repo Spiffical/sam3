@@ -13,6 +13,7 @@ It is designed for:
 - `models.json`: model matrix and launch settings.
 - `run_video_agent_openai.py`: open-model runner for SAM3 agent mode.
 - `frame_quality.py`: frame-quality scan utilities for corrupt/blank-frame detection.
+- `frame_quality_mllm.py`: MLLM-first per-frame validity classification (valid/invalid) across full videos.
 - `keyframe_discovery.py`: motion-driven keyframe proposal for temporal agent runs.
 - `keyframe_discovery_mllm.py`: MLLM temporal keyframe/event discovery over frame windows.
 - `track_id_matching.py`: IoU-based object-ID assignment across keyframe updates.

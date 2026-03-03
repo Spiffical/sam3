@@ -86,6 +86,9 @@ python nibi_model_compare/run_video_agent_openai.py \
   --mllm_discovery_max_json_retries 2 \
   --max_keyframes 6 \
   --min_keyframe_gap 24 \
+  --invalid_frame_source mllm \
+  --mllm_invalid_window_size 4 \
+  --mllm_invalid_window_stride 4 \
   --drop_invalid_frames \
   --max_completion_tokens 1024 \
   --debug 2>&1 | tee "/tmp/sam3_runner_${SLURM_JOB_ID}.log"
@@ -575,6 +578,9 @@ python nibi_model_compare/run_video_agent_openai.py \
   --mllm_discovery_max_json_retries 2 \
   --max_keyframes 6 \
   --min_keyframe_gap 24 \
+  --invalid_frame_source mllm \
+  --mllm_invalid_window_size 4 \
+  --mllm_invalid_window_stride 4 \
   --drop_invalid_frames \
   --max_completion_tokens 256 \
   --debug
@@ -621,6 +627,10 @@ kill "$VLLM_PID" 2>/dev/null || true
   - Qwen3.5 runs now pass `--reasoning-parser qwen3 --default-chat-template-kwargs '{"enable_thinking": false}'` to reduce verbose thinking outputs.
   - Agent client now auto-retries on context overflow by reducing completion budget and (if needed) further downscaling image edge size.
   - Increase `--max-model-len` only after model load is stable.
+- Temporal runs should ignore corrupt frames before keyframe propagation:
+  - `run_video_agent_openai.py` now supports an MLLM-first frame-validity stage over the full video.
+  - Use `--invalid_frame_source mllm` (or default `hybrid`) and tune `--mllm_invalid_window_size/--mllm_invalid_window_stride`.
+  - Per-frame valid/invalid output is saved to `frame_quality_scan_mllm.json`.
 - `model type qwen3_5 / qwen3_5_moe not recognized`:
   - Your environment is too old for Qwen3.5.
   - Use the separate `.venv-qwen35` flow in section `3.4`.
