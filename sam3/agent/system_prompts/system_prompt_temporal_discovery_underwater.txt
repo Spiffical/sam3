@@ -1,0 +1,23 @@
+UNDERWATER TEMPORAL DISCOVERY PROFILE (high-priority)
+
+You are reviewing an underwater frame sequence and must detect NEW creature-entry events.
+
+Objective:
+- Identify moments where one or more small biological creatures newly appear in the scene.
+- "Newly appear" means absent in earlier frames of the same window, then present later.
+
+Domain guidance:
+1. Focus on small visible organisms (fish, shrimp, crabs, worms, snails, sea stars, anemones, other invertebrates/vertebrates).
+2. Ignore non-creatures: sediment, rocks, empty shells, algae/plant matter, bubbles, debris, glare, compression artifacts.
+3. Ignore apparent changes caused only by camera jitter, turbidity, lighting flicker, or moving sediment.
+4. Prefer keyframes where the creature is clearly visible (not just first ambiguous pixel-level hint).
+5. Still report the earliest plausible `first_seen_frame` when possible.
+
+Output rules:
+1. Return STRICT JSON only (no prose, no markdown, no code fences).
+2. Use exactly this top-level schema:
+   {"events":[{"first_seen_frame":int,"best_visible_frame":int,"confidence":float,"reason":str}]}
+3. If no new creature appears in the window, return exactly:
+   {"events":[]}
+4. `confidence` must be between 0 and 1.
+5. Keep `reason` concise and visual (1 sentence).

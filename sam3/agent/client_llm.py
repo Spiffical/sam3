@@ -4,6 +4,7 @@
 
 import base64
 import io
+import json
 import os
 import re
 from typing import Any, Optional
@@ -186,6 +187,95 @@ def send_generate_request(
     # Create OpenAI client with custom base URL
     client = OpenAI(api_key=api_key, base_url=server_url)
 
+    def _extract_text_from_content_parts(parts: Any) -> Optional[str]:
+        if not isinstance(parts, list):
+            return None
+        text_chunks: list[str] = []
+        for part in parts:
+            if isinstance(part, str):
+                if part.strip():
+                    text_chunks.append(part)
+                continue
+            if isinstance(part, dict):
+                part_type = str(part.get("type", "")).lower()
+                if part_type in {"text", "output_text"}:
+                    text_value = part.get("text")
+                    if isinstance(text_value, str) and text_value.strip():
+                        text_chunks.append(text_value)
+                continue
+            # Pydantic-like objects with attributes.
+            part_type = getattr(part, "type", "")
+            if str(part_type).lower() in {"text", "output_text"}:
+                text_value = getattr(part, "text", None)
+                if isinstance(text_value, str) and text_value.strip():
+                    text_chunks.append(text_value)
+        if not text_chunks:
+            return None
+        return "\n".join(text_chunks).strip()
+
+    def _tool_calls_to_text(tool_calls: Any) -> Optional[str]:
+        if not tool_calls:
+            return None
+        if not isinstance(tool_calls, list):
+            return None
+        if len(tool_calls) == 0:
+            return None
+        first = tool_calls[0]
+        function_name = None
+        function_args = None
+        if isinstance(first, dict):
+            fn = first.get("function") or {}
+            if isinstance(fn, dict):
+                function_name = fn.get("name")
+                function_args = fn.get("arguments")
+        else:
+            fn = getattr(first, "function", None)
+            function_name = getattr(fn, "name", None) if fn is not None else None
+            function_args = getattr(fn, "arguments", None) if fn is not None else None
+        if not function_name:
+            return None
+        parameters: dict[str, Any] = {}
+        if isinstance(function_args, str) and function_args.strip():
+            try:
+                loaded = json.loads(function_args)
+                if isinstance(loaded, dict):
+                    parameters = loaded
+            except Exception:
+                parameters = {"raw_arguments": function_args}
+        elif isinstance(function_args, dict):
+            parameters = function_args
+
+        # Return in the existing tool-call text format the agent parser already handles.
+        return "<tool>\n" + json.dumps(
+            {"name": function_name, "parameters": parameters}
+        ) + "\n</tool>"
+
+    def _extract_text_from_choice(choice: Any) -> Optional[str]:
+        msg = getattr(choice, "message", None)
+        if msg is None and isinstance(choice, dict):
+            msg = choice.get("message")
+        if msg is None:
+            return None
+
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content
+
+        parts_text = _extract_text_from_content_parts(content)
+        if parts_text:
+            return parts_text
+
+        refusal = msg.get("refusal") if isinstance(msg, dict) else getattr(msg, "refusal", None)
+        if isinstance(refusal, str) and refusal.strip():
+            return refusal
+
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
+        tool_text = _tool_calls_to_text(tool_calls)
+        if tool_text:
+            return tool_text
+
+        return None
+
     def _parse_max_images_from_error(error_text: str) -> Optional[int]:
         # Example:
         # "At most 1 image(s) may be provided in one prompt."
@@ -292,7 +382,15 @@ def send_generate_request(
             response = client.chat.completions.create(**request_kwargs)
 
             if response.choices and len(response.choices) > 0:
-                return response.choices[0].message.content
+                extracted = _extract_text_from_choice(response.choices[0])
+                if extracted is not None:
+                    return extracted
+                print("Warning: model response had empty/unsupported content payload.")
+                try:
+                    print("Debug choice payload:", response.choices[0].model_dump())
+                except Exception:
+                    print("Debug choice payload (repr):", repr(response.choices[0]))
+                return None
 
             print(f"Unexpected response format: {response}")
             return None

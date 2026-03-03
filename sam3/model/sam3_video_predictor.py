@@ -93,10 +93,14 @@ class Sam3VideoPredictor:
         """Dispatch a stream request based on its type."""
         request_type = request["type"]
         if request_type == "propagate_in_video":
+            start_frame_idx = request.get("start_frame_index", None)
+            if start_frame_idx is None:
+                # Backward compatibility for callers that use "start_frame_idx".
+                start_frame_idx = request.get("start_frame_idx", None)
             yield from self.propagate_in_video(
                 session_id=request["session_id"],
                 propagation_direction=request.get("propagation_direction", "both"),
-                start_frame_idx=request.get("start_frame_index", None),
+                start_frame_idx=start_frame_idx,
                 max_frame_num_to_track=request.get("max_frame_num_to_track", None),
             )
         else:

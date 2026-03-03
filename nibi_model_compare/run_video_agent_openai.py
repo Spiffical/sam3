@@ -43,9 +43,12 @@ except ImportError:
     Image = None
 
 # Ensure repo root importability when running from copied folder.
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
+if SCRIPT_DIR not in sys.path:
+    sys.path.append(SCRIPT_DIR)
 if load_dotenv is not None:
     load_dotenv(os.path.join(REPO_ROOT, ".env"))
 
@@ -160,6 +163,18 @@ def get_center_point(mask: np.ndarray) -> tuple[int, int] | None:
         return None
     idx = len(ys) // 2
     return int(xs[idx]), int(ys[idx])
+
+
+def read_video_frame(video_path: str, frame_idx: int) -> np.ndarray | None:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        return None
+    return frame
 
 
 def mask_list_from_outputs(outputs: dict[str, Any]) -> list[np.ndarray]:
@@ -347,6 +362,10 @@ def save_frame_outputs_json(
     results_by_frame: dict[int, dict[str, Any]],
     frame_h: int,
     frame_w: int,
+    *,
+    total_video_frames: int | None = None,
+    invalid_frame_indices: list[int] | None = None,
+    keyframe_indices: list[int] | None = None,
 ) -> None:
     frames_payload: list[dict[str, Any]] = []
     for frame_index in sorted(results_by_frame.keys()):
@@ -357,7 +376,10 @@ def save_frame_outputs_json(
     payload = {
         "format_version": 1,
         "frame_size_hw": [int(frame_h), int(frame_w)],
+        "total_video_frames": int(total_video_frames or 0),
         "num_frames_with_outputs": len(frames_payload),
+        "invalid_frame_indices": sorted(set(invalid_frame_indices or [])),
+        "keyframe_indices": sorted(set(keyframe_indices or [])),
         "frames": frames_payload,
     }
     write_json(output_path, payload)
@@ -461,6 +483,152 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save_prompts", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--temporal_keyframe_pipeline",
+        action="store_true",
+        help=(
+            "Enable multi-keyframe pipeline: frame-quality scan, keyframe discovery, "
+            "iterative agent prompting, and incremental propagation."
+        ),
+    )
+    parser.add_argument(
+        "--max_keyframes",
+        default=6,
+        type=int,
+        help="Maximum number of keyframes to analyze in temporal mode.",
+    )
+    parser.add_argument(
+        "--min_keyframe_gap",
+        default=24,
+        type=int,
+        help="Minimum frame gap between selected keyframes in temporal mode.",
+    )
+    parser.add_argument(
+        "--keyframe_motion_threshold",
+        default=0.03,
+        type=float,
+        help="Minimum normalized motion score required to consider a keyframe event.",
+    )
+    parser.add_argument(
+        "--id_match_iou_threshold",
+        default=0.30,
+        type=float,
+        help="IoU threshold to reuse existing object ID at a keyframe.",
+    )
+    parser.add_argument(
+        "--drop_invalid_frames",
+        action="store_true",
+        help=(
+            "Skip invalid/corrupt frames during final video rendering. "
+            "Useful for black/white/corrupt frame removal."
+        ),
+    )
+    parser.add_argument(
+        "--invalid_frame_black_mean_threshold",
+        default=8.0,
+        type=float,
+        help="Frame-quality threshold: near-black mean cutoff.",
+    )
+    parser.add_argument(
+        "--invalid_frame_white_mean_threshold",
+        default=247.0,
+        type=float,
+        help="Frame-quality threshold: near-white mean cutoff.",
+    )
+    parser.add_argument(
+        "--invalid_frame_low_std_threshold",
+        default=2.5,
+        type=float,
+        help="Frame-quality threshold: low grayscale std cutoff.",
+    )
+    parser.add_argument(
+        "--invalid_frame_low_entropy_threshold",
+        default=0.08,
+        type=float,
+        help="Frame-quality threshold: low normalized entropy cutoff.",
+    )
+    parser.add_argument(
+        "--discovery_mode",
+        default="hybrid",
+        choices=["motion", "mllm", "hybrid"],
+        help=(
+            "Keyframe discovery mode in temporal pipeline: "
+            "motion-only, mllm-only, or hybrid (mllm with motion fallback)."
+        ),
+    )
+    parser.add_argument(
+        "--mllm_discovery_window_size",
+        default=4,
+        type=int,
+        help="Number of frames per MLLM temporal discovery window.",
+    )
+    parser.add_argument(
+        "--mllm_discovery_window_stride",
+        default=24,
+        type=int,
+        help="Frame stride between MLLM temporal discovery windows.",
+    )
+    parser.add_argument(
+        "--mllm_discovery_min_confidence",
+        default=0.45,
+        type=float,
+        help="Minimum confidence for MLLM-discovered new-creature events.",
+    )
+    parser.add_argument(
+        "--mllm_discovery_max_events",
+        default=10,
+        type=int,
+        help="Maximum number of MLLM-discovered events kept before keyframe selection.",
+    )
+    parser.add_argument(
+        "--mllm_discovery_max_completion_tokens",
+        default=768,
+        type=int,
+        help="Completion token budget for MLLM temporal discovery calls.",
+    )
+    parser.add_argument(
+        "--mllm_discovery_use_collage",
+        dest="mllm_discovery_use_collage",
+        action="store_true",
+        help=(
+            "Use a single temporal collage image per discovery window. "
+            "Recommended when server allows only one image per request."
+        ),
+    )
+    parser.add_argument(
+        "--no_mllm_discovery_use_collage",
+        dest="mllm_discovery_use_collage",
+        action="store_false",
+        help="Disable collage mode and send multiple images per discovery window.",
+    )
+    parser.set_defaults(mllm_discovery_use_collage=True)
+    parser.add_argument(
+        "--mllm_discovery_collage_cols",
+        default=2,
+        type=int,
+        help="Number of columns in temporal discovery collage layout.",
+    )
+    parser.add_argument(
+        "--mllm_discovery_collage_tile_max_edge",
+        default=512,
+        type=int,
+        help="Max edge (px) for each tile in temporal discovery collage.",
+    )
+    parser.add_argument(
+        "--mllm_discovery_prompt_path",
+        default="",
+        type=str,
+        help=(
+            "Optional path to temporal discovery system prompt template. "
+            "If unset, uses profile-specific default."
+        ),
+    )
+    parser.add_argument(
+        "--mllm_discovery_max_json_retries",
+        default=2,
+        type=int,
+        help="Retries per discovery window when model output is not valid strict JSON.",
+    )
     return parser.parse_args()
 
 
@@ -488,6 +656,11 @@ def run() -> int:
                 "Missing required packages. Install dependencies including "
                 "opencv-python, numpy, torch, and pillow in this environment."
             )
+
+        from frame_quality import scan_video_frame_quality
+        from keyframe_discovery import discover_keyframes_from_motion
+        from keyframe_discovery_mllm import discover_keyframes_with_mllm
+        from track_id_matching import assign_object_ids_by_iou
 
         from sam3.agent.agent_core import agent_inference
         from sam3.agent.client_llm import (
@@ -579,9 +752,6 @@ def run() -> int:
         cap.release()
         cap = None
 
-        frame_0_path = os.path.join(args.output_dir, "frame_0.jpg")
-        Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).save(frame_0_path)
-
         api_key = (
             args.api_key
             or os.environ.get("OPENAI_API_KEY")
@@ -595,24 +765,169 @@ def run() -> int:
             api_key=api_key,
             max_tokens=args.max_completion_tokens,
         )
-
-        history, final_outputs, _ = agent_inference(
-            img_path=frame_0_path,
-            initial_text_prompt=args.prompt,
-            send_generate_request=send_req,
-            call_sam_service=local_service.call_service,
-            output_dir=os.path.join(args.output_dir, "agent_out"),
-            debug=args.debug,
+        send_req_discovery = partial(
+            send_generate_request_orig,
+            server_url=args.server_url,
+            model=args.model,
+            api_key=api_key,
+            max_tokens=args.mllm_discovery_max_completion_tokens,
         )
+        # Keep frame_0 extraction for compatibility and debugging.
+        frame_0_path = os.path.join(args.output_dir, "frame_0.jpg")
+        Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).save(frame_0_path)
 
-        selected_masks_rle = final_outputs.get("pred_masks", [])
-        metrics["agent_history_len"] = len(history)
-        metrics["num_agent_masks"] = len(selected_masks_rle)
+        invalid_frame_indices: list[int] = []
+        keyframe_indices: list[int] = [0]
+        keyframe_event_candidates: list[dict[str, Any]] = []
+
+        should_scan_frame_quality = (
+            args.temporal_keyframe_pipeline or args.drop_invalid_frames
+        )
+        if should_scan_frame_quality:
+            quality = scan_video_frame_quality(
+                args.video_path,
+                black_mean_threshold=args.invalid_frame_black_mean_threshold,
+                white_mean_threshold=args.invalid_frame_white_mean_threshold,
+                low_std_threshold=args.invalid_frame_low_std_threshold,
+                low_entropy_threshold=args.invalid_frame_low_entropy_threshold,
+            )
+            invalid_frame_indices = sorted(
+                set(quality.get("invalid_frame_indices", []))
+            )
+            metrics["invalid_frame_count"] = len(invalid_frame_indices)
+            metrics["invalid_frame_ratio"] = quality.get("invalid_frame_ratio", 0.0)
+            if len(invalid_frame_indices) > 0:
+                metrics["invalid_frame_sample"] = invalid_frame_indices[:20]
+            write_json(
+                os.path.join(args.output_dir, "frame_quality_scan.json"),
+                quality,
+            )
+
+        if args.temporal_keyframe_pipeline:
+            invalid_set = set(invalid_frame_indices)
+            valid_frame_indices = [
+                frame_idx for frame_idx in range(total_frames) if frame_idx not in invalid_set
+            ]
+            if len(valid_frame_indices) == 0:
+                raise RuntimeError(
+                    "No valid frames remain after quality filtering; cannot run temporal pipeline."
+                )
+
+            motion_plan = discover_keyframes_from_motion(
+                args.video_path,
+                invalid_frame_indices=invalid_set,
+                max_keyframes=args.max_keyframes,
+                min_keyframe_gap=args.min_keyframe_gap,
+                motion_threshold=args.keyframe_motion_threshold,
+            )
+            write_json(
+                os.path.join(args.output_dir, "keyframe_discovery_motion.json"),
+                motion_plan,
+            )
+
+            motion_keyframes = list(motion_plan.get("keyframes", []))
+            motion_events = list(motion_plan.get("event_candidates", []))
+            mllm_plan: dict[str, Any] = {}
+            mllm_keyframes: list[int] = []
+            mllm_events: list[dict[str, Any]] = []
+
+            if args.discovery_mode in {"mllm", "hybrid"}:
+                mllm_plan = discover_keyframes_with_mllm(
+                    video_path=args.video_path,
+                    send_generate_request_fn=send_req_discovery,
+                    initial_text_prompt=args.prompt,
+                    valid_frame_indices=valid_frame_indices,
+                    output_dir=os.path.join(args.output_dir, "mllm_discovery"),
+                    max_keyframes=args.max_keyframes,
+                    min_keyframe_gap=args.min_keyframe_gap,
+                    window_size=args.mllm_discovery_window_size,
+                    window_stride=args.mllm_discovery_window_stride,
+                    min_confidence=args.mllm_discovery_min_confidence,
+                    max_events=args.mllm_discovery_max_events,
+                    use_collage=args.mllm_discovery_use_collage,
+                    collage_cols=args.mllm_discovery_collage_cols,
+                    collage_tile_max_edge=args.mllm_discovery_collage_tile_max_edge,
+                    prompt_profile=args.prompt_profile,
+                    prompt_template_path=(
+                        args.mllm_discovery_prompt_path.strip() or None
+                    ),
+                    max_json_retries=args.mllm_discovery_max_json_retries,
+                )
+                write_json(
+                    os.path.join(args.output_dir, "keyframe_discovery_mllm.json"),
+                    mllm_plan,
+                )
+                mllm_keyframes = list(mllm_plan.get("keyframes", []))
+                mllm_events = list(mllm_plan.get("event_candidates", []))
+
+            if args.discovery_mode == "motion":
+                keyframe_indices = motion_keyframes
+                keyframe_event_candidates = motion_events
+            elif args.discovery_mode == "mllm":
+                keyframe_indices = mllm_keyframes if mllm_keyframes else motion_keyframes
+                keyframe_event_candidates = mllm_events if mllm_events else motion_events
+            else:
+                # hybrid: prefer MLLM keyframes/events, then fill from motion if needed.
+                keyframe_indices = list(mllm_keyframes)
+                keyframe_event_candidates = list(mllm_events)
+                for mk in motion_keyframes:
+                    if len(keyframe_indices) >= args.max_keyframes:
+                        break
+                    if all(
+                        abs(int(mk) - int(existing)) >= args.min_keyframe_gap
+                        for existing in keyframe_indices
+                    ):
+                        keyframe_indices.append(int(mk))
+                keyframe_indices = sorted(set(keyframe_indices))
+                if len(keyframe_event_candidates) == 0:
+                    keyframe_event_candidates = motion_events
+
+            if (0 not in invalid_frame_indices) and (0 not in keyframe_indices):
+                keyframe_indices = [0] + keyframe_indices
+            if not keyframe_indices:
+                keyframe_indices = [valid_frame_indices[0]]
+            keyframe_indices = sorted(set(int(x) for x in keyframe_indices))
+            if len(keyframe_indices) > args.max_keyframes:
+                keyframe_indices = keyframe_indices[: args.max_keyframes]
+
+            keyframe_plan = {
+                "mode": args.discovery_mode,
+                "keyframes": keyframe_indices,
+                "event_candidates": keyframe_event_candidates,
+                "motion_fallback_keyframes": motion_keyframes,
+                "motion_fallback_events": motion_events,
+                "mllm_keyframes": mllm_keyframes,
+                "mllm_events": mllm_events,
+            }
+            write_json(
+                os.path.join(args.output_dir, "keyframe_discovery.json"),
+                keyframe_plan,
+            )
+
+        metrics["keyframe_indices"] = keyframe_indices
+        metrics["keyframe_event_candidates"] = keyframe_event_candidates
+        metrics["discovery_mode"] = args.discovery_mode
+        metrics["mllm_discovery_config"] = {
+            "window_size": int(args.mllm_discovery_window_size),
+            "window_stride": int(args.mllm_discovery_window_stride),
+            "min_confidence": float(args.mllm_discovery_min_confidence),
+            "max_events": int(args.mllm_discovery_max_events),
+            "max_completion_tokens": int(args.mllm_discovery_max_completion_tokens),
+            "use_collage": bool(args.mllm_discovery_use_collage),
+            "collage_cols": int(args.mllm_discovery_collage_cols),
+            "collage_tile_max_edge": int(args.mllm_discovery_collage_tile_max_edge),
+            "max_json_retries": int(args.mllm_discovery_max_json_retries),
+            "prompt_path": args.mllm_discovery_prompt_path,
+        }
+        metrics["total_video_frames"] = total_frames
 
         generated_prompts: list[dict[str, Any]] = []
+        agent_runs: list[dict[str, Any]] = []
+        failed_agent_keyframes: list[dict[str, Any]] = []
         session_id: str | None = None
+        results_by_frame: dict[int, dict[str, Any]] = {}
 
-        if not args.save_prompts and len(selected_masks_rle) > 0:
+        if not args.save_prompts:
             gpu_ids = [int(x.strip()) for x in args.gpus.split(",") if x.strip()]
             backend = PredictorBackend(gpu_ids=gpu_ids)
             session_id = backend.start_session(
@@ -621,42 +936,166 @@ def run() -> int:
             )
             metrics["video_session_id"] = session_id
 
-        for index, rle in enumerate(selected_masks_rle):
+        next_obj_id = 1
+        total_agent_masks = 0
+        total_history_len = 0
+
+        for keyframe_idx in keyframe_indices:
+            if keyframe_idx in invalid_frame_indices:
+                print(
+                    f"[warn] keyframe {keyframe_idx} marked invalid by quality scan; skipping."
+                )
+                continue
+
+            frame_k = read_video_frame(args.video_path, keyframe_idx)
+            if frame_k is None:
+                print(
+                    f"[warn] could not decode keyframe {keyframe_idx}; skipping keyframe."
+                )
+                continue
+
+            keyframe_path = os.path.join(args.output_dir, f"frame_{keyframe_idx}.jpg")
+            Image.fromarray(cv2.cvtColor(frame_k, cv2.COLOR_BGR2RGB)).save(keyframe_path)
+
             try:
-                mask = decode_rle_to_mask(rle, frame_h, frame_w)
+                history, final_outputs, _ = agent_inference(
+                    img_path=keyframe_path,
+                    initial_text_prompt=args.prompt,
+                    send_generate_request=send_req,
+                    call_sam_service=local_service.call_service,
+                    output_dir=os.path.join(args.output_dir, "agent_out"),
+                    debug=args.debug,
+                )
             except Exception as exc:
-                print(f"[warn] failed to decode RLE {index}: {exc}")
-                continue
-            point = get_center_point(mask)
-            if point is None:
+                err_msg = str(exc).strip() or repr(exc) or type(exc).__name__
+                print(
+                    f"[warn] agent_inference failed on keyframe {keyframe_idx}: "
+                    f"{type(exc).__name__}: {err_msg}"
+                )
+                failed_agent_keyframes.append(
+                    {
+                        "frame_idx": int(keyframe_idx),
+                        "frame_path": keyframe_path,
+                        "error_type": type(exc).__name__,
+                        "error": err_msg,
+                    }
+                )
                 continue
 
-            prompt_data = {
-                "frame_idx": 0,
-                "obj_id": index + 1,
-                "points": [[float(point[0]), float(point[1]), 1]],
-                "label": 1,
-                "source": "agent_center_point",
-            }
-            generated_prompts.append(prompt_data)
+            selected_masks_rle = list(final_outputs.get("pred_masks", []))
+            total_agent_masks += len(selected_masks_rle)
+            total_history_len += len(history)
+            agent_runs.append(
+                {
+                    "frame_idx": int(keyframe_idx),
+                    "frame_path": keyframe_path,
+                    "history_len": int(len(history)),
+                    "num_masks": int(len(selected_masks_rle)),
+                }
+            )
 
-            if backend is not None and session_id is not None:
-                backend.add_point_prompt(
-                    session_id=session_id,
-                    frame_idx=0,
-                    obj_id=index + 1,
-                    points=[(float(point[0]), float(point[1]), 1)],
-                    # PredictorBackend expects frame_size as (width, height).
-                    frame_size=(frame_w, frame_h),
+            decoded_masks: list[np.ndarray] = []
+            for rle_idx, rle in enumerate(selected_masks_rle):
+                try:
+                    decoded_masks.append(
+                        decode_rle_to_mask(rle, frame_h, frame_w).astype(bool)
+                    )
+                except Exception as exc:
+                    print(
+                        f"[warn] failed to decode RLE {rle_idx} on frame {keyframe_idx}: {exc}"
+                    )
+
+            if not decoded_masks:
+                continue
+
+            existing_masks_with_ids: list[tuple[int, np.ndarray]] = []
+            if keyframe_idx in results_by_frame:
+                existing_masks_with_ids = iter_output_masks_with_ids(
+                    results_by_frame[keyframe_idx], frame_h, frame_w
                 )
 
+            assignment = assign_object_ids_by_iou(
+                existing_masks_with_ids,
+                decoded_masks,
+                next_obj_id=next_obj_id,
+                iou_match_threshold=args.id_match_iou_threshold,
+            )
+            assigned_ids: list[int] = list(assignment["assigned_ids"])
+            next_obj_id = int(assignment["next_obj_id"])
+            assignment_rows: list[dict[str, Any]] = list(assignment["assignments"])
+
+            prompts_added_this_frame = 0
+            for mask_idx, (mask, obj_id) in enumerate(zip(decoded_masks, assigned_ids)):
+                point = get_center_point(mask)
+                if point is None:
+                    continue
+
+                meta_row = assignment_rows[mask_idx]
+                prompt_data = {
+                    "frame_idx": int(keyframe_idx),
+                    "obj_id": int(obj_id),
+                    "points": [[float(point[0]), float(point[1]), 1]],
+                    "label": 1,
+                    "source": (
+                        "agent_center_point_temporal"
+                        if args.temporal_keyframe_pipeline
+                        else "agent_center_point"
+                    ),
+                    "best_iou_at_assignment": float(meta_row["best_iou"]),
+                    "matched_existing_obj_id": meta_row["matched_existing_obj_id"],
+                    "is_new_obj_id": bool(meta_row["is_new_obj_id"]),
+                }
+                generated_prompts.append(prompt_data)
+                prompts_added_this_frame += 1
+
+                if backend is not None and session_id is not None:
+                    backend.add_point_prompt(
+                        session_id=session_id,
+                        frame_idx=int(keyframe_idx),
+                        obj_id=int(obj_id),
+                        points=[(float(point[0]), float(point[1]), 1)],
+                        frame_size=(frame_w, frame_h),
+                    )
+
+            if (
+                backend is not None
+                and session_id is not None
+                and prompts_added_this_frame > 0
+                and not args.save_prompts
+            ):
+                try:
+                    req = {
+                        "session_id": session_id,
+                        "type": "propagate_in_video",
+                        "start_frame_index": int(keyframe_idx),
+                        "propagation_direction": "both",
+                    }
+                    for output in backend.propagate(req):
+                        frame_index = int(output["frame_index"])
+                        results_by_frame[frame_index] = output["outputs"]
+                except Exception as exc:
+                    err_msg = str(exc).strip() or repr(exc) or type(exc).__name__
+                    raise RuntimeError(
+                        f"propagate_in_video failed ({type(exc).__name__}): {err_msg}"
+                    ) from exc
+
+        metrics["agent_runs"] = agent_runs
+        metrics["failed_agent_keyframes"] = failed_agent_keyframes
+        metrics["agent_history_len"] = total_history_len
+        metrics["num_agent_masks"] = total_agent_masks
+
         prompts_path = os.path.join(args.output_dir, "generated_prompts.json")
-        write_json(prompts_path, {"prompts": generated_prompts})
+        write_json(
+            prompts_path,
+            {
+                "prompts": generated_prompts,
+                "keyframe_indices": keyframe_indices,
+                "invalid_frame_indices": invalid_frame_indices,
+            },
+        )
         metrics["num_generated_prompts"] = len(generated_prompts)
         metrics["generated_prompts_path"] = prompts_path
-        metrics["total_video_frames"] = total_frames
 
-        results_by_frame: dict[int, dict[str, Any]] = {}
         output_video_path = ""
         frame_outputs_json_path = ""
 
@@ -665,17 +1104,13 @@ def run() -> int:
         elif backend is None or session_id is None:
             metrics["status"] = "success_no_propagation"
         else:
-            try:
-                for output in backend.propagate(
-                    {"session_id": session_id, "type": "propagate_in_video"}
-                ):
-                    frame_index = int(output["frame_index"])
-                    results_by_frame[frame_index] = output["outputs"]
-            except Exception as exc:
-                err_msg = str(exc).strip() or repr(exc) or type(exc).__name__
-                raise RuntimeError(
-                    f"propagate_in_video failed ({type(exc).__name__}): {err_msg}"
-                ) from exc
+            if len(results_by_frame) == 0:
+                metrics["status"] = "success_no_propagation"
+                metrics["invalid_frame_indices"] = invalid_frame_indices
+                metrics["output_video_path"] = ""
+                metrics["output_dir"] = os.path.abspath(args.output_dir)
+                return_code = 0
+                return return_code
 
             out_path = os.path.join(args.output_dir, "output_video.mp4")
             should_save_frame_outputs = args.save_frame_outputs_json or os.environ.get(
@@ -691,6 +1126,9 @@ def run() -> int:
                     results_by_frame,
                     frame_h=frame_h,
                     frame_w=frame_w,
+                    total_video_frames=total_frames,
+                    invalid_frame_indices=invalid_frame_indices,
+                    keyframe_indices=keyframe_indices,
                 )
                 metrics["frame_outputs_json_path"] = frame_outputs_json_path
 
@@ -703,10 +1141,15 @@ def run() -> int:
             )
 
             frame_index = 0
+            dropped_frame_count = 0
             while True:
                 ret, video_frame = cap.read()
                 if not ret:
                     break
+                if args.drop_invalid_frames and frame_index in invalid_frame_indices:
+                    dropped_frame_count += 1
+                    frame_index += 1
+                    continue
                 output = results_by_frame.get(frame_index)
                 if output:
                     video_frame = overlay_masks_on_frame(video_frame, output)
@@ -720,6 +1163,8 @@ def run() -> int:
             output_video_path = out_path
             metrics["status"] = "success"
             metrics["frames_with_outputs"] = len(results_by_frame)
+            metrics["invalid_frame_indices"] = invalid_frame_indices
+            metrics["dropped_frame_count"] = dropped_frame_count
             if total_frames > 0:
                 metrics["frame_output_fraction"] = len(results_by_frame) / total_frames
 

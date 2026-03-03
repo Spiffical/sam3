@@ -79,6 +79,14 @@ python nibi_model_compare/run_video_agent_openai.py \
   --output_dir "$OUT_DIR" \
   --gpus 0 \
   --image_size 1008 \
+  --temporal_keyframe_pipeline \
+  --discovery_mode hybrid \
+  --mllm_discovery_window_size 4 \
+  --mllm_discovery_window_stride 24 \
+  --mllm_discovery_max_json_retries 2 \
+  --max_keyframes 6 \
+  --min_keyframe_gap 24 \
+  --drop_invalid_frames \
   --max_completion_tokens 1024 \
   --debug 2>&1 | tee "/tmp/sam3_runner_${SLURM_JOB_ID}.log"
 
@@ -560,6 +568,14 @@ python nibi_model_compare/run_video_agent_openai.py \
   --model "$MODEL_ID" \
   --output_dir "$OUT_DIR" \
   --gpus 0 \
+  --temporal_keyframe_pipeline \
+  --discovery_mode hybrid \
+  --mllm_discovery_window_size 4 \
+  --mllm_discovery_window_stride 24 \
+  --mllm_discovery_max_json_retries 2 \
+  --max_keyframes 6 \
+  --min_keyframe_gap 24 \
+  --drop_invalid_frames \
   --max_completion_tokens 256 \
   --debug
 

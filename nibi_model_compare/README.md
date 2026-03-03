@@ -12,6 +12,14 @@ It is designed for:
 
 - `models.json`: model matrix and launch settings.
 - `run_video_agent_openai.py`: open-model runner for SAM3 agent mode.
+- `frame_quality.py`: frame-quality scan utilities for corrupt/blank-frame detection.
+- `keyframe_discovery.py`: motion-driven keyframe proposal for temporal agent runs.
+- `keyframe_discovery_mllm.py`: MLLM temporal keyframe/event discovery over frame windows.
+- `track_id_matching.py`: IoU-based object-ID assignment across keyframe updates.
+- `TEMPORAL_UNDERWATER_PIPELINE_PLAN.md`: design and rollout notes for temporal underwater workflow.
+- Temporal discovery prompt templates:
+  - `sam3/agent/system_prompts/system_prompt_temporal_discovery_underwater.txt`
+  - `sam3/agent/system_prompts/system_prompt_temporal_discovery_general.txt`
 - `run_model_matrix.py`: orchestrates multiple model runs.
 - `summarize_runs.py`: builds `summary.csv` and `summary.md`.
 - `generate_paste_report.py`: creates `PASTE_TO_CODEX.md`.
