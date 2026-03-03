@@ -184,6 +184,28 @@ def _extract_mask_verdict(generated_text):
     return None
 
 
+def _compact_assistant_text_for_history(generated_text, max_chars=400):
+    """
+    Keep retry history compact to avoid context-window blowups.
+    Preserve structured outputs when present; otherwise store a short summary.
+    """
+    if not isinstance(generated_text, str) or not generated_text.strip():
+        return "[empty model response]"
+
+    parsed_tool_call = _parse_tool_call_from_generated_text(generated_text)
+    if parsed_tool_call is not None:
+        return parsed_tool_call[1]
+
+    verdict = _extract_mask_verdict(generated_text)
+    if verdict is not None:
+        return f"<verdict>{verdict}</verdict>"
+
+    compact = generated_text.strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[:max_chars] + "\n...[truncated to reduce context size]..."
+
+
 def _request_mask_verdict_with_retry(send_generate_request_fn, iterative_messages, max_retries=2):
     """
     Request a mask verdict and retry with strict formatting instructions if missing.
@@ -200,7 +222,12 @@ def _request_mask_verdict_with_retry(send_generate_request_fn, iterative_message
         iterative_messages.append(
             {
                 "role": "assistant",
-                "content": [{"type": "text", "text": str(model_text)}],
+                "content": [
+                    {
+                        "type": "text",
+                        "text": _compact_assistant_text_for_history(model_text),
+                    }
+                ],
             }
         )
         iterative_messages.append(
@@ -393,7 +420,12 @@ def agent_inference(
             messages.append(
                 {
                     "role": "assistant",
-                    "content": [{"type": "text", "text": generated_text}],
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": _compact_assistant_text_for_history(generated_text),
+                        }
+                    ],
                 }
             )
             messages.append(

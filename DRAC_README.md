@@ -186,14 +186,14 @@ python -m pip --isolated install --no-index -e ".[notebooks,frontend,train]" || 
 Try normal Alliance wheelhouse install first:
 
 ```bash
-python -m pip --isolated install --no-index vllm openai pycocotools || true
+python -m pip --isolated install --no-index vllm openai pycocotools timm ftfy scikit-image scikit-learn pandas matplotlib || true
 ```
 
 If `opencv-noinstall` / `opencv-python-headless` fails during `vllm` dependency resolution, use:
 
 ```bash
 python -m pip --isolated install --no-index vllm --no-deps
-python -m pip --isolated install --no-index openai pycocotools packaging setuptools
+python -m pip --isolated install --no-index openai pycocotools timm ftfy scikit-image scikit-learn pandas matplotlib packaging setuptools
 ```
 
 Optional: install additional `vllm` deps while skipping problematic OpenCV deps:
@@ -265,7 +265,7 @@ python -m pip --isolated install --no-index "${WHEELHOUSE_ARGS[@]}" -e ".[notebo
 
 # Avoid Alliance dummy OpenCV package breakage:
 python -m pip --isolated install --no-index "${WHEELHOUSE_ARGS[@]}" vllm --no-deps
-python -m pip --isolated install --no-index "${WHEELHOUSE_ARGS[@]}" openai pycocotools packaging setuptools
+python -m pip --isolated install --no-index "${WHEELHOUSE_ARGS[@]}" openai pycocotools timm ftfy scikit-image scikit-learn pandas matplotlib packaging setuptools
 python -m pip --isolated install --no-index "${WHEELHOUSE_ARGS[@]}" --upgrade transformers || true
 
 python - <<'PY' > /tmp/vllm_reqs_nibi_qwen35.txt
@@ -433,12 +433,18 @@ If you see `Failed to infer device type` or NVML warnings, you are usually on a 
 
 ```bash
 python - <<'PY'
-import torch, cv2, vllm, openai, pycocotools
+import torch, cv2, vllm, openai, pycocotools, timm, ftfy, skimage, sklearn, pandas, matplotlib
 print("OK  torch")
 print("OK  cv2")
 print("OK  vllm")
 print("OK  openai")
 print("OK  pycocotools")
+print("OK  timm")
+print("OK  ftfy")
+print("OK  skimage")
+print("OK  sklearn")
+print("OK  pandas")
+print("OK  matplotlib")
 PY
 ```
 
@@ -569,6 +575,15 @@ kill "$VLLM_PID" 2>/dev/null || true
   - Use latest repo patch removing hard dependency on `pkg_resources` in model builder path.
 - `No module named 'bioclip'` during CLI run:
   - Use latest repo patch where interactive-video package/UI imports are lazy/optional.
+- `No module named 'timm'`, `ftfy`, `skimage`, `sklearn`, `pandas`, or `matplotlib` during run:
+  - The Nibi runner/sbatch templates now auto-install runtime deps into the active venv using Alliance wheelhouse (`--no-index`) first, then PyPI fallback:
+    - `timm>=1.0.17`, `ftfy==6.1.1`, `scikit-image`, `scikit-learn`, `pandas`, `matplotlib`
+  - If you still see this, verify the expected venv is being used (`--venv-path`) and that pip install in that venv is writable.
+  - Manual repair (current venv): `python -m pip install "timm>=1.0.17" "ftfy==6.1.1" scikit-image scikit-learn pandas matplotlib`
+- `numpy.dtype size changed ... pycocotools._mask`:
+  - This is an ABI mismatch (typically `numpy 2.x` with a `pycocotools` build expecting `numpy 1.x`).
+  - Nibi runner/sbatch templates now auto-repair by force-reinstalling `numpy>=1.26,<2` and `pycocotools` (wheelhouse first, PyPI fallback).
+  - Manual repair (current venv): `python -m pip install --force-reinstall "numpy>=1.26,<2" pycocotools`
 - `Could not find bpe_simple_vocab_16e6.txt.gz`:
   - Latest script resolves `sam3/assets/...`; optionally set:
     - `export SAM3_BPE_PATH=/home/$USER/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz`
@@ -585,6 +600,8 @@ kill "$VLLM_PID" 2>/dev/null || true
 - Context error (`input+output > context length`):
   - Reduce `--max_completion_tokens` (start with 256).
   - Keep `SAM3_IMAGE_DETAIL=low`, `SAM3_AGENT_IMAGE_MAX_EDGE=768`.
+  - Qwen3.5 runs now pass `--reasoning-parser qwen3 --default-chat-template-kwargs '{"enable_thinking": false}'` to reduce verbose thinking outputs.
+  - Agent client now auto-retries on context overflow by reducing completion budget and (if needed) further downscaling image edge size.
   - Increase `--max-model-len` only after model load is stable.
 - `model type qwen3_5 / qwen3_5_moe not recognized`:
   - Your environment is too old for Qwen3.5.

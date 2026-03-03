@@ -121,59 +121,67 @@ def send_generate_request(
     # Process messages to convert image paths to base64
     image_detail = os.environ.get("SAM3_IMAGE_DETAIL", "low")
     try:
-        image_max_edge = int(os.environ.get("SAM3_AGENT_IMAGE_MAX_EDGE", "896"))
+        image_max_edge = int(os.environ.get("SAM3_AGENT_IMAGE_MAX_EDGE", "768"))
     except ValueError:
-        image_max_edge = 896
+        image_max_edge = 768
+    try:
+        min_image_max_edge = int(os.environ.get("SAM3_AGENT_IMAGE_MIN_EDGE", "384"))
+    except ValueError:
+        min_image_max_edge = 384
+    min_image_max_edge = max(128, min_image_max_edge)
 
-    processed_messages = []
-    for message in messages:
-        processed_message = message.copy()
-        if message["role"] == "user" and "content" in message:
-            processed_content = []
-            for c in message["content"]:
-                if isinstance(c, dict) and c.get("type") == "image":
-                    # Convert image path to base64 format
-                    image_path = c["image"]
+    def _build_processed_messages(current_image_max_edge: Optional[int]):
+        processed_messages = []
+        for message in messages:
+            processed_message = message.copy()
+            if message["role"] == "user" and "content" in message:
+                processed_content = []
+                for c in message["content"]:
+                    if isinstance(c, dict) and c.get("type") == "image":
+                        # Convert image path to base64 format
+                        image_path = c["image"]
 
-                    print("image_path", image_path)
-                    new_image_path = image_path.replace(
-                        "?", "%3F"
-                    )  # Escape ? in the path
+                        print("image_path", image_path)
+                        new_image_path = image_path.replace(
+                            "?", "%3F"
+                        )  # Escape ? in the path
 
-                    # Read the image file and convert to base64
-                    try:
-                        base64_image, mime_type = get_image_base64_and_mime(
-                            new_image_path,
-                            max_edge=image_max_edge,
-                        )
-                        if base64_image is None:
-                            print(
-                                f"Warning: Could not convert image to base64: {new_image_path}"
+                        # Read the image file and convert to base64
+                        try:
+                            base64_image, mime_type = get_image_base64_and_mime(
+                                new_image_path,
+                                max_edge=current_image_max_edge,
                             )
+                            if base64_image is None:
+                                print(
+                                    "Warning: Could not convert image to base64: "
+                                    f"{new_image_path}"
+                                )
+                                continue
+
+                            # Create the proper image_url structure with base64 data
+                            processed_content.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{mime_type};base64,{base64_image}",
+                                        "detail": image_detail,
+                                    },
+                                }
+                            )
+
+                        except FileNotFoundError:
+                            print(f"Warning: Image file not found: {new_image_path}")
                             continue
+                        except Exception as e:
+                            print(f"Warning: Error processing image {new_image_path}: {e}")
+                            continue
+                    else:
+                        processed_content.append(c)
 
-                        # Create the proper image_url structure with base64 data
-                        processed_content.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{base64_image}",
-                                    "detail": image_detail,
-                                },
-                            }
-                        )
-
-                    except FileNotFoundError:
-                        print(f"Warning: Image file not found: {new_image_path}")
-                        continue
-                    except Exception as e:
-                        print(f"Warning: Error processing image {new_image_path}: {e}")
-                        continue
-                else:
-                    processed_content.append(c)
-
-            processed_message["content"] = processed_content
-        processed_messages.append(processed_message)
+                processed_message["content"] = processed_content
+            processed_messages.append(processed_message)
+        return processed_messages
 
     # Create OpenAI client with custom base URL
     client = OpenAI(api_key=api_key, base_url=server_url)
@@ -189,17 +197,24 @@ def send_generate_request(
             return None
         return int(image_limit_match.group(1))
 
-    def _next_token_budget_from_error(error_text: str, current_budget: int) -> Optional[int]:
+    def _next_token_budget_from_error(
+        error_text: str, current_budget: int
+    ) -> Optional[int]:
         """
         Parse vLLM/OpenAI-compatible context-window errors and compute a safer retry budget.
         Expected fragment:
           "You passed 4097 input tokens and requested 4096 output tokens... context length is only 8192..."
         """
-        if "context length" not in error_text:
+        normalized = error_text.lower()
+        if (
+            "context length" not in normalized
+            and "maximum input length" not in normalized
+            and "max_tokens must be at least 1" not in normalized
+        ):
             return None
 
         # Always back off aggressively on context errors.
-        fallback_budget = max(current_budget // 2, 64)
+        fallback_budget = max(current_budget // 2, 1)
 
         input_match = re.search(r"passed\s+(\d+)\s+input tokens", error_text)
         context_match = re.search(r"context length is only\s+(\d+)\s+tokens", error_text)
@@ -210,13 +225,30 @@ def send_generate_request(
 
         input_tokens = int(input_match.group(1))
         context_tokens = int(context_match.group(1))
-        parsed_budget = max(context_tokens - input_tokens - 64, 64)
+        parsed_budget = max(context_tokens - input_tokens - 32, 1)
         next_budget = min(parsed_budget, fallback_budget)
         if next_budget >= current_budget:
             return None
         return next_budget
 
-    budget = max_tokens
+    def _next_smaller_image_edge(current_edge: Optional[int]) -> Optional[int]:
+        if current_edge is None or current_edge <= min_image_max_edge:
+            return None
+        reduced = max(min_image_max_edge, int(current_edge * 0.8))
+        if reduced >= current_edge:
+            return None
+        return reduced
+
+    def _is_context_overflow_error(error_text: str) -> bool:
+        normalized = error_text.lower()
+        return (
+            "context length" in normalized
+            or "maximum input length" in normalized
+            or "max_tokens must be at least 1" in normalized
+        )
+
+    budget = max(int(max_tokens), 1)
+    current_image_max_edge = image_max_edge
     forced_max_images: Optional[int] = None
     max_images_env = os.environ.get("SAM3_MAX_IMAGES_PER_REQUEST")
     if max_images_env:
@@ -225,19 +257,39 @@ def send_generate_request(
         except ValueError:
             forced_max_images = None
 
+    model_lc = (model or "").lower()
+    disable_thinking_env = os.environ.get("SAM3_DISABLE_THINKING")
+    if disable_thinking_env is None:
+        disable_thinking = "qwen3" in model_lc
+    else:
+        disable_thinking = disable_thinking_env.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    extra_body: dict[str, Any] = {}
+    if disable_thinking:
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+
     # Retry a few times only for context-budget errors.
-    for _attempt in range(6):
+    for _attempt in range(10):
         try:
+            processed_messages = _build_processed_messages(current_image_max_edge)
             request_messages = _cap_images_in_processed_messages(
                 processed_messages, forced_max_images
             )
             print(f"🔍 Calling model {model}...")
-            response = client.chat.completions.create(
+            request_kwargs = dict(
                 model=model,
                 messages=request_messages,
                 max_completion_tokens=budget,
                 n=1,
             )
+            if extra_body:
+                request_kwargs["extra_body"] = extra_body
+            response = client.chat.completions.create(**request_kwargs)
 
             if response.choices and len(response.choices) > 0:
                 return response.choices[0].message.content
@@ -260,14 +312,36 @@ def send_generate_request(
                 continue
 
             next_budget = _next_token_budget_from_error(error_text, budget)
-            if next_budget is None:
-                print(f"Request failed: {e}")
-                return None
-            print(
-                "Request exceeded context budget. "
-                f"Retrying with max_completion_tokens={next_budget}."
-            )
-            budget = next_budget
+            if next_budget is not None:
+                print(
+                    "Request exceeded context budget. "
+                    f"Retrying with max_completion_tokens={next_budget}."
+                )
+                budget = next_budget
+                continue
+
+            if _is_context_overflow_error(error_text):
+                # Retry with one image only when multimodal context is too large.
+                if forced_max_images is None or forced_max_images > 1:
+                    forced_max_images = 1
+                    print(
+                        "Request exceeded context budget. "
+                        "Retrying with at most 1 image per request."
+                    )
+                    continue
+
+                # If still too large, downscale image further.
+                next_edge = _next_smaller_image_edge(current_image_max_edge)
+                if next_edge is not None:
+                    print(
+                        "Request exceeded context budget. "
+                        f"Retrying with SAM3_AGENT_IMAGE_MAX_EDGE={next_edge}."
+                    )
+                    current_image_max_edge = next_edge
+                    continue
+
+            print(f"Request failed: {e}")
+            return None
 
     print("Request failed after retries due to repeated context budget errors.")
     return None

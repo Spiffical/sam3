@@ -76,6 +76,59 @@ Examples:
 EOF
 }
 
+ensure_runner_deps() {
+  local wheelhouse_args=(
+    -f /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v4
+    -f /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v3
+    -f /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/generic
+    -f /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/generic
+  )
+  local runner_dep_specs=(
+    "timm>=1.0.17"
+    "ftfy==6.1.1"
+    "scikit-image"
+    "scikit-learn"
+    "pandas"
+    "matplotlib"
+  )
+  export PIP_NO_USER=1
+
+  if ! python - <<'PY'
+import importlib.util
+import sys
+missing = [
+    m
+    for m in ("timm", "ftfy", "skimage", "sklearn", "pandas", "matplotlib")
+    if importlib.util.find_spec(m) is None
+]
+sys.exit(0 if not missing else 1)
+PY
+  then
+    echo "[Info] Installing missing SAM3 runner deps (timm, ftfy, scikit-image, scikit-learn, pandas, matplotlib) into active venv..."
+    if ! python -m pip --isolated install --no-index "${wheelhouse_args[@]}" "${runner_dep_specs[@]}"; then
+      PIP_CONFIG_FILE=/dev/null python -m pip install -i https://pypi.org/simple "${runner_dep_specs[@]}"
+    fi
+  fi
+
+  if ! python - <<'PY'
+import sys
+import numpy as np
+if int(np.__version__.split(".")[0]) >= 2:
+    raise SystemExit(1)
+try:
+    import pycocotools._mask  # noqa: F401
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+  then
+    echo "[Info] Repairing numpy/pycocotools ABI compatibility (numpy<2)..."
+    if ! python -m pip --isolated install --no-index "${wheelhouse_args[@]}" --force-reinstall "numpy>=1.26,<2" "pycocotools"; then
+      PIP_CONFIG_FILE=/dev/null python -m pip install -i https://pypi.org/simple --force-reinstall "numpy>=1.26,<2" "pycocotools"
+    fi
+  fi
+}
+
 mode="auto"
 account="${ACCOUNT:-rpp-kmoran}"
 video_path=""
@@ -234,6 +287,7 @@ run_interactive() {
   fi
   # shellcheck disable=SC1090
   source "${venv_path}/bin/activate"
+  ensure_runner_deps
 
   if [[ -f "$env_file" ]]; then
     set -a
@@ -357,6 +411,10 @@ run_interactive() {
   fi
   if [[ -n "$MODEL_REVISION" ]]; then
     vllm_cmd+=(--revision "$MODEL_REVISION")
+  fi
+  if [[ "${MODEL_ID,,}" == *"qwen3.5"* ]]; then
+    # Qwen3.5 behaves better for agentic tool-calling when thinking is disabled.
+    vllm_cmd+=(--reasoning-parser qwen3 --default-chat-template-kwargs '{"enable_thinking": false}')
   fi
 
   runner_cmd=(

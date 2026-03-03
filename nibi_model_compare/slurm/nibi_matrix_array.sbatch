@@ -35,6 +35,58 @@ safe_delete_dir() {
   rm -rf -- "$staged"
 }
 
+ensure_runner_deps() {
+  local wheelhouse_args=(
+    -f /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v4
+    -f /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/x86-64-v3
+    -f /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/gentoo2023/generic
+    -f /cvmfs/soft.computecanada.ca/custom/python/wheelhouse/generic
+  )
+  local runner_dep_specs=(
+    "timm>=1.0.17"
+    "ftfy==6.1.1"
+    "scikit-image"
+    "scikit-learn"
+    "pandas"
+    "matplotlib"
+  )
+  export PIP_NO_USER=1
+
+  if ! python3 - <<'PY'
+import importlib.util
+import sys
+missing = [
+    m
+    for m in ("timm", "ftfy", "skimage", "sklearn", "pandas", "matplotlib")
+    if importlib.util.find_spec(m) is None
+]
+sys.exit(0 if not missing else 1)
+PY
+  then
+    echo "[Info] Installing missing SAM3 runner deps (timm, ftfy, scikit-image, scikit-learn, pandas, matplotlib) into active venv..."
+    if ! python3 -m pip --isolated install --no-index "${wheelhouse_args[@]}" "${runner_dep_specs[@]}"; then
+      PIP_CONFIG_FILE=/dev/null python3 -m pip install -i https://pypi.org/simple "${runner_dep_specs[@]}"
+    fi
+  fi
+
+  if ! python3 - <<'PY'
+import numpy as np
+if int(np.__version__.split(".")[0]) >= 2:
+    raise SystemExit(1)
+try:
+    import pycocotools._mask  # noqa: F401
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+  then
+    echo "[Info] Repairing numpy/pycocotools ABI compatibility (numpy<2)..."
+    if ! python3 -m pip --isolated install --no-index "${wheelhouse_args[@]}" --force-reinstall "numpy>=1.26,<2" "pycocotools"; then
+      PIP_CONFIG_FILE=/dev/null python3 -m pip install -i https://pypi.org/simple --force-reinstall "numpy>=1.26,<2" "pycocotools"
+    fi
+  fi
+}
+
 REPO_ROOT="${REPO_ROOT:-$PWD}"
 PROJECT_ROOT="${PROJECT_ROOT:-$REPO_ROOT}"
 ACCOUNT_NAME="${SLURM_JOB_ACCOUNT:-${SLURM_ACCOUNT:-${ACCOUNT:-}}}"
@@ -81,6 +133,7 @@ if [[ ! -d "$VENV_PATH" ]]; then
   exit 1
 fi
 source "$VENV_PATH/bin/activate"
+ensure_runner_deps
 
 PERSISTENT_CACHE_ROOT="${PERSISTENT_CACHE_ROOT:-$PROJECT_CACHE_ROOT}"
 JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-${SLURM_TMPDIR:-$PROJECT_CACHE_ROOT}/hf-cache}"
@@ -238,6 +291,10 @@ if [[ -n "$MAX_NUM_SEQS" ]]; then
 fi
 if [[ -n "$MODEL_REVISION" ]]; then
   VLLM_CMD+=(--revision "$MODEL_REVISION")
+fi
+if [[ "${MODEL_ID,,}" == *"qwen3.5"* ]]; then
+  # Qwen3.5 behaves better for agentic tool-calling when thinking is disabled.
+  VLLM_CMD+=(--reasoning-parser qwen3 --default-chat-template-kwargs '{"enable_thinking": false}')
 fi
 if [[ -n "$LIMIT_MM_PER_PROMPT" ]]; then
   VLLM_CMD+=(--limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT")
