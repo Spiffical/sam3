@@ -217,8 +217,120 @@ def _build_tool_format_repair_message(path_to_latest_output_json, initial_text_p
         "Respond with exactly one tool call in this strict format and nothing else: "
         '<tool>{"name":"TOOL_NAME","parameters":{...}}</tool>. '
         f"The tool name must be one of: {valid_names}. "
+        "Do not include analysis, markdown, bullet points, or any text outside <tool>...</tool>. "
         f"The original user query is: '{initial_text_prompt}'."
     )
+
+
+def _is_broad_underwater_creature_query(text):
+    if not isinstance(text, str):
+        return False
+    normalized = text.lower()
+    keywords = (
+        "small creature",
+        "small creatures",
+        "creature",
+        "creatures",
+        "marine organism",
+        "marine organisms",
+        "underwater",
+    )
+    return any(keyword in normalized for keyword in keywords)
+
+
+def _safe_count_available_masks(path_to_latest_output_json):
+    if not path_to_latest_output_json:
+        return None
+    try:
+        with open(path_to_latest_output_json, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+
+    pred_masks = payload.get("pred_masks")
+    if isinstance(pred_masks, list):
+        return len(pred_masks)
+    pred_boxes = payload.get("pred_boxes")
+    if isinstance(pred_boxes, list):
+        return len(pred_boxes)
+    return None
+
+
+def _make_tool_call_text(tool_call):
+    return f"<tool>{json.dumps(tool_call, ensure_ascii=False)}</tool>"
+
+
+def _build_malformed_tool_call_fallback(
+    *,
+    path_to_latest_output_json,
+    initial_text_prompt,
+    prompt_profile,
+    used_text_prompts,
+):
+    """
+    Build a deterministic fallback tool call when the model repeatedly fails to emit
+    valid tool-call JSON.
+
+    Policy is controlled via SAM3_TOOL_CALL_FALLBACK_POLICY:
+      - strict_fail (default for non-underwater): raise error
+      - auto (default for underwater broad-creature prompts):
+          * if masks exist => select all masks
+          * if no masks => report_no_mask
+          * first turn underwater broad-creature => segment_phrase with a safe phrase
+      - select_all: force select all currently available masks when possible
+      - report_no_mask: force report_no_mask
+    """
+    configured_policy = os.environ.get("SAM3_TOOL_CALL_FALLBACK_POLICY", "").strip().lower()
+    if configured_policy:
+        policy = configured_policy
+    else:
+        if (
+            prompt_profile == "underwater"
+            and _is_broad_underwater_creature_query(initial_text_prompt)
+        ):
+            policy = "auto"
+        else:
+            policy = "strict_fail"
+
+    if policy in {"strict", "strict_fail", "off", "none"}:
+        return None
+
+    if policy in {"report", "report_no_mask"}:
+        tool_call = {"name": "report_no_mask", "parameters": {}}
+        return tool_call, _make_tool_call_text(tool_call)
+
+    available_masks = _safe_count_available_masks(path_to_latest_output_json)
+    if available_masks is not None and available_masks > 0:
+        if policy in {"auto", "select_all", "auto_select_all"}:
+            tool_call = {
+                "name": "select_masks_and_return",
+                "parameters": {"final_answer_masks": list(range(1, available_masks + 1))},
+            }
+            return tool_call, _make_tool_call_text(tool_call)
+
+    if available_masks == 0 and policy in {"auto", "select_all", "auto_select_all"}:
+        tool_call = {"name": "report_no_mask", "parameters": {}}
+        return tool_call, _make_tool_call_text(tool_call)
+
+    if not path_to_latest_output_json and policy in {"auto", "segment_phrase"}:
+        for candidate_prompt in (
+            "small creatures",
+            "small creature",
+            "creatures",
+            "marine organisms",
+            "small animals",
+        ):
+            if candidate_prompt not in used_text_prompts:
+                tool_call = {
+                    "name": "segment_phrase",
+                    "parameters": {"text_prompt": candidate_prompt},
+                }
+                return tool_call, _make_tool_call_text(tool_call)
+        # If all defaults were already used, finish gracefully.
+        tool_call = {"name": "report_no_mask", "parameters": {}}
+        return tool_call, _make_tool_call_text(tool_call)
+
+    return None
 
 
 def _extract_mask_verdict(generated_text):
@@ -464,54 +576,69 @@ def agent_inference(
         if parsed_tool_call is None:
             malformed_tool_call_retries += 1
             if malformed_tool_call_retries > 3:
-                raise ValueError(f"Invalid JSON in tool call: {generated_text}")
-
-            print(
-                "⚠️ Invalid tool-call format from model. "
-                f"Requesting a strict-format retry ({malformed_tool_call_retries}/3)."
-            )
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": _compact_assistant_text_for_history(generated_text),
-                        }
-                    ],
-                }
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": _build_tool_format_repair_message(
-                                PATH_TO_LATEST_OUTPUT_JSON, initial_text_prompt
-                            ),
-                        }
-                    ],
-                }
-            )
-
-            # Keep parse retries bounded within max_generations as well.
-            generation_count += 1
-            if generation_count > max_generations:
-                raise ValueError(
-                    f"Exceeded maximum number of allowed generation requests ({max_generations})"
+                fallback_tool = _build_malformed_tool_call_fallback(
+                    path_to_latest_output_json=PATH_TO_LATEST_OUTPUT_JSON,
+                    initial_text_prompt=initial_text_prompt,
+                    prompt_profile=prompt_profile,
+                    used_text_prompts=USED_TEXT_PROMPTS,
                 )
-            print("\n\n")
-            print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
-            print("\n\n")
-            generated_text = send_generate_request(messages)
-            print(
-                f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
-            )
-            continue
+                if fallback_tool is None:
+                    raise ValueError(f"Invalid JSON in tool call: {generated_text}")
 
-        malformed_tool_call_retries = 0
-        tool_call, generated_text = parsed_tool_call
+                tool_call, generated_text = fallback_tool
+                malformed_tool_call_retries = 0
+                print(
+                    "⚠️ Invalid tool-call format persisted after retries. "
+                    f"Applying fallback tool call: {tool_call}"
+                )
+            else:
+                print(
+                    "⚠️ Invalid tool-call format from model. "
+                    f"Requesting a strict-format retry ({malformed_tool_call_retries}/3)."
+                )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": _compact_assistant_text_for_history(generated_text),
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": _build_tool_format_repair_message(
+                                    PATH_TO_LATEST_OUTPUT_JSON, initial_text_prompt
+                                ),
+                            }
+                        ],
+                    }
+                )
+
+                # Keep parse retries bounded within max_generations as well.
+                generation_count += 1
+                if generation_count > max_generations:
+                    raise ValueError(
+                        f"Exceeded maximum number of allowed generation requests ({max_generations})"
+                    )
+                print("\n\n")
+                print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
+                print("\n\n")
+                generated_text = send_generate_request(messages)
+                print(
+                    f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
+                )
+                continue
+
+        else:
+            malformed_tool_call_retries = 0
+            tool_call, generated_text = parsed_tool_call
 
         if PATH_TO_LATEST_OUTPUT_JSON == "":
             # The first tool call must be segment_phrase or report_no_mask

@@ -66,6 +66,7 @@ SAM3 env toggles (forwarded in both modes):
   --sam3-max-images-per-request <n>            Default: 1
   --pytorch-cuda-alloc-conf <value>            Default: expandable_segments:True
   --sam3-save-frame-outputs-json <0|1>         Default: 1
+  --sam3-tool-call-fallback-policy <policy>    Optional (auto|strict_fail|select_all|report_no_mask)
   --sam3-overlay-max-mask-area-ratio <float>   Optional
   --sam3-overlay-alpha <float>                 Optional
 
@@ -188,6 +189,7 @@ sam3_disable_warmup="1"
 sam3_max_images_per_request="1"
 pytorch_cuda_alloc_conf="expandable_segments:True"
 sam3_save_frame_outputs_json="1"
+sam3_tool_call_fallback_policy=""
 sam3_overlay_max_mask_area_ratio=""
 sam3_overlay_alpha=""
 
@@ -245,6 +247,7 @@ while [[ $# -gt 0 ]]; do
     --sam3-max-images-per-request) sam3_max_images_per_request="$2"; shift 2 ;;
     --pytorch-cuda-alloc-conf) pytorch_cuda_alloc_conf="$2"; shift 2 ;;
     --sam3-save-frame-outputs-json) sam3_save_frame_outputs_json="$2"; shift 2 ;;
+    --sam3-tool-call-fallback-policy) sam3_tool_call_fallback_policy="$2"; shift 2 ;;
     --sam3-overlay-max-mask-area-ratio) sam3_overlay_max_mask_area_ratio="$2"; shift 2 ;;
     --sam3-overlay-alpha) sam3_overlay_alpha="$2"; shift 2 ;;
 
@@ -412,6 +415,14 @@ run_interactive() {
   export SAM3_MAX_IMAGES_PER_REQUEST="$sam3_max_images_per_request"
   export PYTORCH_CUDA_ALLOC_CONF="$pytorch_cuda_alloc_conf"
   export SAM3_SAVE_FRAME_OUTPUTS_JSON="$sam3_save_frame_outputs_json"
+  if [[ -z "$sam3_tool_call_fallback_policy" ]]; then
+    if [[ "${MODEL_ID,,}" == *"qwen3.5"* && "${SAM3_AGENT_PROMPT_PROFILE,,}" == "underwater" ]]; then
+      sam3_tool_call_fallback_policy="auto"
+    fi
+  fi
+  if [[ -n "$sam3_tool_call_fallback_policy" ]]; then
+    export SAM3_TOOL_CALL_FALLBACK_POLICY="$sam3_tool_call_fallback_policy"
+  fi
   if [[ -n "$sam3_overlay_max_mask_area_ratio" ]]; then
     export SAM3_OVERLAY_MAX_MASK_AREA_RATIO="$sam3_overlay_max_mask_area_ratio"
   fi
@@ -510,6 +521,9 @@ run_interactive() {
   echo "runner cuda visible: $runner_cuda_visible_devices"
   echo "temporal pipeline: $temporal_keyframe_pipeline"
   echo "invalid frame source: $invalid_frame_source"
+  if [[ -n "${SAM3_TOOL_CALL_FALLBACK_POLICY:-}" ]]; then
+    echo "tool-call fallback: $SAM3_TOOL_CALL_FALLBACK_POLICY"
+  fi
 
   if [[ "$dry_run" == "1" ]]; then
     if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
@@ -608,6 +622,14 @@ run_submit() {
     --set-env "MLLM_DISCOVERY_WINDOW_STRIDE=${mllm_discovery_window_stride}"
     --set-env "MLLM_DISCOVERY_MAX_JSON_RETRIES=${mllm_discovery_max_json_retries}"
   )
+  if [[ -z "$sam3_tool_call_fallback_policy" ]]; then
+    if [[ "${model_id,,}" == *"qwen3.5"* && "${prompt_profile,,}" == "underwater" ]]; then
+      sam3_tool_call_fallback_policy="auto"
+    fi
+  fi
+  if [[ -n "$sam3_tool_call_fallback_policy" ]]; then
+    submit_cmd+=(--set-env "SAM3_TOOL_CALL_FALLBACK_POLICY=${sam3_tool_call_fallback_policy}")
+  fi
   if [[ -n "$sam3_overlay_max_mask_area_ratio" ]]; then
     submit_cmd+=(--set-env "SAM3_OVERLAY_MAX_MASK_AREA_RATIO=${sam3_overlay_max_mask_area_ratio}")
   fi

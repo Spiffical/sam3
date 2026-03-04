@@ -180,6 +180,11 @@ if [[ "$MODEL_ID" == *:* ]]; then
   echo "Invalid MODEL_ID '${MODEL_ID}'. Use plain repo id, and pass revision as MODEL_REVISION."
   exit 1
 fi
+if [[ -z "${SAM3_TOOL_CALL_FALLBACK_POLICY:-}" ]]; then
+  if [[ "${MODEL_ID,,}" == *"qwen3.5"* && "${PROMPT_PROFILE,,}" == "underwater" ]]; then
+    export SAM3_TOOL_CALL_FALLBACK_POLICY="auto"
+  fi
+fi
 VLLM_RUNTIME="${VLLM_RUNTIME:-auto}"
 if [[ "$VLLM_RUNTIME" == "auto" ]]; then
   model_id_lc="${MODEL_ID,,}"
