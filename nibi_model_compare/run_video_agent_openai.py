@@ -165,6 +165,62 @@ def get_center_point(mask: np.ndarray) -> tuple[int, int] | None:
     return int(xs[idx]), int(ys[idx])
 
 
+def binary_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    a = np.asarray(mask_a).astype(bool)
+    b = np.asarray(mask_b).astype(bool)
+    inter = float(np.logical_and(a, b).sum())
+    if inter <= 0.0:
+        return 0.0
+    union = float(np.logical_or(a, b).sum())
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def deduplicate_masks_by_iou(
+    masks: list[np.ndarray], iou_threshold: float
+) -> tuple[list[np.ndarray], list[int], list[dict[str, Any]]]:
+    """
+    Remove near-duplicate masks within one keyframe before ID assignment.
+    Keeps first occurrence order and drops masks with IoU >= threshold to a kept mask.
+    Returns: (kept_masks, kept_original_indices, dropped_rows)
+    """
+    if len(masks) <= 1:
+        return masks, list(range(len(masks))), []
+
+    kept_masks: list[np.ndarray] = []
+    kept_indices: list[int] = []
+    dropped_rows: list[dict[str, Any]] = []
+
+    for new_idx, candidate_mask in enumerate(masks):
+        matched_kept_idx: int | None = None
+        best_iou = 0.0
+        is_duplicate = False
+        for kept_pos, kept_mask in enumerate(kept_masks):
+            iou = binary_mask_iou(candidate_mask, kept_mask)
+            if iou > best_iou:
+                best_iou = float(iou)
+                matched_kept_idx = kept_indices[kept_pos]
+            if iou >= iou_threshold:
+                is_duplicate = True
+                break
+        if is_duplicate:
+            dropped_rows.append(
+                {
+                    "dropped_mask_index": int(new_idx),
+                    "matched_kept_mask_index": (
+                        int(matched_kept_idx) if matched_kept_idx is not None else None
+                    ),
+                    "best_iou": float(best_iou),
+                }
+            )
+            continue
+        kept_masks.append(candidate_mask)
+        kept_indices.append(new_idx)
+
+    return kept_masks, kept_indices, dropped_rows
+
+
 def read_video_frame(video_path: str, frame_idx: int) -> np.ndarray | None:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -254,11 +310,80 @@ def iter_output_masks_with_ids(
     return [(i + 1, m) for i, m in enumerate(mask_list_from_outputs(outputs))]
 
 
+def _coerce_to_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:
+            pass
+    if isinstance(value, list):
+        return value
+    try:
+        return list(value)
+    except Exception:
+        return []
+
+
+def _frame_object_metadata(
+    outputs: dict[str, Any], frame_h: int, frame_w: int
+) -> dict[int, dict[str, Any]]:
+    obj_ids = _coerce_to_list(outputs.get("out_obj_ids"))
+    out_boxes_xywh = _coerce_to_list(outputs.get("out_boxes_xywh"))
+    out_probs = _coerce_to_list(outputs.get("out_probs"))
+
+    metadata: dict[int, dict[str, Any]] = {}
+    for i, raw_obj_id in enumerate(obj_ids):
+        try:
+            obj_id = int(raw_obj_id)
+        except Exception:
+            continue
+
+        box_xyxy: tuple[int, int, int, int] | None = None
+        if i < len(out_boxes_xywh):
+            raw_box = out_boxes_xywh[i]
+            if isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
+                try:
+                    x, y, w, h = [float(raw_box[j]) for j in range(4)]
+                    x1 = int(round(x))
+                    y1 = int(round(y))
+                    x2 = int(round(x + max(0.0, w)))
+                    y2 = int(round(y + max(0.0, h)))
+                    x1 = max(0, min(frame_w - 1, x1))
+                    y1 = max(0, min(frame_h - 1, y1))
+                    x2 = max(0, min(frame_w - 1, x2))
+                    y2 = max(0, min(frame_h - 1, y2))
+                    if x2 > x1 and y2 > y1:
+                        box_xyxy = (x1, y1, x2, y2)
+                except Exception:
+                    box_xyxy = None
+
+        conf: float | None = None
+        if i < len(out_probs):
+            raw_prob = out_probs[i]
+            if isinstance(raw_prob, (list, tuple)) and len(raw_prob) > 0:
+                raw_prob = raw_prob[0]
+            try:
+                conf = float(raw_prob)
+            except Exception:
+                conf = None
+
+        metadata[obj_id] = {"box_xyxy": box_xyxy, "confidence": conf}
+
+    return metadata
+
+
 def overlay_masks_on_frame(video_frame: np.ndarray, outputs: dict[str, Any]) -> np.ndarray:
     frame_h, frame_w = video_frame.shape[:2]
     masks_with_ids = iter_output_masks_with_ids(outputs, frame_h, frame_w)
     if not masks_with_ids:
         return video_frame
+    metadata_by_obj = _frame_object_metadata(outputs, frame_h, frame_w)
 
     max_area_ratio = float(os.environ.get("SAM3_OVERLAY_MAX_MASK_AREA_RATIO", "0.95"))
     alpha = float(os.environ.get("SAM3_OVERLAY_ALPHA", "0.35"))
@@ -281,6 +406,47 @@ def overlay_masks_on_frame(video_frame: np.ndarray, outputs: dict[str, Any]) -> 
         mask_u8 = (mask.astype(np.uint8) * 255)
         contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(video_frame, contours, -1, color, 2)
+
+        meta = metadata_by_obj.get(int(obj_id), {})
+        box_xyxy = meta.get("box_xyxy")
+        confidence = meta.get("confidence")
+
+        if box_xyxy is None:
+            ys, xs = np.where(mask)
+            if len(xs) > 0 and len(ys) > 0:
+                x1 = int(xs.min())
+                y1 = int(ys.min())
+                x2 = int(xs.max())
+                y2 = int(ys.max())
+                if x2 > x1 and y2 > y1:
+                    box_xyxy = (x1, y1, x2, y2)
+
+        if box_xyxy is not None:
+            x1, y1, x2, y2 = box_xyxy
+            cv2.rectangle(video_frame, (x1, y1), (x2, y2), color, 2)
+
+            label = f"id {int(obj_id)}"
+            if isinstance(confidence, (float, int)):
+                label += f" p {float(confidence):.1f}"
+
+            (text_w, text_h), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            )
+            text_x = x1
+            text_y = max(text_h + 2, y1 - 4)
+            bg_tl = (text_x, text_y - text_h - baseline - 2)
+            bg_br = (text_x + text_w + 4, text_y + 2)
+            cv2.rectangle(video_frame, bg_tl, bg_br, color, -1)
+            cv2.putText(
+                video_frame,
+                label,
+                (text_x + 2, text_y - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
         drawn_any = True
 
     if not drawn_any:
@@ -514,6 +680,15 @@ def parse_args() -> argparse.Namespace:
         default=0.30,
         type=float,
         help="IoU threshold to reuse existing object ID at a keyframe.",
+    )
+    parser.add_argument(
+        "--intra_keyframe_dedup_iou_threshold",
+        default=0.85,
+        type=float,
+        help=(
+            "IoU threshold to drop near-duplicate masks selected on the same keyframe "
+            "before object-ID assignment."
+        ),
     )
     parser.add_argument(
         "--drop_invalid_frames",
@@ -1116,8 +1291,10 @@ def run() -> int:
             metrics["video_session_id"] = session_id
 
         next_obj_id = 1
-        total_agent_masks = 0
+        total_agent_masks_raw = 0
+        total_agent_masks_after_keyframe_dedup = 0
         total_history_len = 0
+        keyframe_dedup_events: list[dict[str, Any]] = []
 
         for keyframe_idx in keyframe_indices:
             if keyframe_idx in invalid_frame_indices:
@@ -1162,14 +1339,15 @@ def run() -> int:
                 continue
 
             selected_masks_rle = list(final_outputs.get("pred_masks", []))
-            total_agent_masks += len(selected_masks_rle)
+            raw_mask_count = len(selected_masks_rle)
+            total_agent_masks_raw += raw_mask_count
             total_history_len += len(history)
             agent_runs.append(
                 {
                     "frame_idx": int(keyframe_idx),
                     "frame_path": keyframe_path,
                     "history_len": int(len(history)),
-                    "num_masks": int(len(selected_masks_rle)),
+                    "num_masks": int(raw_mask_count),
                 }
             )
 
@@ -1186,6 +1364,29 @@ def run() -> int:
 
             if not decoded_masks:
                 continue
+
+            decoded_masks, _kept_mask_indices, dropped_rows = deduplicate_masks_by_iou(
+                decoded_masks,
+                iou_threshold=float(args.intra_keyframe_dedup_iou_threshold),
+            )
+            if dropped_rows:
+                dropped_count = len(dropped_rows)
+                print(
+                    f"[warn] keyframe {keyframe_idx}: dropped {dropped_count} near-duplicate "
+                    "mask(s) before ID assignment."
+                )
+                keyframe_dedup_events.append(
+                    {
+                        "frame_idx": int(keyframe_idx),
+                        "raw_mask_count": int(raw_mask_count),
+                        "kept_mask_count": int(len(decoded_masks)),
+                        "dropped_mask_count": int(dropped_count),
+                        "dropped_rows": dropped_rows,
+                    }
+                )
+            if not decoded_masks:
+                continue
+            total_agent_masks_after_keyframe_dedup += len(decoded_masks)
 
             existing_masks_with_ids: list[tuple[int, np.ndarray]] = []
             if keyframe_idx in results_by_frame:
@@ -1261,7 +1462,14 @@ def run() -> int:
         metrics["agent_runs"] = agent_runs
         metrics["failed_agent_keyframes"] = failed_agent_keyframes
         metrics["agent_history_len"] = total_history_len
-        metrics["num_agent_masks"] = total_agent_masks
+        metrics["num_agent_masks"] = total_agent_masks_after_keyframe_dedup
+        metrics["num_agent_masks_raw"] = total_agent_masks_raw
+        metrics["num_agent_masks_after_keyframe_dedup"] = (
+            total_agent_masks_after_keyframe_dedup
+        )
+        metrics["keyframe_dedup_event_count"] = len(keyframe_dedup_events)
+        if keyframe_dedup_events:
+            metrics["keyframe_dedup_events"] = keyframe_dedup_events
 
         prompts_path = os.path.join(args.output_dir, "generated_prompts.json")
         write_json(

@@ -299,7 +299,7 @@ if [[ -z "$video_path" ]]; then
 fi
 
 if [[ -z "$output_root" ]]; then
-  output_root="/project/${account}/${USER}/sam3/runs"
+  output_root="${SCRATCH:-/scratch/${USER}}/sam3/runs"
 fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"

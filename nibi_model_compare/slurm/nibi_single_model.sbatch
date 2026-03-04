@@ -213,7 +213,7 @@ VLLM_CUDA_VISIBLE_DEVICES="${VLLM_CUDA_VISIBLE_DEVICES:-}"
 RUNNER_CUDA_VISIBLE_DEVICES="${RUNNER_CUDA_VISIBLE_DEVICES:-}"
 RUNNER_GPU_IDS="${RUNNER_GPU_IDS:-}"
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-OUT_ROOT="${OUT_ROOT:-$PROJECT_ROOT/runs/single_${SLURM_JOB_ID}_${RUN_TS}}"
+OUT_ROOT="${OUT_ROOT:-${SCRATCH:-/scratch/$USER}/sam3/runs/single_${SLURM_JOB_ID}_${RUN_TS}}"
 export SERVER_PORT
 
 TMP_BASE="${SLURM_TMPDIR:-/tmp/$USER/slurm_${SLURM_JOB_ID}}"
@@ -404,6 +404,57 @@ else
 fi
 
 cp -a "$STAGE_OUT/." "$FINAL_OUT/"
+
+# Normalize metrics paths to persistent output location (FINAL_OUT) so reports
+# do not keep references to SLURM_TMPDIR staging paths.
+if [[ -f "$FINAL_OUT/run_metrics.json" ]]; then
+  python3 - <<PY
+import json
+import os
+
+run_metrics_path = os.path.join("$FINAL_OUT", "run_metrics.json")
+stage_out = os.path.abspath("$STAGE_OUT")
+final_out = os.path.abspath("$FINAL_OUT")
+
+with open(run_metrics_path, "r", encoding="utf-8") as f:
+    metrics = json.load(f)
+
+changed = False
+for key in ("output_video_path", "output_dir", "frame_outputs_json_path", "generated_prompts_path"):
+    value = metrics.get(key)
+    if isinstance(value, str) and value:
+        abs_value = os.path.abspath(value)
+        if abs_value.startswith(stage_out):
+            new_value = final_out + abs_value[len(stage_out):]
+            metrics[key] = new_value
+            changed = True
+
+# Also normalize per-keyframe frame paths when present.
+for row_key in ("agent_runs", "failed_agent_keyframes"):
+    rows = metrics.get(row_key)
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            frame_path = row.get("frame_path")
+            if isinstance(frame_path, str) and frame_path:
+                abs_frame = os.path.abspath(frame_path)
+                if abs_frame.startswith(stage_out):
+                    row["frame_path"] = final_out + abs_frame[len(stage_out):]
+                    changed = True
+
+if changed:
+    with open(run_metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+        f.write("\\n")
+PY
+fi
+
+if [[ -f "$FINAL_OUT/output_video.mp4" ]]; then
+  echo "Final overlay video (persistent): $FINAL_OUT/output_video.mp4"
+else
+  echo "Final overlay video not found in persistent output: $FINAL_OUT/output_video.mp4"
+fi
 
 python3 nibi_model_compare/summarize_runs.py \
   --output_root "$OUT_ROOT"
