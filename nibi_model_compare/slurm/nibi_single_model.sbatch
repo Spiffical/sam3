@@ -343,6 +343,19 @@ else:
     raise RuntimeError(f"Timed out waiting for {url}")
 PY
 
+TEMPORAL_KEYFRAME_PIPELINE="${TEMPORAL_KEYFRAME_PIPELINE:-0}"
+DISCOVERY_MODE="${DISCOVERY_MODE:-hybrid}"
+MAX_KEYFRAMES="${MAX_KEYFRAMES:-6}"
+MIN_KEYFRAME_GAP="${MIN_KEYFRAME_GAP:-24}"
+DROP_INVALID_FRAMES="${DROP_INVALID_FRAMES:-0}"
+INVALID_FRAME_SOURCE="${INVALID_FRAME_SOURCE:-hybrid}"
+MLLM_INVALID_WINDOW_SIZE="${MLLM_INVALID_WINDOW_SIZE:-4}"
+MLLM_INVALID_WINDOW_STRIDE="${MLLM_INVALID_WINDOW_STRIDE:-4}"
+MLLM_INVALID_MAX_JSON_RETRIES="${MLLM_INVALID_MAX_JSON_RETRIES:-2}"
+MLLM_DISCOVERY_WINDOW_SIZE="${MLLM_DISCOVERY_WINDOW_SIZE:-4}"
+MLLM_DISCOVERY_WINDOW_STRIDE="${MLLM_DISCOVERY_WINDOW_STRIDE:-24}"
+MLLM_DISCOVERY_MAX_JSON_RETRIES="${MLLM_DISCOVERY_MAX_JSON_RETRIES:-2}"
+
 RUN_CMD=(
   python3 nibi_model_compare/run_video_agent_openai.py
   --video_path "$VIDEO_PATH"
@@ -355,6 +368,24 @@ RUN_CMD=(
   --image_size "$IMAGE_SIZE"
   --max_completion_tokens "$MAX_COMPLETION_TOKENS"
 )
+if [[ "$TEMPORAL_KEYFRAME_PIPELINE" == "1" ]]; then
+  RUN_CMD+=(--temporal_keyframe_pipeline)
+  RUN_CMD+=(--discovery_mode "$DISCOVERY_MODE")
+  RUN_CMD+=(--max_keyframes "$MAX_KEYFRAMES")
+  RUN_CMD+=(--min_keyframe_gap "$MIN_KEYFRAME_GAP")
+  RUN_CMD+=(--mllm_discovery_window_size "$MLLM_DISCOVERY_WINDOW_SIZE")
+  RUN_CMD+=(--mllm_discovery_window_stride "$MLLM_DISCOVERY_WINDOW_STRIDE")
+  RUN_CMD+=(--mllm_discovery_max_json_retries "$MLLM_DISCOVERY_MAX_JSON_RETRIES")
+fi
+if [[ "$DROP_INVALID_FRAMES" == "1" ]]; then
+  RUN_CMD+=(--drop_invalid_frames)
+fi
+if [[ "$TEMPORAL_KEYFRAME_PIPELINE" == "1" || "$DROP_INVALID_FRAMES" == "1" ]]; then
+  RUN_CMD+=(--invalid_frame_source "$INVALID_FRAME_SOURCE")
+  RUN_CMD+=(--mllm_invalid_window_size "$MLLM_INVALID_WINDOW_SIZE")
+  RUN_CMD+=(--mllm_invalid_window_stride "$MLLM_INVALID_WINDOW_STRIDE")
+  RUN_CMD+=(--mllm_invalid_max_json_retries "$MLLM_INVALID_MAX_JSON_RETRIES")
+fi
 if [[ "$SAVE_PROMPTS" == "1" ]]; then
   RUN_CMD+=(--save_prompts)
 fi

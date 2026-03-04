@@ -46,6 +46,18 @@ Runner options:
   --runner-gpu-ids <ids>              Default: 0
   --image-size <n>                     Default: 1008
   --max-completion-tokens <n>          Default: 1024
+  --temporal-keyframe-pipeline         Enable temporal keyframe pipeline
+  --discovery-mode <motion|mllm|hybrid> Default: hybrid
+  --max-keyframes <n>                  Default: 6
+  --min-keyframe-gap <n>               Default: 24
+  --drop-invalid-frames                Drop invalid frames from outputs
+  --invalid-frame-source <heuristic|mllm|hybrid> Default: hybrid
+  --mllm-invalid-window-size <n>       Default: 4
+  --mllm-invalid-window-stride <n>     Default: 4
+  --mllm-invalid-max-json-retries <n>  Default: 2
+  --mllm-discovery-window-size <n>     Default: 4
+  --mllm-discovery-window-stride <n>   Default: 24
+  --mllm-discovery-max-json-retries <n> Default: 2
   --save-prompts                       Save prompts only, skip propagation
   --debug                              Enable debug logs
 
@@ -157,6 +169,18 @@ runner_cuda_visible_devices="1"
 runner_gpu_ids="0"
 image_size="1008"
 max_completion_tokens="1024"
+temporal_keyframe_pipeline=0
+discovery_mode="hybrid"
+max_keyframes="6"
+min_keyframe_gap="24"
+drop_invalid_frames=0
+invalid_frame_source="hybrid"
+mllm_invalid_window_size="4"
+mllm_invalid_window_stride="4"
+mllm_invalid_max_json_retries="2"
+mllm_discovery_window_size="4"
+mllm_discovery_window_stride="24"
+mllm_discovery_max_json_retries="2"
 save_prompts=0
 debug=0
 
@@ -202,6 +226,18 @@ while [[ $# -gt 0 ]]; do
     --runner-gpu-ids) runner_gpu_ids="$2"; shift 2 ;;
     --image-size) image_size="$2"; shift 2 ;;
     --max-completion-tokens) max_completion_tokens="$2"; shift 2 ;;
+    --temporal-keyframe-pipeline) temporal_keyframe_pipeline=1; shift ;;
+    --discovery-mode) discovery_mode="$2"; shift 2 ;;
+    --max-keyframes) max_keyframes="$2"; shift 2 ;;
+    --min-keyframe-gap) min_keyframe_gap="$2"; shift 2 ;;
+    --drop-invalid-frames) drop_invalid_frames=1; shift ;;
+    --invalid-frame-source) invalid_frame_source="$2"; shift 2 ;;
+    --mllm-invalid-window-size) mllm_invalid_window_size="$2"; shift 2 ;;
+    --mllm-invalid-window-stride) mllm_invalid_window_stride="$2"; shift 2 ;;
+    --mllm-invalid-max-json-retries) mllm_invalid_max_json_retries="$2"; shift 2 ;;
+    --mllm-discovery-window-size) mllm_discovery_window_size="$2"; shift 2 ;;
+    --mllm-discovery-window-stride) mllm_discovery_window_stride="$2"; shift 2 ;;
+    --mllm-discovery-max-json-retries) mllm_discovery_max_json_retries="$2"; shift 2 ;;
     --save-prompts) save_prompts=1; shift ;;
     --debug) debug=1; shift ;;
 
@@ -433,6 +469,24 @@ run_interactive() {
     --image_size "$image_size"
     --max_completion_tokens "$max_completion_tokens"
   )
+  if [[ "$temporal_keyframe_pipeline" == "1" ]]; then
+    runner_cmd+=(--temporal_keyframe_pipeline)
+    runner_cmd+=(--discovery_mode "$discovery_mode")
+    runner_cmd+=(--max_keyframes "$max_keyframes")
+    runner_cmd+=(--min_keyframe_gap "$min_keyframe_gap")
+    runner_cmd+=(--mllm_discovery_window_size "$mllm_discovery_window_size")
+    runner_cmd+=(--mllm_discovery_window_stride "$mllm_discovery_window_stride")
+    runner_cmd+=(--mllm_discovery_max_json_retries "$mllm_discovery_max_json_retries")
+  fi
+  if [[ "$drop_invalid_frames" == "1" ]]; then
+    runner_cmd+=(--drop_invalid_frames)
+  fi
+  if [[ "$temporal_keyframe_pipeline" == "1" || "$drop_invalid_frames" == "1" ]]; then
+    runner_cmd+=(--invalid_frame_source "$invalid_frame_source")
+    runner_cmd+=(--mllm_invalid_window_size "$mllm_invalid_window_size")
+    runner_cmd+=(--mllm_invalid_window_stride "$mllm_invalid_window_stride")
+    runner_cmd+=(--mllm_invalid_max_json_retries "$mllm_invalid_max_json_retries")
+  fi
   if [[ "$save_prompts" == "1" ]]; then
     runner_cmd+=(--save_prompts)
   fi
@@ -454,6 +508,8 @@ run_interactive() {
   echo "out:   $OUT_DIR"
   echo "vllm cuda visible: $vllm_cuda_visible_devices"
   echo "runner cuda visible: $runner_cuda_visible_devices"
+  echo "temporal pipeline: $temporal_keyframe_pipeline"
+  echo "invalid frame source: $invalid_frame_source"
 
   if [[ "$dry_run" == "1" ]]; then
     if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
@@ -539,6 +595,18 @@ run_submit() {
     --set-env "SAM3_MAX_IMAGES_PER_REQUEST=${sam3_max_images_per_request}"
     --set-env "PYTORCH_CUDA_ALLOC_CONF=${pytorch_cuda_alloc_conf}"
     --set-env "SAM3_SAVE_FRAME_OUTPUTS_JSON=${sam3_save_frame_outputs_json}"
+    --set-env "TEMPORAL_KEYFRAME_PIPELINE=${temporal_keyframe_pipeline}"
+    --set-env "DISCOVERY_MODE=${discovery_mode}"
+    --set-env "MAX_KEYFRAMES=${max_keyframes}"
+    --set-env "MIN_KEYFRAME_GAP=${min_keyframe_gap}"
+    --set-env "DROP_INVALID_FRAMES=${drop_invalid_frames}"
+    --set-env "INVALID_FRAME_SOURCE=${invalid_frame_source}"
+    --set-env "MLLM_INVALID_WINDOW_SIZE=${mllm_invalid_window_size}"
+    --set-env "MLLM_INVALID_WINDOW_STRIDE=${mllm_invalid_window_stride}"
+    --set-env "MLLM_INVALID_MAX_JSON_RETRIES=${mllm_invalid_max_json_retries}"
+    --set-env "MLLM_DISCOVERY_WINDOW_SIZE=${mllm_discovery_window_size}"
+    --set-env "MLLM_DISCOVERY_WINDOW_STRIDE=${mllm_discovery_window_stride}"
+    --set-env "MLLM_DISCOVERY_MAX_JSON_RETRIES=${mllm_discovery_max_json_retries}"
   )
   if [[ -n "$sam3_overlay_max_mask_area_ratio" ]]; then
     submit_cmd+=(--set-env "SAM3_OVERLAY_MAX_MASK_AREA_RATIO=${sam3_overlay_max_mask_area_ratio}")
