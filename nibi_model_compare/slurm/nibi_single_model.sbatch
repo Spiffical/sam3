@@ -360,6 +360,14 @@ MLLM_INVALID_MAX_JSON_RETRIES="${MLLM_INVALID_MAX_JSON_RETRIES:-2}"
 MLLM_DISCOVERY_WINDOW_SIZE="${MLLM_DISCOVERY_WINDOW_SIZE:-4}"
 MLLM_DISCOVERY_WINDOW_STRIDE="${MLLM_DISCOVERY_WINDOW_STRIDE:-24}"
 MLLM_DISCOVERY_MAX_JSON_RETRIES="${MLLM_DISCOVERY_MAX_JSON_RETRIES:-2}"
+POSTPROP_QA_MLLM="${POSTPROP_QA_MLLM:-0}"
+POSTPROP_QA_WINDOW_SIZE="${POSTPROP_QA_WINDOW_SIZE:-10}"
+POSTPROP_QA_WINDOW_STRIDE="${POSTPROP_QA_WINDOW_STRIDE:-1}"
+POSTPROP_QA_MAX_COMPLETION_TOKENS="${POSTPROP_QA_MAX_COMPLETION_TOKENS:-512}"
+POSTPROP_QA_MAX_OBJECT_CROPS="${POSTPROP_QA_MAX_OBJECT_CROPS:-8}"
+POSTPROP_QA_CROP_CONTEXT_RATIO="${POSTPROP_QA_CROP_CONTEXT_RATIO:-0.25}"
+POSTPROP_QA_MAX_JSON_RETRIES="${POSTPROP_QA_MAX_JSON_RETRIES:-2}"
+POSTPROP_QA_MERGE_BAD_INTO_INVALID="${POSTPROP_QA_MERGE_BAD_INTO_INVALID:-1}"
 
 RUN_CMD=(
   python3 nibi_model_compare/run_video_agent_openai.py
@@ -391,6 +399,18 @@ if [[ "$TEMPORAL_KEYFRAME_PIPELINE" == "1" || "$DROP_INVALID_FRAMES" == "1" ]]; 
   RUN_CMD+=(--mllm_invalid_window_stride "$MLLM_INVALID_WINDOW_STRIDE")
   RUN_CMD+=(--mllm_invalid_max_json_retries "$MLLM_INVALID_MAX_JSON_RETRIES")
 fi
+if [[ "$POSTPROP_QA_MLLM" == "1" ]]; then
+  RUN_CMD+=(--postprop_qa_mllm)
+  RUN_CMD+=(--postprop_qa_window_size "$POSTPROP_QA_WINDOW_SIZE")
+  RUN_CMD+=(--postprop_qa_window_stride "$POSTPROP_QA_WINDOW_STRIDE")
+  RUN_CMD+=(--postprop_qa_max_completion_tokens "$POSTPROP_QA_MAX_COMPLETION_TOKENS")
+  RUN_CMD+=(--postprop_qa_max_object_crops "$POSTPROP_QA_MAX_OBJECT_CROPS")
+  RUN_CMD+=(--postprop_qa_crop_context_ratio "$POSTPROP_QA_CROP_CONTEXT_RATIO")
+  RUN_CMD+=(--postprop_qa_max_json_retries "$POSTPROP_QA_MAX_JSON_RETRIES")
+  if [[ "$POSTPROP_QA_MERGE_BAD_INTO_INVALID" != "1" ]]; then
+    RUN_CMD+=(--no_postprop_qa_merge_bad_into_invalid)
+  fi
+fi
 if [[ "$SAVE_PROMPTS" == "1" ]]; then
   RUN_CMD+=(--save_prompts)
 fi
@@ -420,7 +440,7 @@ with open(run_metrics_path, "r", encoding="utf-8") as f:
     metrics = json.load(f)
 
 changed = False
-for key in ("output_video_path", "output_dir", "frame_outputs_json_path", "generated_prompts_path"):
+for key in ("output_video_path", "output_dir", "frame_outputs_json_path", "generated_prompts_path", "postprop_qa_report_path"):
     value = metrics.get(key)
     if isinstance(value, str) and value:
         abs_value = os.path.abspath(value)

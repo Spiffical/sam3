@@ -58,6 +58,14 @@ Runner options:
   --mllm-discovery-window-size <n>     Default: 4
   --mllm-discovery-window-stride <n>   Default: 24
   --mllm-discovery-max-json-retries <n> Default: 2
+  --postprop-qa-mllm                   Enable post-propagation MLLM QA pass
+  --postprop-qa-window-size <n>        Default: 10
+  --postprop-qa-window-stride <n>      Default: 1
+  --postprop-qa-max-completion-tokens <n> Default: 512
+  --postprop-qa-max-object-crops <n>   Default: 8
+  --postprop-qa-crop-context-ratio <f> Default: 0.25
+  --postprop-qa-max-json-retries <n>   Default: 2
+  --no-postprop-qa-merge-bad-into-invalid  Keep post-QA bad frames separate
   --save-prompts                       Save prompts only, skip propagation
   --debug                              Enable debug logs
 
@@ -182,6 +190,14 @@ mllm_invalid_max_json_retries="2"
 mllm_discovery_window_size="4"
 mllm_discovery_window_stride="24"
 mllm_discovery_max_json_retries="2"
+postprop_qa_mllm=0
+postprop_qa_window_size="10"
+postprop_qa_window_stride="1"
+postprop_qa_max_completion_tokens="512"
+postprop_qa_max_object_crops="8"
+postprop_qa_crop_context_ratio="0.25"
+postprop_qa_max_json_retries="2"
+postprop_qa_merge_bad_into_invalid=1
 save_prompts=0
 debug=0
 
@@ -240,6 +256,14 @@ while [[ $# -gt 0 ]]; do
     --mllm-discovery-window-size) mllm_discovery_window_size="$2"; shift 2 ;;
     --mllm-discovery-window-stride) mllm_discovery_window_stride="$2"; shift 2 ;;
     --mllm-discovery-max-json-retries) mllm_discovery_max_json_retries="$2"; shift 2 ;;
+    --postprop-qa-mllm) postprop_qa_mllm=1; shift ;;
+    --postprop-qa-window-size) postprop_qa_window_size="$2"; shift 2 ;;
+    --postprop-qa-window-stride) postprop_qa_window_stride="$2"; shift 2 ;;
+    --postprop-qa-max-completion-tokens) postprop_qa_max_completion_tokens="$2"; shift 2 ;;
+    --postprop-qa-max-object-crops) postprop_qa_max_object_crops="$2"; shift 2 ;;
+    --postprop-qa-crop-context-ratio) postprop_qa_crop_context_ratio="$2"; shift 2 ;;
+    --postprop-qa-max-json-retries) postprop_qa_max_json_retries="$2"; shift 2 ;;
+    --no-postprop-qa-merge-bad-into-invalid) postprop_qa_merge_bad_into_invalid=0; shift ;;
     --save-prompts) save_prompts=1; shift ;;
     --debug) debug=1; shift ;;
 
@@ -498,6 +522,18 @@ run_interactive() {
     runner_cmd+=(--mllm_invalid_window_stride "$mllm_invalid_window_stride")
     runner_cmd+=(--mllm_invalid_max_json_retries "$mllm_invalid_max_json_retries")
   fi
+  if [[ "$postprop_qa_mllm" == "1" ]]; then
+    runner_cmd+=(--postprop_qa_mllm)
+    runner_cmd+=(--postprop_qa_window_size "$postprop_qa_window_size")
+    runner_cmd+=(--postprop_qa_window_stride "$postprop_qa_window_stride")
+    runner_cmd+=(--postprop_qa_max_completion_tokens "$postprop_qa_max_completion_tokens")
+    runner_cmd+=(--postprop_qa_max_object_crops "$postprop_qa_max_object_crops")
+    runner_cmd+=(--postprop_qa_crop_context_ratio "$postprop_qa_crop_context_ratio")
+    runner_cmd+=(--postprop_qa_max_json_retries "$postprop_qa_max_json_retries")
+    if [[ "$postprop_qa_merge_bad_into_invalid" == "0" ]]; then
+      runner_cmd+=(--no_postprop_qa_merge_bad_into_invalid)
+    fi
+  fi
   if [[ "$save_prompts" == "1" ]]; then
     runner_cmd+=(--save_prompts)
   fi
@@ -521,6 +557,7 @@ run_interactive() {
   echo "runner cuda visible: $runner_cuda_visible_devices"
   echo "temporal pipeline: $temporal_keyframe_pipeline"
   echo "invalid frame source: $invalid_frame_source"
+  echo "post-prop QA: $postprop_qa_mllm"
   if [[ -n "${SAM3_TOOL_CALL_FALLBACK_POLICY:-}" ]]; then
     echo "tool-call fallback: $SAM3_TOOL_CALL_FALLBACK_POLICY"
   fi
@@ -621,6 +658,14 @@ run_submit() {
     --set-env "MLLM_DISCOVERY_WINDOW_SIZE=${mllm_discovery_window_size}"
     --set-env "MLLM_DISCOVERY_WINDOW_STRIDE=${mllm_discovery_window_stride}"
     --set-env "MLLM_DISCOVERY_MAX_JSON_RETRIES=${mllm_discovery_max_json_retries}"
+    --set-env "POSTPROP_QA_MLLM=${postprop_qa_mllm}"
+    --set-env "POSTPROP_QA_WINDOW_SIZE=${postprop_qa_window_size}"
+    --set-env "POSTPROP_QA_WINDOW_STRIDE=${postprop_qa_window_stride}"
+    --set-env "POSTPROP_QA_MAX_COMPLETION_TOKENS=${postprop_qa_max_completion_tokens}"
+    --set-env "POSTPROP_QA_MAX_OBJECT_CROPS=${postprop_qa_max_object_crops}"
+    --set-env "POSTPROP_QA_CROP_CONTEXT_RATIO=${postprop_qa_crop_context_ratio}"
+    --set-env "POSTPROP_QA_MAX_JSON_RETRIES=${postprop_qa_max_json_retries}"
+    --set-env "POSTPROP_QA_MERGE_BAD_INTO_INVALID=${postprop_qa_merge_bad_into_invalid}"
   )
   if [[ -z "$sam3_tool_call_fallback_policy" ]]; then
     if [[ "${model_id,,}" == *"qwen3.5"* && "${prompt_profile,,}" == "underwater" ]]; then

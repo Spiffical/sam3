@@ -16,11 +16,15 @@ It is designed for:
 - `frame_quality_mllm.py`: MLLM-first per-frame validity classification (valid/invalid) across full videos.
 - `keyframe_discovery.py`: motion-driven keyframe proposal for temporal agent runs.
 - `keyframe_discovery_mllm.py`: MLLM temporal keyframe/event discovery over frame windows.
+- `postprop_qa_mllm.py`: post-propagation MLLM QA sweep over frame context + mask crops.
 - `track_id_matching.py`: IoU-based object-ID assignment across keyframe updates.
 - `TEMPORAL_UNDERWATER_PIPELINE_PLAN.md`: design and rollout notes for temporal underwater workflow.
 - Temporal discovery prompt templates:
   - `sam3/agent/system_prompts/system_prompt_temporal_discovery_underwater.txt`
   - `sam3/agent/system_prompts/system_prompt_temporal_discovery_general.txt`
+- Post-propagation QA prompt templates:
+  - `sam3/agent/system_prompts/system_prompt_postprop_qa_underwater.txt`
+  - `sam3/agent/system_prompts/system_prompt_postprop_qa_general.txt`
 - `run_model_matrix.py`: orchestrates multiple model runs.
 - `summarize_runs.py`: builds `summary.csv` and `summary.md`.
 - `generate_paste_report.py`: creates `PASTE_TO_CODEX.md`.

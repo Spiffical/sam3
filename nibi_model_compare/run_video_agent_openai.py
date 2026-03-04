@@ -455,6 +455,53 @@ def overlay_masks_on_frame(video_frame: np.ndarray, outputs: dict[str, Any]) -> 
     return cv2.addWeighted(video_frame, 1.0, overlay, alpha, 0.0)
 
 
+def overlay_invalid_frame_marker(
+    video_frame: np.ndarray, frame_index: int | None = None
+) -> np.ndarray:
+    """Apply a red tint and corner badge for invalid/corrupt frames."""
+    frame = video_frame.copy()
+    h, w = frame.shape[:2]
+    if h <= 0 or w <= 0:
+        return frame
+
+    alpha = float(os.environ.get("SAM3_INVALID_FRAME_OVERLAY_ALPHA", "0.28"))
+    alpha = max(0.0, min(0.95, alpha))
+
+    red_overlay = np.zeros_like(frame)
+    red_overlay[:, :] = (0, 0, 255)  # BGR
+    frame = cv2.addWeighted(frame, 1.0 - alpha, red_overlay, alpha, 0.0)
+
+    label = "INVALID FRAME"
+    if frame_index is not None:
+        label = f"INVALID FRAME #{int(frame_index)}"
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.62
+    thickness = 2
+    (text_w, text_h), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+    pad_x = 10
+    pad_y = 8
+    x1 = 10
+    y1 = 10
+    x2 = min(w - 1, x1 + text_w + (2 * pad_x))
+    y2 = min(h - 1, y1 + text_h + baseline + (2 * pad_y))
+
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 170), -1)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+    cv2.putText(
+        frame,
+        label,
+        (x1 + pad_x, y2 - pad_y - baseline),
+        font,
+        font_scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
 def _to_serializable_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -699,6 +746,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no_mark_invalid_frames_in_video",
+        action="store_true",
+        help=(
+            "Disable red invalid-frame overlays in exported video. "
+            "By default, invalid frames are marked unless dropped."
+        ),
+    )
+    parser.add_argument(
         "--invalid_frame_source",
         default="hybrid",
         choices=["heuristic", "mllm", "hybrid"],
@@ -890,6 +945,108 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Retries per discovery window when model output is not valid strict JSON.",
     )
+    parser.add_argument(
+        "--postprop_qa_mllm",
+        action="store_true",
+        help=(
+            "Run an MLLM post-propagation QA pass over frame context + mask crops. "
+            "Flags bad frames/masks and optional missed creatures."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_qa_window_size",
+        default=10,
+        type=int,
+        help="Temporal context window size (frames) for post-propagation QA.",
+    )
+    parser.add_argument(
+        "--postprop_qa_window_stride",
+        default=1,
+        type=int,
+        help="Frame stride for post-propagation QA assessment.",
+    )
+    parser.add_argument(
+        "--postprop_qa_max_completion_tokens",
+        default=512,
+        type=int,
+        help="Completion token budget for post-propagation QA MLLM calls.",
+    )
+    parser.add_argument(
+        "--postprop_qa_max_object_crops",
+        default=8,
+        type=int,
+        help="Maximum number of per-object zoomed crops included in each QA collage.",
+    )
+    parser.add_argument(
+        "--postprop_qa_crop_context_ratio",
+        default=0.25,
+        type=float,
+        help="Relative context padding around each object crop in post-prop QA.",
+    )
+    parser.add_argument(
+        "--postprop_qa_collage_cols",
+        default=4,
+        type=int,
+        help="Number of columns in post-propagation QA collages.",
+    )
+    parser.add_argument(
+        "--postprop_qa_collage_tile_max_edge",
+        default=320,
+        type=int,
+        help="Max edge (px) per tile in post-propagation QA collages.",
+    )
+    parser.add_argument(
+        "--postprop_qa_max_json_retries",
+        default=2,
+        type=int,
+        help="Retries per post-prop QA frame when model output is not valid strict JSON.",
+    )
+    parser.add_argument(
+        "--postprop_qa_overlap_iou_threshold",
+        default=0.70,
+        type=float,
+        help=(
+            "Heuristic IoU threshold used to auto-flag overlapping masks in post-prop QA."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_qa_prompt_path",
+        default="",
+        type=str,
+        help=(
+            "Optional path to post-propagation QA system prompt template. "
+            "If unset, uses profile-specific default."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_qa_include_frames_without_outputs",
+        dest="postprop_qa_include_frames_without_outputs",
+        action="store_true",
+        help="Run post-propagation QA also on frames with no tracked outputs.",
+    )
+    parser.add_argument(
+        "--no_postprop_qa_include_frames_without_outputs",
+        dest="postprop_qa_include_frames_without_outputs",
+        action="store_false",
+        help="Skip post-propagation QA for frames without tracked outputs.",
+    )
+    parser.set_defaults(postprop_qa_include_frames_without_outputs=True)
+    parser.add_argument(
+        "--postprop_qa_merge_bad_into_invalid",
+        dest="postprop_qa_merge_bad_into_invalid",
+        action="store_true",
+        help=(
+            "Merge post-propagation QA bad frames into invalid-frame set used for "
+            "final rendering/drop decisions."
+        ),
+    )
+    parser.add_argument(
+        "--no_postprop_qa_merge_bad_into_invalid",
+        dest="postprop_qa_merge_bad_into_invalid",
+        action="store_false",
+        help="Do not merge post-propagation QA bad frames into final invalid-frame set.",
+    )
+    parser.set_defaults(postprop_qa_merge_bad_into_invalid=True)
     return parser.parse_args()
 
 
@@ -922,6 +1079,7 @@ def run() -> int:
         from frame_quality_mllm import discover_invalid_frames_with_mllm
         from keyframe_discovery import discover_keyframes_from_motion
         from keyframe_discovery_mllm import discover_keyframes_with_mllm
+        from postprop_qa_mllm import discover_postprop_qa_with_mllm
         from track_id_matching import assign_object_ids_by_iou
 
         from sam3.agent.agent_core import agent_inference
@@ -1040,6 +1198,13 @@ def run() -> int:
             model=args.model,
             api_key=api_key,
             max_tokens=args.mllm_invalid_max_completion_tokens,
+        )
+        send_req_postprop_qa = partial(
+            send_generate_request_orig,
+            server_url=args.server_url,
+            model=args.model,
+            api_key=api_key,
+            max_tokens=args.postprop_qa_max_completion_tokens,
         )
         # Keep frame_0 extraction for compatibility and debugging.
         frame_0_path = os.path.join(args.output_dir, "frame_0.jpg")
@@ -1273,6 +1438,23 @@ def run() -> int:
                 args.mllm_invalid_fill_missing_with_heuristic
             ),
         }
+        metrics["postprop_qa_config"] = {
+            "enabled": bool(args.postprop_qa_mllm),
+            "window_size": int(args.postprop_qa_window_size),
+            "window_stride": int(args.postprop_qa_window_stride),
+            "max_completion_tokens": int(args.postprop_qa_max_completion_tokens),
+            "max_object_crops": int(args.postprop_qa_max_object_crops),
+            "crop_context_ratio": float(args.postprop_qa_crop_context_ratio),
+            "collage_cols": int(args.postprop_qa_collage_cols),
+            "collage_tile_max_edge": int(args.postprop_qa_collage_tile_max_edge),
+            "max_json_retries": int(args.postprop_qa_max_json_retries),
+            "overlap_iou_threshold": float(args.postprop_qa_overlap_iou_threshold),
+            "prompt_path": args.postprop_qa_prompt_path,
+            "include_frames_without_outputs": bool(
+                args.postprop_qa_include_frames_without_outputs
+            ),
+            "merge_bad_into_invalid": bool(args.postprop_qa_merge_bad_into_invalid),
+        }
         metrics["total_video_frames"] = total_frames
 
         generated_prompts: list[dict[str, Any]] = []
@@ -1493,11 +1675,74 @@ def run() -> int:
         else:
             if len(results_by_frame) == 0:
                 metrics["status"] = "success_no_propagation"
+                if args.postprop_qa_mllm:
+                    metrics["postprop_qa_skipped_reason"] = "no_propagation_outputs"
                 metrics["invalid_frame_indices"] = invalid_frame_indices
                 metrics["output_video_path"] = ""
                 metrics["output_dir"] = os.path.abspath(args.output_dir)
                 return_code = 0
                 return return_code
+
+            if args.postprop_qa_mllm:
+                postprop_report = discover_postprop_qa_with_mllm(
+                    video_path=args.video_path,
+                    send_generate_request_fn=send_req_postprop_qa,
+                    initial_text_prompt=args.prompt,
+                    results_by_frame=results_by_frame,
+                    total_frames=total_frames,
+                    output_dir=os.path.join(args.output_dir, "postprop_qa"),
+                    window_size=args.postprop_qa_window_size,
+                    window_stride=args.postprop_qa_window_stride,
+                    max_object_crops=args.postprop_qa_max_object_crops,
+                    crop_context_ratio=args.postprop_qa_crop_context_ratio,
+                    collage_cols=args.postprop_qa_collage_cols,
+                    collage_tile_max_edge=args.postprop_qa_collage_tile_max_edge,
+                    prompt_profile=args.prompt_profile,
+                    prompt_template_path=(
+                        args.postprop_qa_prompt_path.strip() or None
+                    ),
+                    max_json_retries=args.postprop_qa_max_json_retries,
+                    overlap_iou_threshold=args.postprop_qa_overlap_iou_threshold,
+                    include_frames_without_outputs=(
+                        args.postprop_qa_include_frames_without_outputs
+                    ),
+                )
+                postprop_report_path = os.path.join(
+                    args.output_dir, "postprop_qa_report.json"
+                )
+                write_json(postprop_report_path, postprop_report)
+                postprop_bad = sorted(
+                    set(int(x) for x in postprop_report.get("bad_frame_indices", []))
+                )
+                metrics["postprop_qa_report_path"] = postprop_report_path
+                metrics["postprop_qa_bad_frame_count"] = len(postprop_bad)
+                metrics["postprop_qa_bad_frame_ratio"] = float(
+                    postprop_report.get("bad_frame_ratio", 0.0)
+                )
+                if postprop_bad:
+                    metrics["postprop_qa_bad_frame_sample"] = postprop_bad[:20]
+
+                if args.postprop_qa_merge_bad_into_invalid and postprop_bad:
+                    invalid_frame_indices = sorted(set(invalid_frame_indices) | set(postprop_bad))
+                    invalid_ratio = (
+                        len(invalid_frame_indices) / float(total_frames)
+                        if total_frames > 0
+                        else 0.0
+                    )
+                    metrics["invalid_frame_count"] = len(invalid_frame_indices)
+                    metrics["invalid_frame_ratio"] = float(invalid_ratio)
+                    metrics["invalid_frame_sample"] = invalid_frame_indices[:20]
+                    metrics["invalid_frame_source_effective"] = (
+                        f"{args.invalid_frame_source}+postprop_qa"
+                    )
+                    write_json(
+                        prompts_path,
+                        {
+                            "prompts": generated_prompts,
+                            "keyframe_indices": keyframe_indices,
+                            "invalid_frame_indices": invalid_frame_indices,
+                        },
+                    )
 
             out_path = os.path.join(args.output_dir, "output_video.mp4")
             should_save_frame_outputs = args.save_frame_outputs_json or os.environ.get(
@@ -1529,17 +1774,25 @@ def run() -> int:
 
             frame_index = 0
             dropped_frame_count = 0
+            marked_invalid_frame_count = 0
+            mark_invalid_frames = not bool(args.no_mark_invalid_frames_in_video)
             while True:
                 ret, video_frame = cap.read()
                 if not ret:
                     break
-                if args.drop_invalid_frames and frame_index in invalid_frame_indices:
+                is_invalid_frame = frame_index in invalid_frame_indices
+                if args.drop_invalid_frames and is_invalid_frame:
                     dropped_frame_count += 1
                     frame_index += 1
                     continue
                 output = results_by_frame.get(frame_index)
                 if output:
                     video_frame = overlay_masks_on_frame(video_frame, output)
+                if (not args.drop_invalid_frames) and mark_invalid_frames and is_invalid_frame:
+                    video_frame = overlay_invalid_frame_marker(
+                        video_frame, frame_index=frame_index
+                    )
+                    marked_invalid_frame_count += 1
                 writer.write(video_frame)
                 frame_index += 1
 
@@ -1552,6 +1805,8 @@ def run() -> int:
             metrics["frames_with_outputs"] = len(results_by_frame)
             metrics["invalid_frame_indices"] = invalid_frame_indices
             metrics["dropped_frame_count"] = dropped_frame_count
+            metrics["mark_invalid_frames_in_video"] = bool(mark_invalid_frames)
+            metrics["marked_invalid_frame_count"] = int(marked_invalid_frame_count)
             if total_frames > 0:
                 metrics["frame_output_fraction"] = len(results_by_frame) / total_frames
 

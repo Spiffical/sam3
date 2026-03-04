@@ -63,7 +63,18 @@ Single-seed-frame propagation misses creatures that enter later in a clip and ca
 2. No dedicated local re-check loop yet for borderline events.
 3. Temporal object lifecycle metadata export is still minimal.
 
-## Phase 3 (Next)
+## Phase 3 (Implemented Baseline)
+1. Post-propagation MLLM QA pass:
+   - Reviews each assessed frame with temporal context + segmentation overlays.
+   - Includes per-object zoomed crops with local context for label-quality checks.
+2. Structured QA outputs:
+   - `postprop_qa_report.json` with per-frame assessments.
+   - Frame-level flags for invalid masks, overlap/merge errors, and likely missing creatures.
+3. Export integration:
+   - Optional merge of post-QA bad frames into the invalid-frame set used for final rendering/drop.
+   - Bad frames can be dropped or marked in output video using existing invalid-frame controls.
+
+## Phase 4 (Next)
 1. Local re-check refinement for each MLLM event candidate (`±N` frame micro-window).
 2. Event-aware bounded propagation windows (instead of always both directions full span).
 3. Rich track table export (`first_seen`, `best_seen`, `last_seen`, confidence history).
