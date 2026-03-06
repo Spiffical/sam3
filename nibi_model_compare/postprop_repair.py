@@ -51,22 +51,45 @@ def _mask_bbox_xyxy(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
+def _sanitize_xyxy(
+    box_xyxy: tuple[int, int, int, int] | list[int],
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int, int, int]:
+    if frame_w <= 0 or frame_h <= 0:
+        return (0, 0, 0, 0)
+    x1, y1, x2, y2 = [int(v) for v in box_xyxy]
+    if x1 > x2:
+        x1, x2 = x2, x1
+    if y1 > y2:
+        y1, y2 = y2, y1
+    x1 = max(0, min(frame_w - 1, x1))
+    y1 = max(0, min(frame_h - 1, y1))
+    x2 = max(0, min(frame_w - 1, x2))
+    y2 = max(0, min(frame_h - 1, y2))
+    return (x1, y1, max(x1, x2), max(y1, y2))
+
+
 def _expand_xyxy(
     box_xyxy: tuple[int, int, int, int],
     frame_w: int,
     frame_h: int,
     context_ratio: float = 0.30,
 ) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = box_xyxy
+    x1, y1, x2, y2 = _sanitize_xyxy(box_xyxy, frame_w, frame_h)
     bw = max(1, x2 - x1 + 1)
     bh = max(1, y2 - y1 + 1)
     pad_x = int(round(bw * float(context_ratio)))
     pad_y = int(round(bh * float(context_ratio)))
-    return (
+    return _sanitize_xyxy(
+        (
         max(0, x1 - pad_x),
         max(0, y1 - pad_y),
         min(frame_w - 1, x2 + pad_x),
         min(frame_h - 1, y2 + pad_y),
+        ),
+        frame_w,
+        frame_h,
     )
 
 
@@ -77,12 +100,7 @@ def _union_xyxy(
     y1 = min(b[1] for b in boxes_xyxy)
     x2 = max(b[2] for b in boxes_xyxy)
     y2 = max(b[3] for b in boxes_xyxy)
-    return (
-        max(0, x1),
-        max(0, y1),
-        min(frame_w - 1, x2),
-        min(frame_h - 1, y2),
-    )
+    return _sanitize_xyxy((x1, y1, x2, y2), frame_w, frame_h)
 
 
 def _frame_mask_by_obj_id(
@@ -472,11 +490,18 @@ def generate_mask_candidates_for_issue(
     )
     x1, y1, x2, y2 = crop_xyxy
     crop_bgr = frame_bgr[y1 : y2 + 1, x1 : x2 + 1].copy()
+    if crop_bgr.size == 0:
+        crop_xyxy = (0, 0, frame_w - 1, frame_h - 1)
+        x1, y1, x2, y2 = crop_xyxy
+        crop_bgr = frame_bgr.copy()
 
     issue_dir = os.path.join(output_dir, issue["issue_id"])
     os.makedirs(issue_dir, exist_ok=True)
     crop_path = os.path.join(issue_dir, "crop.jpg")
-    cv2.imwrite(crop_path, crop_bgr)
+    if crop_bgr.size == 0 or not cv2.imwrite(crop_path, crop_bgr):
+        raise RuntimeError(
+            f"Could not write non-empty repair crop for issue {issue['issue_id']}."
+        )
 
     target_candidates: list[dict[str, Any]] = []
     prompt_rows: list[dict[str, Any]] = []
@@ -1015,18 +1040,31 @@ def repair_postprop_failures(
             attempt_ok = True
 
             for issue in frame_issues:
-                candidate_bundle = generate_mask_candidates_for_issue(
-                    video_path=video_path,
-                    frame_index=frame_index,
-                    issue=issue,
-                    results_by_frame=results_by_frame,
-                    image_processor=image_processor,
-                    initial_text_prompt=initial_text_prompt,
-                    prompt_profile=prompt_profile,
-                    max_candidates=max_candidates_per_issue,
-                    output_dir=os.path.join(output_dir, "candidates"),
-                    search_radius=max(2, int(repair_window)),
-                )
+                try:
+                    candidate_bundle = generate_mask_candidates_for_issue(
+                        video_path=video_path,
+                        frame_index=frame_index,
+                        issue=issue,
+                        results_by_frame=results_by_frame,
+                        image_processor=image_processor,
+                        initial_text_prompt=initial_text_prompt,
+                        prompt_profile=prompt_profile,
+                        max_candidates=max_candidates_per_issue,
+                        output_dir=os.path.join(output_dir, "candidates"),
+                        search_radius=max(2, int(repair_window)),
+                    )
+                except Exception as exc:
+                    candidate_sets_log.append(
+                        {
+                            "issue_id": issue["issue_id"],
+                            "frame_index": int(frame_index),
+                            "attempt_index": int(attempt_index),
+                            "error": str(exc).strip() or repr(exc),
+                            "stage": "candidate_generation",
+                        }
+                    )
+                    attempt_ok = False
+                    break
                 candidate_sets_log.append(
                     {
                         "issue_id": issue["issue_id"],
@@ -1038,20 +1076,34 @@ def repair_postprop_failures(
 
                 target_obj_ids = issue.get("target_obj_ids", []) or ["new_object"]
                 for target_obj_id in target_obj_ids:
-                    choice = choose_candidate_with_mllm(
-                        issue=issue,
-                        target_obj_id=target_obj_id,
-                        candidate_bundle=candidate_bundle,
-                        results_by_frame=results_by_frame,
-                        video_path=video_path,
-                        send_generate_request_fn=send_generate_request_fn,
-                        initial_text_prompt=initial_text_prompt,
-                        prompt_profile=prompt_profile,
-                        prompt_template_path=chooser_prompt_template_path,
-                        output_dir=os.path.join(output_dir, "choices"),
-                        search_radius=max(2, int(repair_window)),
-                        max_json_retries=2,
-                    )
+                    try:
+                        choice = choose_candidate_with_mllm(
+                            issue=issue,
+                            target_obj_id=target_obj_id,
+                            candidate_bundle=candidate_bundle,
+                            results_by_frame=results_by_frame,
+                            video_path=video_path,
+                            send_generate_request_fn=send_generate_request_fn,
+                            initial_text_prompt=initial_text_prompt,
+                            prompt_profile=prompt_profile,
+                            prompt_template_path=chooser_prompt_template_path,
+                            output_dir=os.path.join(output_dir, "choices"),
+                            search_radius=max(2, int(repair_window)),
+                            max_json_retries=2,
+                        )
+                    except Exception as exc:
+                        choices_log.append(
+                            {
+                                "issue_id": issue["issue_id"],
+                                "frame_index": int(frame_index),
+                                "attempt_index": int(attempt_index),
+                                "target_obj_id": target_obj_id,
+                                "error": str(exc).strip() or repr(exc),
+                                "stage": "chooser",
+                            }
+                        )
+                        attempt_ok = False
+                        break
                     choices_log.append(dict(choice, attempt_index=int(attempt_index)))
 
                     if choice["decision"] == "unrepairable":
@@ -1092,31 +1144,56 @@ def repair_postprop_failures(
                     break
 
             if attempt_ok and selected_masks_by_obj_id:
-                action = apply_repair_action(
-                    backend=backend,
-                    video_path=video_path,
-                    results_by_frame=results_by_frame,
-                    frame_index=frame_index,
-                    frame_size_wh=(frame_size_hw[1], frame_size_hw[0]),
-                    image_size=image_size,
-                    selected_masks_by_obj_id=selected_masks_by_obj_id,
-                    repair_window=repair_window,
-                )
+                try:
+                    action = apply_repair_action(
+                        backend=backend,
+                        video_path=video_path,
+                        results_by_frame=results_by_frame,
+                        frame_index=frame_index,
+                        frame_size_wh=(frame_size_hw[1], frame_size_hw[0]),
+                        image_size=image_size,
+                        selected_masks_by_obj_id=selected_masks_by_obj_id,
+                        repair_window=repair_window,
+                    )
+                except Exception as exc:
+                    actions_log.append(
+                        {
+                            "frame_index": int(frame_index),
+                            "attempt_index": int(attempt_index),
+                            "replace_obj_ids": sorted(
+                                int(x) for x in selected_masks_by_obj_id.keys()
+                            ),
+                            "error": str(exc).strip() or repr(exc),
+                            "stage": "apply_repair_action",
+                        }
+                    )
+                    continue
                 action["attempt_index"] = int(attempt_index)
                 actions_log.append(action)
                 frame_attempt_logs.append(action)
 
                 if verify_with_qa:
-                    verification = _verify_frame_cluster(
-                        frame_index=frame_index,
-                        results_by_frame=results_by_frame,
-                        video_path=video_path,
-                        send_generate_request_fn=send_generate_request_fn,
-                        initial_text_prompt=initial_text_prompt,
-                        prompt_profile=prompt_profile,
-                        output_dir=os.path.join(output_dir, "verify"),
-                        overlap_iou_threshold=overlap_iou_threshold,
-                    )
+                    try:
+                        verification = _verify_frame_cluster(
+                            frame_index=frame_index,
+                            results_by_frame=results_by_frame,
+                            video_path=video_path,
+                            send_generate_request_fn=send_generate_request_fn,
+                            initial_text_prompt=initial_text_prompt,
+                            prompt_profile=prompt_profile,
+                            output_dir=os.path.join(output_dir, "verify"),
+                            overlap_iou_threshold=overlap_iou_threshold,
+                        )
+                    except Exception as exc:
+                        verification_log.append(
+                            {
+                                "frame_index": int(frame_index),
+                                "attempt_index": int(attempt_index),
+                                "error": str(exc).strip() or repr(exc),
+                                "stage": "verify",
+                            }
+                        )
+                        continue
                     verification["attempt_index"] = int(attempt_index)
                     verification_log.append(verification)
                     if not verification["bad_frame_indices"]:
