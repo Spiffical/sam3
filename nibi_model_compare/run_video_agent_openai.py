@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import traceback
+from collections import Counter
 from importlib import resources as importlib_resources
 from functools import partial
 from typing import Any
@@ -558,6 +559,182 @@ def write_frame_keep_drop_json(
             "frames": frames_payload,
         },
     )
+
+
+def _read_json_if_exists(path: str | None) -> Any:
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def _counter_dict(counter: Counter[Any], limit: int = 20) -> dict[str, int]:
+    return {str(key): int(value) for key, value in counter.most_common(limit)}
+
+
+def _summarize_postprop_repair_report(report: dict[str, Any]) -> dict[str, Any]:
+    issues = [row for row in report.get("issues", []) if isinstance(row, dict)]
+    choices = [row for row in report.get("choices", []) if isinstance(row, dict)]
+    actions = [row for row in report.get("actions", []) if isinstance(row, dict)]
+    verification = [row for row in report.get("verification", []) if isinstance(row, dict)]
+
+    issue_type_counts = Counter(row.get("issue_type", "unknown") for row in issues)
+    choice_decision_counts = Counter(row.get("decision", "unknown") for row in choices)
+    choice_selected_counts = Counter(
+        row.get("selected_candidate_id", "unknown") for row in choices
+    )
+
+    choice_rows_by_attempt: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for row in choices:
+        key = (int(row.get("frame_index", -1)), int(row.get("attempt_index", -1)))
+        choice_rows_by_attempt.setdefault(key, []).append(row)
+
+    current_only_action_count = 0
+    noncurrent_action_count = 0
+    skipped_current_only_actions: list[dict[str, Any]] = []
+    for row in actions:
+        if row.get("skip_reason") == "all_selected_current":
+            current_only_action_count += 1
+            if len(skipped_current_only_actions) < 12:
+                skipped_current_only_actions.append(row)
+            continue
+        key = (int(row.get("frame_index", -1)), int(row.get("attempt_index", -1)))
+        attempt_choices = choice_rows_by_attempt.get(key, [])
+        if attempt_choices and all(
+            choice.get("selected_candidate_id") == "current"
+            for choice in attempt_choices
+        ):
+            current_only_action_count += 1
+        else:
+            noncurrent_action_count += 1
+
+    verification_outcomes = Counter()
+    neighbor_only_failures: list[dict[str, Any]] = []
+    center_failures: list[dict[str, Any]] = []
+    for row in verification:
+        if "error" in row:
+            verification_outcomes["error"] += 1
+            continue
+        if row.get("verification_passed"):
+            verification_outcomes["passed"] += 1
+            continue
+        if row.get("center_frame_bad"):
+            verification_outcomes["center_frame_bad"] += 1
+            if len(center_failures) < 12:
+                center_failures.append(
+                    {
+                        "frame_index": row.get("frame_index"),
+                        "attempt_index": row.get("attempt_index"),
+                        "bad_frame_indices": row.get("bad_frame_indices", []),
+                    }
+                )
+        else:
+            verification_outcomes["neighbor_only_bad"] += 1
+            if len(neighbor_only_failures) < 12:
+                neighbor_only_failures.append(
+                    {
+                        "frame_index": row.get("frame_index"),
+                        "attempt_index": row.get("attempt_index"),
+                        "neighbor_bad_frame_indices": row.get(
+                            "neighbor_bad_frame_indices", []
+                        ),
+                    }
+                )
+
+    stage_error_samples: list[dict[str, Any]] = []
+    for collection in (report.get("candidate_sets", []), report.get("choices", []), report.get("actions", []), report.get("verification", [])):
+        for row in collection:
+            if isinstance(row, dict) and "error" in row:
+                stage_error_samples.append(row)
+            if len(stage_error_samples) >= 12:
+                break
+        if len(stage_error_samples) >= 12:
+            break
+
+    return {
+        "issue_type_counts": _counter_dict(issue_type_counts),
+        "choice_decision_counts": _counter_dict(choice_decision_counts),
+        "choice_selected_candidate_counts": _counter_dict(choice_selected_counts),
+        "current_only_action_count": int(current_only_action_count),
+        "noncurrent_action_count": int(noncurrent_action_count),
+        "verification_outcomes": _counter_dict(verification_outcomes),
+        "skipped_current_only_action_samples": skipped_current_only_actions,
+        "neighbor_only_verification_failure_samples": neighbor_only_failures,
+        "center_frame_verification_failure_samples": center_failures,
+        "error_samples": stage_error_samples,
+    }
+
+
+def write_codex_debug_report(output_dir: str, metrics: dict[str, Any]) -> str:
+    postprop_qa_report = _read_json_if_exists(metrics.get("postprop_qa_report_path"))
+    postprop_repair_report = _read_json_if_exists(
+        metrics.get("postprop_repair_report_path")
+    )
+
+    payload = {
+        "schema_version": 1,
+        "run_status": metrics.get("status"),
+        "runtime_sec": metrics.get("runtime_sec"),
+        "video_path": metrics.get("video_path"),
+        "model": metrics.get("model"),
+        "prompt": metrics.get("prompt"),
+        "prompt_profile": metrics.get("prompt_profile"),
+        "artifacts": {
+            "run_metrics_path": os.path.join(output_dir, "run_metrics.json"),
+            "output_video_path": metrics.get("output_video_path", ""),
+            "frame_outputs_json_path": metrics.get("frame_outputs_json_path", ""),
+            "generated_prompts_path": metrics.get("generated_prompts_path", ""),
+            "postprop_qa_report_path": metrics.get("postprop_qa_report_path", ""),
+            "postprop_repair_report_path": metrics.get(
+                "postprop_repair_report_path", ""
+            ),
+            "frame_keep_drop_path": metrics.get("frame_keep_drop_path", ""),
+        },
+        "metrics_excerpt": {
+            "hard_invalid_frame_count": metrics.get("hard_invalid_frame_count"),
+            "invalid_frame_count": metrics.get("invalid_frame_count"),
+            "postprop_qa_bad_frame_count": metrics.get("postprop_qa_bad_frame_count"),
+            "postprop_repair_issue_count": metrics.get("postprop_repair_issue_count"),
+            "postprop_repair_repaired_frame_count": metrics.get(
+                "postprop_repair_repaired_frame_count"
+            ),
+            "postprop_repair_unresolved_frame_count": metrics.get(
+                "postprop_repair_unresolved_frame_count"
+            ),
+            "invalid_frame_source_effective": metrics.get(
+                "invalid_frame_source_effective", ""
+            ),
+            "invalid_frame_sample": metrics.get("invalid_frame_sample", []),
+            "postprop_repair_unresolved_frame_sample": metrics.get(
+                "postprop_repair_unresolved_frame_sample", []
+            ),
+        },
+        "postprop_qa_summary": (
+            {
+                "bad_frame_count": len(
+                    postprop_qa_report.get("bad_frame_indices", [])
+                ),
+                "bad_frame_ratio": postprop_qa_report.get("bad_frame_ratio"),
+                "assessment_count": len(
+                    postprop_qa_report.get("per_frame_assessments", [])
+                ),
+            }
+            if isinstance(postprop_qa_report, dict)
+            else None
+        ),
+        "postprop_repair_summary": (
+            _summarize_postprop_repair_report(postprop_repair_report)
+            if isinstance(postprop_repair_report, dict)
+            else None
+        ),
+    }
+
+    debug_path = os.path.join(output_dir, "codex_debug_report.json")
+    write_json(debug_path, payload)
+    return debug_path
 
 
 def write_run_documentation(output_dir: str, metrics: dict[str, Any]) -> None:
@@ -1954,6 +2131,12 @@ def run() -> int:
             cap.release()
         metrics["runtime_sec"] = round(time.time() - start_ts, 3)
         metrics["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            metrics["codex_debug_report_path"] = write_codex_debug_report(
+                args.output_dir, metrics
+            )
+        except Exception as exc:
+            metrics["codex_debug_report_error"] = str(exc).strip() or repr(exc)
         write_json(os.path.join(args.output_dir, "run_metrics.json"), metrics)
         write_run_documentation(args.output_dir, metrics)
         print(json.dumps(metrics, indent=2))

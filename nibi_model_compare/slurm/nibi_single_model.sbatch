@@ -466,6 +466,7 @@ for key in (
     "postprop_qa_report_path",
     "postprop_repair_report_path",
     "frame_keep_drop_path",
+    "codex_debug_report_path",
 ):
     value = metrics.get(key)
     if isinstance(value, str) and value:
@@ -492,6 +493,27 @@ for row_key in ("agent_runs", "failed_agent_keyframes"):
 if changed:
     with open(run_metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
+        f.write("\\n")
+
+debug_report_path = os.path.join(final_out, "codex_debug_report.json")
+if os.path.exists(debug_report_path):
+    def _replace_stage_paths(value):
+        if isinstance(value, str):
+            abs_value = os.path.abspath(value)
+            if abs_value.startswith(stage_out):
+                return final_out + abs_value[len(stage_out):]
+            return value
+        if isinstance(value, list):
+            return [_replace_stage_paths(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _replace_stage_paths(v) for k, v in value.items()}
+        return value
+
+    with open(debug_report_path, "r", encoding="utf-8") as f:
+        debug_payload = json.load(f)
+    debug_payload = _replace_stage_paths(debug_payload)
+    with open(debug_report_path, "w", encoding="utf-8") as f:
+        json.dump(debug_payload, f, indent=2)
         f.write("\\n")
 PY
 fi

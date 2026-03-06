@@ -12,6 +12,7 @@ import numpy as np
 from frame_output_utils import (
     decode_rle_to_mask,
     encode_binary_mask_to_rle,
+    frame_object_metadata,
     iter_output_masks_with_ids,
     merge_frame_outputs_by_obj_ids,
     read_video_frame,
@@ -278,6 +279,25 @@ def _score_candidate(
         "area_score": float(area_score),
         "total_score": float(total_score),
     }
+
+
+def _current_mask_score_prior(
+    results_by_frame: dict[int, dict[str, Any]],
+    frame_index: int,
+    obj_id: int,
+    frame_h: int,
+    frame_w: int,
+) -> float:
+    outputs = results_by_frame.get(int(frame_index), {})
+    metadata = frame_object_metadata(outputs, frame_h, frame_w)
+    row = metadata.get(int(obj_id), {})
+    tracker_confidence = row.get("tracker_confidence")
+    if tracker_confidence is not None:
+        return float(max(0.0, min(1.0, tracker_confidence)))
+    confidence = row.get("confidence")
+    if confidence is not None:
+        return float(max(0.0, min(1.0, confidence)))
+    return 0.35
 
 
 def _issue_crop_box(
@@ -569,7 +589,13 @@ def generate_mask_candidates_for_issue(
         if current_mask is not None and current_mask.any():
             current_scores = _score_candidate(
                 current_mask,
-                sam_score=1.0,
+                sam_score=_current_mask_score_prior(
+                    results_by_frame,
+                    frame_index,
+                    int(target_obj_id),
+                    frame_h,
+                    frame_w,
+                ),
                 temporal_masks=temporal_masks,
                 other_masks=list(other_masks_by_obj_id.values()),
                 reference_area=reference_area,
@@ -942,6 +968,7 @@ def _verify_frame_cluster(
     assessments: list[dict[str, Any]] = []
     requests: list[dict[str, Any]] = []
     bad_frame_indices: list[int] = []
+    center_assessment: dict[str, Any] | None = None
 
     verify_indices = [idx for idx in [frame_index - 1, frame_index, frame_index + 1] if idx >= 0]
     for verify_index in verify_indices:
@@ -975,13 +1002,23 @@ def _verify_frame_cluster(
         )
         assessments.append(assessment)
         requests.append(request_entry)
+        if int(verify_index) == int(frame_index):
+            center_assessment = assessment
         if assessment.get("is_bad_frame"):
             bad_frame_indices.append(int(verify_index))
+
+    center_frame_bad = bool(center_assessment and center_assessment.get("is_bad_frame"))
+    neighbor_bad_frame_indices = sorted(
+        idx for idx in set(bad_frame_indices) if int(idx) != int(frame_index)
+    )
 
     return {
         "frame_index": int(frame_index),
         "verify_indices": verify_indices,
         "bad_frame_indices": sorted(set(bad_frame_indices)),
+        "center_frame_bad": bool(center_frame_bad),
+        "neighbor_bad_frame_indices": neighbor_bad_frame_indices,
+        "verification_passed": not bool(center_frame_bad),
         "assessments": assessments,
         "requests": requests,
     }
@@ -1038,6 +1075,7 @@ def repair_postprop_failures(
             selected_masks_by_obj_id: dict[int, np.ndarray] = {}
             tentative_new_obj_id = next_obj_id_local
             attempt_ok = True
+            attempt_has_noncurrent_selection = False
 
             for issue in frame_issues:
                 try:
@@ -1124,6 +1162,7 @@ def repair_postprop_failures(
                         if selected_candidate_id == "current":
                             attempt_ok = False
                             break
+                        attempt_has_noncurrent_selection = True
                         selected_masks_by_obj_id[tentative_new_obj_id] = selected_row["mask_full"]
                         tentative_new_obj_id += 1
                     else:
@@ -1138,12 +1177,26 @@ def repair_postprop_failures(
                             if current_mask is not None:
                                 selected_masks_by_obj_id[int(target_obj_id)] = current_mask
                         else:
+                            attempt_has_noncurrent_selection = True
                             selected_masks_by_obj_id[int(target_obj_id)] = selected_row["mask_full"]
 
                 if not attempt_ok:
                     break
 
             if attempt_ok and selected_masks_by_obj_id:
+                if not attempt_has_noncurrent_selection:
+                    actions_log.append(
+                        {
+                            "frame_index": int(frame_index),
+                            "attempt_index": int(attempt_index),
+                            "replace_obj_ids": sorted(
+                                int(x) for x in selected_masks_by_obj_id.keys()
+                            ),
+                            "skipped": True,
+                            "skip_reason": "all_selected_current",
+                        }
+                    )
+                    break
                 try:
                     action = apply_repair_action(
                         backend=backend,
@@ -1196,7 +1249,7 @@ def repair_postprop_failures(
                         continue
                     verification["attempt_index"] = int(attempt_index)
                     verification_log.append(verification)
-                    if not verification["bad_frame_indices"]:
+                    if verification.get("verification_passed", False):
                         frame_repaired = True
                         repaired_frame_indices.update(action["updated_frame_indices"])
                         next_obj_id_local = tentative_new_obj_id
