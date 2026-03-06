@@ -1764,9 +1764,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             self.tracker.propagate_in_video_preflight(
                 tracker_state, run_mem_encoder=True
             )
-            self.clear_detector_added_cond_frame_in_tracker(
-                tracker_state, obj_id, frame_idx
-            )
+            # Keep mask-only conditioning frames for mask-prompt repair sessions.
+            # Clearing them makes the tracker think no conditioning input exists and
+            # breaks immediate local propagation from the repaired frame.
 
         if self.rank == obj_rank and len(obj_ids) > 0 and video_res_masks is not None:
             new_mask_data = (video_res_masks[obj_ids.index(obj_id)] > 0.0).to(
