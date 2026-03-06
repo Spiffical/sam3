@@ -254,6 +254,42 @@ class PredictorBackend:
         self.mark_frame_has_prompt(session_id, frame_idx)
         return _detach_outputs(response["outputs"])
 
+    def add_mask_prompt(
+        self,
+        session_id: str,
+        frame_idx: int,
+        obj_id: int,
+        mask: np.ndarray | torch.Tensor,
+    ) -> Dict:
+        self._guard()
+        if isinstance(mask, np.ndarray):
+            mask_tensor = torch.from_numpy(mask)
+        elif isinstance(mask, torch.Tensor):
+            mask_tensor = mask.detach().cpu()
+        else:
+            mask_tensor = torch.as_tensor(mask)
+
+        if mask_tensor.ndim != 2:
+            raise ValueError(
+                f"Mask prompt must be 2D (H, W); got shape {tuple(mask_tensor.shape)}"
+            )
+
+        mask_tensor = (mask_tensor > 0).to(dtype=torch.bool)
+        with self._lock:
+            with self._amp_context():
+                response = self.predictor.handle_request(
+                    request=dict(
+                        type="add_mask_prompt",
+                        session_id=session_id,
+                        frame_index=frame_idx,
+                        obj_id=obj_id,
+                        mask=mask_tensor,
+                    )
+                )
+        frame_idx = response.get("frame_index", frame_idx)
+        self.mark_frame_has_prompt(session_id, frame_idx)
+        return _detach_outputs(response["outputs"])
+
     def propagate(self, request: Dict):
         self._guard()
         with self._lock:

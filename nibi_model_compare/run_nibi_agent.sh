@@ -66,6 +66,12 @@ Runner options:
   --postprop-qa-crop-context-ratio <f> Default: 0.25
   --postprop-qa-max-json-retries <n>   Default: 2
   --no-postprop-qa-merge-bad-into-invalid  Keep post-QA bad frames separate
+  --postprop-repair                    Enable post-QA repair pass
+  --postprop-repair-window <n>         Default: 8
+  --postprop-repair-max-attempts <n>   Default: 2
+  --postprop-repair-max-candidates <n> Default: 5
+  --postprop-repair-prompt-path <path> Optional chooser system prompt template
+  --no-postprop-repair-verify          Skip QA re-verification after repair
   --save-prompts                       Save prompts only, skip propagation
   --debug                              Enable debug logs
 
@@ -198,6 +204,12 @@ postprop_qa_max_object_crops="8"
 postprop_qa_crop_context_ratio="0.25"
 postprop_qa_max_json_retries="2"
 postprop_qa_merge_bad_into_invalid=1
+postprop_repair=0
+postprop_repair_window="8"
+postprop_repair_max_attempts="2"
+postprop_repair_max_candidates="5"
+postprop_repair_prompt_path=""
+postprop_repair_verify=1
 save_prompts=0
 debug=0
 
@@ -264,6 +276,12 @@ while [[ $# -gt 0 ]]; do
     --postprop-qa-crop-context-ratio) postprop_qa_crop_context_ratio="$2"; shift 2 ;;
     --postprop-qa-max-json-retries) postprop_qa_max_json_retries="$2"; shift 2 ;;
     --no-postprop-qa-merge-bad-into-invalid) postprop_qa_merge_bad_into_invalid=0; shift ;;
+    --postprop-repair) postprop_repair=1; shift ;;
+    --postprop-repair-window) postprop_repair_window="$2"; shift 2 ;;
+    --postprop-repair-max-attempts) postprop_repair_max_attempts="$2"; shift 2 ;;
+    --postprop-repair-max-candidates) postprop_repair_max_candidates="$2"; shift 2 ;;
+    --postprop-repair-prompt-path) postprop_repair_prompt_path="$2"; shift 2 ;;
+    --no-postprop-repair-verify) postprop_repair_verify=0; shift ;;
     --save-prompts) save_prompts=1; shift ;;
     --debug) debug=1; shift ;;
 
@@ -534,6 +552,18 @@ run_interactive() {
       runner_cmd+=(--no_postprop_qa_merge_bad_into_invalid)
     fi
   fi
+  if [[ "$postprop_repair" == "1" ]]; then
+    runner_cmd+=(--postprop_repair)
+    runner_cmd+=(--postprop_repair_window "$postprop_repair_window")
+    runner_cmd+=(--postprop_repair_max_attempts "$postprop_repair_max_attempts")
+    runner_cmd+=(--postprop_repair_max_candidates "$postprop_repair_max_candidates")
+    if [[ -n "$postprop_repair_prompt_path" ]]; then
+      runner_cmd+=(--postprop_repair_prompt_path "$postprop_repair_prompt_path")
+    fi
+    if [[ "$postprop_repair_verify" == "0" ]]; then
+      runner_cmd+=(--no_postprop_repair_verify)
+    fi
+  fi
   if [[ "$save_prompts" == "1" ]]; then
     runner_cmd+=(--save_prompts)
   fi
@@ -558,6 +588,7 @@ run_interactive() {
   echo "temporal pipeline: $temporal_keyframe_pipeline"
   echo "invalid frame source: $invalid_frame_source"
   echo "post-prop QA: $postprop_qa_mllm"
+  echo "post-prop repair: $postprop_repair"
   if [[ -n "${SAM3_TOOL_CALL_FALLBACK_POLICY:-}" ]]; then
     echo "tool-call fallback: $SAM3_TOOL_CALL_FALLBACK_POLICY"
   fi
@@ -666,6 +697,12 @@ run_submit() {
     --set-env "POSTPROP_QA_CROP_CONTEXT_RATIO=${postprop_qa_crop_context_ratio}"
     --set-env "POSTPROP_QA_MAX_JSON_RETRIES=${postprop_qa_max_json_retries}"
     --set-env "POSTPROP_QA_MERGE_BAD_INTO_INVALID=${postprop_qa_merge_bad_into_invalid}"
+    --set-env "POSTPROP_REPAIR=${postprop_repair}"
+    --set-env "POSTPROP_REPAIR_WINDOW=${postprop_repair_window}"
+    --set-env "POSTPROP_REPAIR_MAX_ATTEMPTS=${postprop_repair_max_attempts}"
+    --set-env "POSTPROP_REPAIR_MAX_CANDIDATES=${postprop_repair_max_candidates}"
+    --set-env "POSTPROP_REPAIR_PROMPT_PATH=${postprop_repair_prompt_path}"
+    --set-env "POSTPROP_REPAIR_VERIFY=${postprop_repair_verify}"
   )
   if [[ -z "$sam3_tool_call_fallback_policy" ]]; then
     if [[ "${model_id,,}" == *"qwen3.5"* && "${prompt_profile,,}" == "underwater" ]]; then

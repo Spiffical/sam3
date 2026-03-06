@@ -368,6 +368,12 @@ POSTPROP_QA_MAX_OBJECT_CROPS="${POSTPROP_QA_MAX_OBJECT_CROPS:-8}"
 POSTPROP_QA_CROP_CONTEXT_RATIO="${POSTPROP_QA_CROP_CONTEXT_RATIO:-0.25}"
 POSTPROP_QA_MAX_JSON_RETRIES="${POSTPROP_QA_MAX_JSON_RETRIES:-2}"
 POSTPROP_QA_MERGE_BAD_INTO_INVALID="${POSTPROP_QA_MERGE_BAD_INTO_INVALID:-1}"
+POSTPROP_REPAIR="${POSTPROP_REPAIR:-0}"
+POSTPROP_REPAIR_WINDOW="${POSTPROP_REPAIR_WINDOW:-8}"
+POSTPROP_REPAIR_MAX_ATTEMPTS="${POSTPROP_REPAIR_MAX_ATTEMPTS:-2}"
+POSTPROP_REPAIR_MAX_CANDIDATES="${POSTPROP_REPAIR_MAX_CANDIDATES:-5}"
+POSTPROP_REPAIR_PROMPT_PATH="${POSTPROP_REPAIR_PROMPT_PATH:-}"
+POSTPROP_REPAIR_VERIFY="${POSTPROP_REPAIR_VERIFY:-1}"
 
 RUN_CMD=(
   python3 nibi_model_compare/run_video_agent_openai.py
@@ -411,6 +417,18 @@ if [[ "$POSTPROP_QA_MLLM" == "1" ]]; then
     RUN_CMD+=(--no_postprop_qa_merge_bad_into_invalid)
   fi
 fi
+if [[ "$POSTPROP_REPAIR" == "1" ]]; then
+  RUN_CMD+=(--postprop_repair)
+  RUN_CMD+=(--postprop_repair_window "$POSTPROP_REPAIR_WINDOW")
+  RUN_CMD+=(--postprop_repair_max_attempts "$POSTPROP_REPAIR_MAX_ATTEMPTS")
+  RUN_CMD+=(--postprop_repair_max_candidates "$POSTPROP_REPAIR_MAX_CANDIDATES")
+  if [[ -n "$POSTPROP_REPAIR_PROMPT_PATH" ]]; then
+    RUN_CMD+=(--postprop_repair_prompt_path "$POSTPROP_REPAIR_PROMPT_PATH")
+  fi
+  if [[ "$POSTPROP_REPAIR_VERIFY" != "1" ]]; then
+    RUN_CMD+=(--no_postprop_repair_verify)
+  fi
+fi
 if [[ "$SAVE_PROMPTS" == "1" ]]; then
   RUN_CMD+=(--save_prompts)
 fi
@@ -440,7 +458,15 @@ with open(run_metrics_path, "r", encoding="utf-8") as f:
     metrics = json.load(f)
 
 changed = False
-for key in ("output_video_path", "output_dir", "frame_outputs_json_path", "generated_prompts_path", "postprop_qa_report_path"):
+for key in (
+    "output_video_path",
+    "output_dir",
+    "frame_outputs_json_path",
+    "generated_prompts_path",
+    "postprop_qa_report_path",
+    "postprop_repair_report_path",
+    "frame_keep_drop_path",
+):
     value = metrics.get(key)
     if isinstance(value, str) and value:
         abs_value = os.path.abspath(value)

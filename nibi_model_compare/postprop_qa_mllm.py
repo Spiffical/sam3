@@ -10,6 +10,10 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from frame_output_utils import (
+    frame_object_metadata as shared_frame_object_metadata,
+    iter_output_masks_with_ids as shared_iter_output_masks_with_ids,
+)
 from frame_quality import analyze_frame_quality
 
 
@@ -199,67 +203,18 @@ def _to_list(value: Any) -> list[Any]:
 def _iter_output_masks_with_ids(
     outputs: dict[str, Any], frame_h: int, frame_w: int
 ) -> list[tuple[int, np.ndarray]]:
-    if not isinstance(outputs, dict):
-        return []
-
-    raw_masks = outputs.get("out_binary_masks")
-    raw_ids = _to_list(outputs.get("out_obj_ids"))
-    if raw_masks is None:
-        return []
-
-    raw_masks_list = _to_list(raw_masks)
-    out: list[tuple[int, np.ndarray]] = []
-    for i, raw_mask in enumerate(raw_masks_list):
-        arr = np.asarray(raw_mask)
-        while arr.ndim > 2:
-            arr = arr[0]
-        if arr.shape != (frame_h, frame_w):
-            arr = cv2.resize(
-                arr.astype(np.float32),
-                (frame_w, frame_h),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        mask = arr > 0.5
-        if i < len(raw_ids):
-            try:
-                obj_id = int(raw_ids[i])
-            except Exception:
-                obj_id = i + 1
-        else:
-            obj_id = i + 1
-        out.append((obj_id, mask))
-    return out
+    return shared_iter_output_masks_with_ids(outputs, frame_h, frame_w)
 
 
 def _object_metadata(outputs: dict[str, Any]) -> dict[int, dict[str, Any]]:
-    out_obj_ids = _to_list(outputs.get("out_obj_ids"))
-    out_probs = _to_list(outputs.get("out_probs"))
-    out_boxes_xywh = _to_list(outputs.get("out_boxes_xywh"))
-    meta: dict[int, dict[str, Any]] = {}
-    for i, raw_id in enumerate(out_obj_ids):
-        try:
-            obj_id = int(raw_id)
-        except Exception:
-            continue
-        confidence: float | None = None
-        if i < len(out_probs):
-            v = out_probs[i]
-            if isinstance(v, list) and len(v) > 0:
-                v = v[0]
-            try:
-                confidence = float(v)
-            except Exception:
-                confidence = None
-        box = None
-        if i < len(out_boxes_xywh):
-            b = out_boxes_xywh[i]
-            if isinstance(b, list) and len(b) >= 4:
-                try:
-                    box = [float(b[0]), float(b[1]), float(b[2]), float(b[3])]
-                except Exception:
-                    box = None
-        meta[obj_id] = {"confidence": confidence, "box_xywh": box}
-    return meta
+    frame_h = frame_w = 0
+    raw_masks = _to_list(outputs.get("out_binary_masks"))
+    if raw_masks:
+        sample = np.asarray(raw_masks[0])
+        while sample.ndim > 2:
+            sample = sample[0]
+        frame_h, frame_w = int(sample.shape[0]), int(sample.shape[1])
+    return shared_frame_object_metadata(outputs, frame_h, frame_w)
 
 
 def _overlay_masks_with_boxes(frame_bgr: np.ndarray, outputs: dict[str, Any]) -> np.ndarray:
@@ -494,6 +449,158 @@ def _sanitize_assessment(
     return out
 
 
+def assess_postprop_frame_with_mllm(
+    *,
+    frame_index: int,
+    frame_bgr: np.ndarray,
+    context_frames: list[tuple[int, np.ndarray]],
+    outputs: dict[str, Any],
+    send_generate_request_fn: Callable[[list[dict[str, Any]]], str | None],
+    initial_text_prompt: str,
+    collage_output_dir: str,
+    max_object_crops: int,
+    crop_context_ratio: float,
+    collage_cols: int,
+    collage_tile_max_edge: int,
+    overlap_iou_threshold: float,
+    system_prompt: str,
+    max_json_retries: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    frame_h, frame_w = frame_bgr.shape[:2]
+    masks_with_ids = _iter_output_masks_with_ids(outputs, frame_h, frame_w)
+    present_obj_ids = sorted(int(x[0]) for x in masks_with_ids)
+    heuristic_overlap_pairs = _heuristic_overlap_pairs(
+        masks_with_ids, iou_threshold=float(overlap_iou_threshold)
+    )
+
+    current_overlay = _overlay_masks_with_boxes(frame_bgr, outputs)
+    crop_tiles = _extract_object_crops(
+        frame_bgr,
+        outputs,
+        max_object_crops=max_object_crops,
+        crop_context_ratio=float(crop_context_ratio),
+    )
+
+    tiles: list[tuple[str, np.ndarray]] = []
+    for ctx_idx, ctx_frame in context_frames:
+        tiles.append((f"ctx f={ctx_idx}", ctx_frame))
+    tiles.append((f"raw f={frame_index}", frame_bgr))
+    tiles.append((f"overlay f={frame_index}", current_overlay))
+    tiles.extend(crop_tiles)
+
+    collage_path = os.path.join(collage_output_dir, f"qa_frame_{frame_index:05d}.jpg")
+    rows, cols = _build_labeled_collage(
+        tiles,
+        collage_path,
+        cols=collage_cols,
+        tile_max_edge=collage_tile_max_edge,
+    )
+
+    frame_list_text = ", ".join(str(x[0]) for x in context_frames)
+    instruction = (
+        "You are reviewing segmentation QA quality.\n"
+        f"Collage is row-major ({rows} rows x {cols} cols).\n"
+        f"Current frame index: {frame_index}. Temporal context frames: [{frame_list_text}].\n"
+        f"Present tracked object IDs in current frame: {present_obj_ids}.\n"
+        f"Initial prompt context: '{initial_text_prompt}'.\n"
+        "Decide if this frame is usable for high-quality training masks.\n"
+        "Mark overlaps/merges, bad masks, and likely missed creatures.\n"
+        "Return STRICT JSON ONLY with exact schema:\n"
+        "{"
+        '"frame_index":int,'
+        '"frame_validity":"valid"|"invalid",'
+        '"reasons":[str],'
+        '"bad_object_ids":[int],'
+        '"overlap_pairs":[[int,int]],'
+        '"missing_creatures":bool,'
+        '"missing_creature_reason":str,'
+        '"missing_creature_regions":[{"x":int,"y":int,"w":int,"h":int}],'
+        '"needs_rerun":bool,'
+        '"confidence":float'
+        "}\n"
+        "Use only IDs listed above in bad_object_ids / overlap_pairs."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": collage_path},
+                {"type": "text", "text": instruction},
+            ],
+        },
+    ]
+
+    model_text: str | None = None
+    parsed: dict[str, Any] | None = None
+    max_attempts = max(1, int(max_json_retries) + 1)
+    for attempt in range(max_attempts):
+        model_text = send_generate_request_fn(messages)
+        parsed = _extract_json_object(model_text or "")
+        if isinstance(parsed, dict):
+            break
+        if attempt + 1 < max_attempts:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Your last reply was not valid JSON. "
+                                "Reply again with STRICT JSON only and no extra text."
+                            ),
+                        }
+                    ],
+                }
+            )
+
+    assessment = _sanitize_assessment(
+        parsed,
+        frame_index=int(frame_index),
+        present_obj_ids=present_obj_ids,
+    )
+
+    if heuristic_overlap_pairs:
+        existing = {tuple(p) for p in assessment.get("overlap_pairs", [])}
+        for pair in heuristic_overlap_pairs:
+            existing.add(tuple(pair))
+        assessment["overlap_pairs"] = [list(x) for x in sorted(existing)]
+        if not assessment["reasons"]:
+            assessment["reasons"] = ["heuristic_overlap_detected"]
+
+    if not isinstance(parsed, dict):
+        q = analyze_frame_quality(frame_bgr)
+        if bool(q.get("is_invalid", False)):
+            assessment["frame_validity"] = "invalid"
+            if not assessment["reasons"]:
+                assessment["reasons"] = list(q.get("invalid_reasons", []))
+        assessment["confidence"] = 0.0
+        assessment["source"] = "heuristic_fallback"
+    else:
+        assessment["source"] = "mllm"
+
+    is_bad = (
+        assessment["frame_validity"] == "invalid"
+        or bool(assessment.get("bad_object_ids"))
+        or bool(assessment.get("overlap_pairs"))
+        or bool(assessment.get("missing_creatures"))
+        or bool(assessment.get("needs_rerun"))
+    )
+    assessment["is_bad_frame"] = bool(is_bad)
+
+    request_log = {
+        "frame_index": int(frame_index),
+        "collage_path": collage_path,
+        "present_obj_ids": present_obj_ids,
+        "heuristic_overlap_pairs": heuristic_overlap_pairs,
+        "raw_text": model_text,
+        "parsed_json_ok": isinstance(parsed, dict),
+    }
+    return assessment, request_log
+
+
 def discover_postprop_qa_with_mllm(
     *,
     video_path: str,
@@ -550,146 +657,26 @@ def discover_postprop_qa_with_mllm(
             frame_index += 1
             continue
 
-        frame_h, frame_w = frame.shape[:2]
-        masks_with_ids = _iter_output_masks_with_ids(outputs, frame_h, frame_w)
-        present_obj_ids = sorted(int(x[0]) for x in masks_with_ids)
-        heuristic_overlap_pairs = _heuristic_overlap_pairs(
-            masks_with_ids, iou_threshold=float(overlap_iou_threshold)
-        )
-
-        current_overlay = _overlay_masks_with_boxes(frame, outputs)
-        crop_tiles = _extract_object_crops(
-            frame,
-            outputs,
+        assessment, request_entry = assess_postprop_frame_with_mllm(
+            frame_index=int(frame_index),
+            frame_bgr=frame,
+            context_frames=list(context_window),
+            outputs=outputs,
+            send_generate_request_fn=send_generate_request_fn,
+            initial_text_prompt=initial_text_prompt,
+            collage_output_dir=qa_collage_dir,
             max_object_crops=max_object_crops,
             crop_context_ratio=float(crop_context_ratio),
+            collage_cols=collage_cols,
+            collage_tile_max_edge=collage_tile_max_edge,
+            overlap_iou_threshold=float(overlap_iou_threshold),
+            system_prompt=system_prompt,
+            max_json_retries=max_json_retries,
         )
-
-        tiles: list[tuple[str, np.ndarray]] = []
-        for ctx_idx, ctx_frame in list(context_window):
-            tiles.append((f"ctx f={ctx_idx}", ctx_frame))
-        tiles.append((f"raw f={frame_index}", frame))
-        tiles.append((f"overlay f={frame_index}", current_overlay))
-        tiles.extend(crop_tiles)
-
-        collage_path = os.path.join(qa_collage_dir, f"qa_frame_{frame_index:05d}.jpg")
-        rows, cols = _build_labeled_collage(
-            tiles,
-            collage_path,
-            cols=collage_cols,
-            tile_max_edge=collage_tile_max_edge,
-        )
-
-        frame_list_text = ", ".join(str(x[0]) for x in list(context_window))
-        instruction = (
-            "You are reviewing segmentation QA quality.\n"
-            f"Collage is row-major ({rows} rows x {cols} cols).\n"
-            f"Current frame index: {frame_index}. Temporal context frames: [{frame_list_text}].\n"
-            f"Present tracked object IDs in current frame: {present_obj_ids}.\n"
-            f"Initial prompt context: '{initial_text_prompt}'.\n"
-            "Decide if this frame is usable for high-quality training masks.\n"
-            "Mark overlaps/merges, bad masks, and likely missed creatures.\n"
-            "Return STRICT JSON ONLY with exact schema:\n"
-            "{"
-            '"frame_index":int,'
-            '"frame_validity":"valid"|"invalid",'
-            '"reasons":[str],'
-            '"bad_object_ids":[int],'
-            '"overlap_pairs":[[int,int]],'
-            '"missing_creatures":bool,'
-            '"missing_creature_reason":str,'
-            '"missing_creature_regions":[{"x":int,"y":int,"w":int,"h":int}],'
-            '"needs_rerun":bool,'
-            '"confidence":float'
-            "}\n"
-            "Use only IDs listed above in bad_object_ids / overlap_pairs."
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": collage_path},
-                    {"type": "text", "text": instruction},
-                ],
-            },
-        ]
-
-        model_text: str | None = None
-        parsed: dict[str, Any] | None = None
-        max_attempts = max(1, int(max_json_retries) + 1)
-        for attempt in range(max_attempts):
-            model_text = send_generate_request_fn(messages)
-            parsed = _extract_json_object(model_text or "")
-            if isinstance(parsed, dict):
-                break
-            if attempt + 1 < max_attempts:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Your last reply was not valid JSON. "
-                                    "Reply again with STRICT JSON only and no extra text."
-                                ),
-                            }
-                        ],
-                    }
-                )
-
-        assessment = _sanitize_assessment(
-            parsed,
-            frame_index=int(frame_index),
-            present_obj_ids=present_obj_ids,
-        )
-
-        # Fold in deterministic overlap evidence.
-        if heuristic_overlap_pairs:
-            existing = {tuple(p) for p in assessment.get("overlap_pairs", [])}
-            for pair in heuristic_overlap_pairs:
-                existing.add(tuple(pair))
-            assessment["overlap_pairs"] = [list(x) for x in sorted(existing)]
-            if not assessment["reasons"]:
-                assessment["reasons"] = ["heuristic_overlap_detected"]
-
-        # Heuristic fallback if JSON never parsed.
-        if not isinstance(parsed, dict):
-            q = analyze_frame_quality(frame)
-            if bool(q.get("is_invalid", False)):
-                assessment["frame_validity"] = "invalid"
-                if not assessment["reasons"]:
-                    assessment["reasons"] = list(q.get("invalid_reasons", []))
-            assessment["confidence"] = 0.0
-            assessment["source"] = "heuristic_fallback"
-        else:
-            assessment["source"] = "mllm"
-
-        is_bad = (
-            assessment["frame_validity"] == "invalid"
-            or bool(assessment.get("bad_object_ids"))
-            or bool(assessment.get("overlap_pairs"))
-            or bool(assessment.get("missing_creatures"))
-            or bool(assessment.get("needs_rerun"))
-        )
-        assessment["is_bad_frame"] = bool(is_bad)
-
         per_frame_assessments.append(assessment)
-        if is_bad:
+        if assessment.get("is_bad_frame"):
             bad_frame_indices.append(int(frame_index))
-
-        request_log.append(
-            {
-                "frame_index": int(frame_index),
-                "collage_path": collage_path,
-                "present_obj_ids": present_obj_ids,
-                "heuristic_overlap_pairs": heuristic_overlap_pairs,
-                "raw_text": model_text,
-                "parsed_json_ok": isinstance(parsed, dict),
-            }
-        )
+        request_log.append(request_entry)
         frame_index += 1
 
     cap.release()

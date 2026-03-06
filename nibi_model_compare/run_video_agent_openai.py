@@ -49,6 +49,15 @@ if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 if SCRIPT_DIR not in sys.path:
     sys.path.append(SCRIPT_DIR)
+
+from frame_output_utils import (
+    decode_rle_to_mask as shared_decode_rle_to_mask,
+    encode_binary_mask_to_rle as shared_encode_binary_mask_to_rle,
+    frame_object_metadata as shared_frame_object_metadata,
+    iter_output_masks_with_ids as shared_iter_output_masks_with_ids,
+    read_video_frame as shared_read_video_frame,
+)
+
 if load_dotenv is not None:
     load_dotenv(os.path.join(REPO_ROOT, ".env"))
 
@@ -143,18 +152,7 @@ def find_bpe_path() -> str:
 
 
 def decode_rle_to_mask(rle: Any, height: int, width: int) -> np.ndarray:
-    from pycocotools import mask as mask_util
-
-    if isinstance(rle, str):
-        rle = {"counts": rle.encode("utf-8"), "size": [height, width]}
-    elif isinstance(rle, dict) and "counts" in rle and isinstance(rle["counts"], str):
-        rle = dict(rle)
-        rle["counts"] = rle["counts"].encode("utf-8")
-
-    decoded = mask_util.decode([rle])
-    if decoded.ndim == 3:
-        return decoded[:, :, 0]
-    return decoded
+    return shared_decode_rle_to_mask(rle, height, width)
 
 
 def get_center_point(mask: np.ndarray) -> tuple[int, int] | None:
@@ -222,15 +220,7 @@ def deduplicate_masks_by_iou(
 
 
 def read_video_frame(video_path: str, frame_idx: int) -> np.ndarray | None:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return None
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        return None
-    return frame
+    return shared_read_video_frame(video_path, frame_idx)
 
 
 def mask_list_from_outputs(outputs: dict[str, Any]) -> list[np.ndarray]:
@@ -274,40 +264,7 @@ def object_color(obj_id: int) -> tuple[int, int, int]:
 def iter_output_masks_with_ids(
     outputs: dict[str, Any], frame_h: int, frame_w: int
 ) -> list[tuple[int, np.ndarray]]:
-    if not isinstance(outputs, dict):
-        return []
-
-    if "out_binary_masks" in outputs:
-        raw_masks = outputs.get("out_binary_masks")
-        raw_ids = outputs.get("out_obj_ids")
-        if isinstance(raw_masks, torch.Tensor):
-            raw_masks = raw_masks.detach().cpu().numpy()
-        if isinstance(raw_ids, torch.Tensor):
-            raw_ids = raw_ids.detach().cpu().numpy()
-        if raw_masks is None:
-            return []
-
-        out: list[tuple[int, np.ndarray]] = []
-        for i, raw_mask in enumerate(raw_masks):
-            arr = np.asarray(raw_mask)
-            while arr.ndim > 2:
-                arr = arr[0]
-            if arr.shape != (frame_h, frame_w):
-                arr = cv2.resize(
-                    arr.astype(np.float32),
-                    (frame_w, frame_h),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-            mask = arr > 0.5
-            if raw_ids is not None and len(raw_ids) > i:
-                obj_id = int(raw_ids[i])
-            else:
-                obj_id = i + 1
-            out.append((obj_id, mask))
-        return out
-
-    # Fallback for legacy outputs without object ids.
-    return [(i + 1, m) for i, m in enumerate(mask_list_from_outputs(outputs))]
+    return shared_iter_output_masks_with_ids(outputs, frame_h, frame_w)
 
 
 def _coerce_to_list(value: Any) -> list[Any]:
@@ -333,49 +290,7 @@ def _coerce_to_list(value: Any) -> list[Any]:
 def _frame_object_metadata(
     outputs: dict[str, Any], frame_h: int, frame_w: int
 ) -> dict[int, dict[str, Any]]:
-    obj_ids = _coerce_to_list(outputs.get("out_obj_ids"))
-    out_boxes_xywh = _coerce_to_list(outputs.get("out_boxes_xywh"))
-    out_probs = _coerce_to_list(outputs.get("out_probs"))
-
-    metadata: dict[int, dict[str, Any]] = {}
-    for i, raw_obj_id in enumerate(obj_ids):
-        try:
-            obj_id = int(raw_obj_id)
-        except Exception:
-            continue
-
-        box_xyxy: tuple[int, int, int, int] | None = None
-        if i < len(out_boxes_xywh):
-            raw_box = out_boxes_xywh[i]
-            if isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
-                try:
-                    x, y, w, h = [float(raw_box[j]) for j in range(4)]
-                    x1 = int(round(x))
-                    y1 = int(round(y))
-                    x2 = int(round(x + max(0.0, w)))
-                    y2 = int(round(y + max(0.0, h)))
-                    x1 = max(0, min(frame_w - 1, x1))
-                    y1 = max(0, min(frame_h - 1, y1))
-                    x2 = max(0, min(frame_w - 1, x2))
-                    y2 = max(0, min(frame_h - 1, y2))
-                    if x2 > x1 and y2 > y1:
-                        box_xyxy = (x1, y1, x2, y2)
-                except Exception:
-                    box_xyxy = None
-
-        conf: float | None = None
-        if i < len(out_probs):
-            raw_prob = out_probs[i]
-            if isinstance(raw_prob, (list, tuple)) and len(raw_prob) > 0:
-                raw_prob = raw_prob[0]
-            try:
-                conf = float(raw_prob)
-            except Exception:
-                conf = None
-
-        metadata[obj_id] = {"box_xyxy": box_xyxy, "confidence": conf}
-
-    return metadata
+    return shared_frame_object_metadata(outputs, frame_h, frame_w)
 
 
 def overlay_masks_on_frame(video_frame: np.ndarray, outputs: dict[str, Any]) -> np.ndarray:
@@ -520,17 +435,7 @@ def _to_serializable_list(value: Any) -> list[Any]:
 
 
 def _encode_binary_mask_to_rle(mask: np.ndarray) -> dict[str, Any]:
-    from pycocotools import mask as mask_util
-
-    arr = np.asarray(mask)
-    while arr.ndim > 2:
-        arr = arr[0]
-    arr = (arr > 0).astype(np.uint8)
-    rle = mask_util.encode(np.asfortranarray(arr))
-    counts = rle.get("counts")
-    if isinstance(counts, bytes):
-        rle["counts"] = counts.decode("utf-8")
-    return {"size": list(rle.get("size", arr.shape)), "counts": rle["counts"]}
+    return shared_encode_binary_mask_to_rle(mask)
 
 
 def serialize_frame_output(frame_index: int, outputs: dict[str, Any]) -> dict[str, Any]:
@@ -547,6 +452,7 @@ def serialize_frame_output(frame_index: int, outputs: dict[str, Any]) -> dict[st
 
     out_obj_ids = _to_serializable_list(outputs.get("out_obj_ids"))
     out_probs = _to_serializable_list(outputs.get("out_probs"))
+    out_tracker_probs = _to_serializable_list(outputs.get("out_tracker_probs"))
     out_boxes_xywh = _to_serializable_list(outputs.get("out_boxes_xywh"))
 
     rle_masks: list[dict[str, Any]] = []
@@ -565,6 +471,7 @@ def serialize_frame_output(frame_index: int, outputs: dict[str, Any]) -> dict[st
         "frame_index": int(frame_index),
         "out_obj_ids": out_obj_ids if out_obj_ids else obj_ids,
         "out_probs": out_probs,
+        "out_tracker_probs": out_tracker_probs,
         "out_boxes_xywh": out_boxes_xywh,
         "out_binary_masks_rle": rle_masks,
     }
@@ -587,7 +494,7 @@ def save_frame_outputs_json(
         frame_outputs["_frame_w"] = frame_w
         frames_payload.append(serialize_frame_output(frame_index, frame_outputs))
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "frame_size_hw": [int(frame_h), int(frame_w)],
         "total_video_frames": int(total_video_frames or 0),
         "num_frames_with_outputs": len(frames_payload),
@@ -602,6 +509,55 @@ def write_json(path: str, payload: dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+
+
+def write_frame_keep_drop_json(
+    output_path: str,
+    *,
+    total_video_frames: int,
+    final_invalid_frame_indices: list[int],
+    hard_invalid_frame_indices: list[int] | None = None,
+    postprop_bad_frame_indices: list[int] | None = None,
+    repaired_frame_indices: list[int] | None = None,
+    unresolved_frame_indices: list[int] | None = None,
+    raw_video_invalid_frame_indices: list[int] | None = None,
+) -> None:
+    reason_codes_by_frame: dict[int, list[str]] = {}
+
+    def add_reason(frame_indices: list[int] | None, reason_code: str) -> None:
+        for raw_idx in frame_indices or []:
+            frame_index = int(raw_idx)
+            row = reason_codes_by_frame.setdefault(frame_index, [])
+            if reason_code not in row:
+                row.append(reason_code)
+
+    add_reason(hard_invalid_frame_indices, "hard_invalid_video")
+    add_reason(postprop_bad_frame_indices, "postprop_bad")
+    add_reason(repaired_frame_indices, "repaired")
+    add_reason(unresolved_frame_indices, "repair_unresolved")
+    add_reason(raw_video_invalid_frame_indices, "postprop_raw_video_invalid")
+
+    invalid_set = set(int(x) for x in final_invalid_frame_indices)
+    repaired_set = set(int(x) for x in (repaired_frame_indices or []))
+    frames_payload: list[dict[str, Any]] = []
+    for frame_index in range(max(0, int(total_video_frames))):
+        frames_payload.append(
+            {
+                "frame_index": int(frame_index),
+                "decision": "drop" if frame_index in invalid_set else "keep",
+                "reason_codes": reason_codes_by_frame.get(frame_index, []),
+                "repaired": frame_index in repaired_set,
+            }
+        )
+
+    write_json(
+        output_path,
+        {
+            "total_video_frames": int(total_video_frames),
+            "final_invalid_frame_indices": sorted(invalid_set),
+            "frames": frames_payload,
+        },
+    )
 
 
 def write_run_documentation(output_dir: str, metrics: dict[str, Any]) -> None:
@@ -1047,6 +1003,54 @@ def parse_args() -> argparse.Namespace:
         help="Do not merge post-propagation QA bad frames into final invalid-frame set.",
     )
     parser.set_defaults(postprop_qa_merge_bad_into_invalid=True)
+    parser.add_argument(
+        "--postprop_repair",
+        action="store_true",
+        help=(
+            "Attempt to repair post-propagation QA segmentation failures before "
+            "final invalid-frame merge/render."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_repair_window",
+        default=8,
+        type=int,
+        help="Local temporal propagation radius used for post-prop repair sessions.",
+    )
+    parser.add_argument(
+        "--postprop_repair_max_attempts",
+        default=2,
+        type=int,
+        help="Maximum repair attempts per flagged frame.",
+    )
+    parser.add_argument(
+        "--postprop_repair_max_candidates",
+        default=5,
+        type=int,
+        help="Maximum candidate masks per repair issue/object sent to the chooser.",
+    )
+    parser.add_argument(
+        "--postprop_repair_prompt_path",
+        default="",
+        type=str,
+        help=(
+            "Optional path to post-propagation repair chooser system prompt template. "
+            "If unset, uses the built-in profile-specific default."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_repair_verify",
+        dest="postprop_repair_verify",
+        action="store_true",
+        help="Re-run post-propagation QA on repaired frame windows before accepting repairs.",
+    )
+    parser.add_argument(
+        "--no_postprop_repair_verify",
+        dest="postprop_repair_verify",
+        action="store_false",
+        help="Skip QA re-verification after applying a post-propagation repair.",
+    )
+    parser.set_defaults(postprop_repair_verify=True)
     return parser.parse_args()
 
 
@@ -1080,6 +1084,7 @@ def run() -> int:
         from keyframe_discovery import discover_keyframes_from_motion
         from keyframe_discovery_mllm import discover_keyframes_with_mllm
         from postprop_qa_mllm import discover_postprop_qa_with_mllm
+        from postprop_repair import repair_postprop_failures
         from track_id_matching import assign_object_ids_by_iou
 
         from sam3.agent.agent_core import agent_inference
@@ -1211,6 +1216,7 @@ def run() -> int:
         Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).save(frame_0_path)
 
         invalid_frame_indices: list[int] = []
+        hard_invalid_frame_indices: list[int] = []
         keyframe_indices: list[int] = [0]
         keyframe_event_candidates: list[dict[str, Any]] = []
         heuristic_invalid_frame_indices: list[int] = []
@@ -1307,6 +1313,12 @@ def run() -> int:
                     "mllm_invalid_frame_indices": mllm_invalid_frame_indices,
                 },
             )
+
+        hard_invalid_frame_indices = sorted(set(int(x) for x in invalid_frame_indices))
+        metrics["hard_invalid_frame_count"] = len(hard_invalid_frame_indices)
+        if hard_invalid_frame_indices:
+            metrics["hard_invalid_frame_sample"] = hard_invalid_frame_indices[:20]
+        invalid_frame_indices = list(hard_invalid_frame_indices)
 
         if args.temporal_keyframe_pipeline:
             invalid_set = set(invalid_frame_indices)
@@ -1454,6 +1466,14 @@ def run() -> int:
                 args.postprop_qa_include_frames_without_outputs
             ),
             "merge_bad_into_invalid": bool(args.postprop_qa_merge_bad_into_invalid),
+        }
+        metrics["postprop_repair_config"] = {
+            "enabled": bool(args.postprop_repair),
+            "window": int(args.postprop_repair_window),
+            "max_attempts": int(args.postprop_repair_max_attempts),
+            "max_candidates": int(args.postprop_repair_max_candidates),
+            "prompt_path": args.postprop_repair_prompt_path,
+            "verify": bool(args.postprop_repair_verify),
         }
         metrics["total_video_frames"] = total_frames
 
@@ -1677,12 +1697,16 @@ def run() -> int:
                 metrics["status"] = "success_no_propagation"
                 if args.postprop_qa_mllm:
                     metrics["postprop_qa_skipped_reason"] = "no_propagation_outputs"
+                if args.postprop_repair:
+                    metrics["postprop_repair_skipped_reason"] = "no_propagation_outputs"
                 metrics["invalid_frame_indices"] = invalid_frame_indices
                 metrics["output_video_path"] = ""
                 metrics["output_dir"] = os.path.abspath(args.output_dir)
                 return_code = 0
                 return return_code
 
+            repair_report: dict[str, Any] | None = None
+            postprop_bad: list[int] = []
             if args.postprop_qa_mllm:
                 postprop_report = discover_postprop_qa_with_mllm(
                     video_path=args.video_path,
@@ -1722,27 +1746,124 @@ def run() -> int:
                 if postprop_bad:
                     metrics["postprop_qa_bad_frame_sample"] = postprop_bad[:20]
 
-                if args.postprop_qa_merge_bad_into_invalid and postprop_bad:
-                    invalid_frame_indices = sorted(set(invalid_frame_indices) | set(postprop_bad))
-                    invalid_ratio = (
-                        len(invalid_frame_indices) / float(total_frames)
-                        if total_frames > 0
-                        else 0.0
+                if args.postprop_repair:
+                    repair_output_dir = os.path.join(args.output_dir, "postprop_repair")
+                    repair_report = repair_postprop_failures(
+                        video_path=args.video_path,
+                        backend=backend,
+                        image_processor=image_processor,
+                        send_generate_request_fn=send_req_postprop_qa,
+                        initial_text_prompt=args.prompt,
+                        prompt_profile=args.prompt_profile,
+                        results_by_frame=results_by_frame,
+                        postprop_report=postprop_report,
+                        hard_invalid_frame_indices=hard_invalid_frame_indices,
+                        next_obj_id=next_obj_id,
+                        total_frames=total_frames,
+                        frame_size_hw=(frame_h, frame_w),
+                        output_dir=repair_output_dir,
+                        image_size=args.image_size,
+                        repair_window=args.postprop_repair_window,
+                        max_attempts_per_frame=args.postprop_repair_max_attempts,
+                        max_candidates_per_issue=args.postprop_repair_max_candidates,
+                        chooser_prompt_template_path=(
+                            args.postprop_repair_prompt_path.strip() or None
+                        ),
+                        verify_with_qa=args.postprop_repair_verify,
+                        overlap_iou_threshold=args.postprop_qa_overlap_iou_threshold,
                     )
-                    metrics["invalid_frame_count"] = len(invalid_frame_indices)
-                    metrics["invalid_frame_ratio"] = float(invalid_ratio)
-                    metrics["invalid_frame_sample"] = invalid_frame_indices[:20]
+                    next_obj_id = int(repair_report.get("next_obj_id", next_obj_id))
+                    invalid_frame_indices = sorted(
+                        set(
+                            int(x)
+                            for x in repair_report.get(
+                                "final_invalid_frame_indices",
+                                hard_invalid_frame_indices,
+                            )
+                        )
+                    )
+                    metrics["postprop_repair_report_path"] = os.path.join(
+                        repair_output_dir, "postprop_repair_report.json"
+                    )
+                    metrics["postprop_repair_issue_count"] = int(
+                        repair_report.get("num_issues", 0)
+                    )
+                    metrics["postprop_repair_repaired_frame_count"] = len(
+                        repair_report.get("repaired_frame_indices", [])
+                    )
+                    metrics["postprop_repair_unresolved_frame_count"] = len(
+                        repair_report.get("unresolved_frame_indices", [])
+                    )
+                    metrics["postprop_repair_raw_video_invalid_frame_count"] = len(
+                        repair_report.get("raw_video_invalid_frame_indices", [])
+                    )
+                    repaired_sample = repair_report.get("repaired_frame_indices", [])
+                    unresolved_sample = repair_report.get(
+                        "unresolved_frame_indices", []
+                    )
+                    if repaired_sample:
+                        metrics["postprop_repair_repaired_frame_sample"] = repaired_sample[
+                            :20
+                        ]
+                    if unresolved_sample:
+                        metrics[
+                            "postprop_repair_unresolved_frame_sample"
+                        ] = unresolved_sample[:20]
+                    metrics["invalid_frame_source_effective"] = (
+                        f"{args.invalid_frame_source}+postprop_repair"
+                    )
+                elif args.postprop_qa_merge_bad_into_invalid and postprop_bad:
+                    invalid_frame_indices = sorted(
+                        set(invalid_frame_indices) | set(postprop_bad)
+                    )
                     metrics["invalid_frame_source_effective"] = (
                         f"{args.invalid_frame_source}+postprop_qa"
                     )
-                    write_json(
-                        prompts_path,
-                        {
-                            "prompts": generated_prompts,
-                            "keyframe_indices": keyframe_indices,
-                            "invalid_frame_indices": invalid_frame_indices,
-                        },
-                    )
+            elif args.postprop_repair:
+                metrics["postprop_repair_skipped_reason"] = "postprop_qa_disabled"
+
+            invalid_ratio = (
+                len(invalid_frame_indices) / float(total_frames)
+                if total_frames > 0
+                else 0.0
+            )
+            metrics["invalid_frame_count"] = len(invalid_frame_indices)
+            metrics["invalid_frame_ratio"] = float(invalid_ratio)
+            metrics["invalid_frame_indices"] = invalid_frame_indices
+            if invalid_frame_indices:
+                metrics["invalid_frame_sample"] = invalid_frame_indices[:20]
+            write_json(
+                prompts_path,
+                {
+                    "prompts": generated_prompts,
+                    "keyframe_indices": keyframe_indices,
+                    "invalid_frame_indices": invalid_frame_indices,
+                },
+            )
+            frame_keep_drop_path = os.path.join(args.output_dir, "frame_keep_drop.json")
+            write_frame_keep_drop_json(
+                frame_keep_drop_path,
+                total_video_frames=total_frames,
+                final_invalid_frame_indices=invalid_frame_indices,
+                hard_invalid_frame_indices=hard_invalid_frame_indices,
+                postprop_bad_frame_indices=postprop_bad,
+                repaired_frame_indices=(
+                    repair_report.get("repaired_frame_indices", [])
+                    if repair_report
+                    else []
+                ),
+                unresolved_frame_indices=(
+                    repair_report.get("unresolved_frame_indices", [])
+                    if repair_report
+                    else []
+                ),
+                raw_video_invalid_frame_indices=(
+                    repair_report.get("raw_video_invalid_frame_indices", [])
+                    if repair_report
+                    else []
+                ),
+            )
+            metrics["frame_keep_drop_path"] = frame_keep_drop_path
 
             out_path = os.path.join(args.output_dir, "output_video.mp4")
             should_save_frame_outputs = args.save_frame_outputs_json or os.environ.get(

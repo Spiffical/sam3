@@ -75,6 +75,13 @@ class Sam3VideoPredictor:
                 bounding_box_labels=request.get("bounding_box_labels", None),
                 obj_id=request.get("obj_id", None),
             )
+        elif request_type == "add_mask_prompt":
+            return self.add_mask_prompt(
+                session_id=request["session_id"],
+                frame_idx=request["frame_index"],
+                obj_id=request["obj_id"],
+                mask=request["mask"],
+            )
         elif request_type == "remove_object":
             return self.remove_object(
                 session_id=request["session_id"],
@@ -214,6 +221,32 @@ class Sam3VideoPredictor:
             is_user_action=is_user_action,
         )
         return {"is_success": True}
+
+    def add_mask_prompt(
+        self,
+        session_id: str,
+        frame_idx: int,
+        obj_id: int,
+        mask,
+    ):
+        """Add a binary mask prompt for a tracked or newly-added object on one frame."""
+        logger.debug(
+            f"add mask prompt on frame {frame_idx} in session {session_id}: {obj_id=}"
+        )
+        session = self._get_session(session_id)
+        inference_state = session["state"]
+
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.as_tensor(mask)
+        mask = (mask > 0).to(dtype=torch.bool)
+
+        frame_idx, outputs = self.model.add_mask_prompt(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            mask=mask,
+        )
+        return {"frame_index": frame_idx, "outputs": outputs}
 
     def propagate_in_video(
         self,
