@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 from collections import defaultdict
 from typing import Any, Callable
 
@@ -224,6 +225,29 @@ def _render_multi_mask_overlay(
     return out[y1 : y2 + 1, x1 : x2 + 1].copy()
 
 
+def _collect_masks_by_obj_ids(
+    outputs: dict[str, Any],
+    frame_h: int,
+    frame_w: int,
+    obj_ids: set[int] | None = None,
+) -> dict[int, np.ndarray]:
+    selected_obj_ids = {int(x) for x in (obj_ids or set())}
+    masks: dict[int, np.ndarray] = {}
+    for obj_id, mask in iter_output_masks_with_ids(outputs, frame_h, frame_w):
+        if selected_obj_ids and int(obj_id) not in selected_obj_ids:
+            continue
+        masks[int(obj_id)] = np.asarray(mask).astype(bool)
+    return masks
+
+
+def _copy_file_if_exists(src_path: str | None, dst_path: str) -> bool:
+    if not src_path or not os.path.isfile(src_path):
+        return False
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    shutil.copy2(src_path, dst_path)
+    return True
+
+
 def _deduplicate_candidate_masks(
     candidates: list[dict[str, Any]], iou_threshold: float = 0.95
 ) -> list[dict[str, Any]]:
@@ -298,6 +322,99 @@ def _current_mask_score_prior(
     if confidence is not None:
         return float(max(0.0, min(1.0, confidence)))
     return 0.35
+
+
+def _assessment_bad_object_ids(assessment: dict[str, Any] | None) -> set[int]:
+    if not isinstance(assessment, dict):
+        return set()
+    return {
+        int(x)
+        for x in assessment.get("bad_object_ids", [])
+        if x is not None
+    }
+
+
+def _assessment_overlap_pairs(
+    assessment: dict[str, Any] | None,
+) -> set[tuple[int, int]]:
+    if not isinstance(assessment, dict):
+        return set()
+    out: set[tuple[int, int]] = set()
+    for pair in assessment.get("overlap_pairs", []):
+        if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            continue
+        try:
+            a, b = sorted((int(pair[0]), int(pair[1])))
+        except Exception:
+            continue
+        out.add((a, b))
+    return out
+
+
+def _assessment_has_mask_issues(assessment: dict[str, Any] | None) -> bool:
+    if not isinstance(assessment, dict):
+        return False
+    return bool(
+        assessment.get("bad_object_ids")
+        or assessment.get("overlap_pairs")
+        or assessment.get("missing_creatures")
+        or assessment.get("needs_rerun")
+    )
+
+
+def _assessment_is_raw_video_invalid(assessment: dict[str, Any] | None) -> bool:
+    if not isinstance(assessment, dict):
+        return False
+    return (
+        str(assessment.get("frame_validity", "")).strip().lower() == "invalid"
+        and not _assessment_has_mask_issues(assessment)
+    )
+
+
+def _evaluate_issue_resolution(
+    issue: dict[str, Any],
+    assessment: dict[str, Any] | None,
+) -> dict[str, Any]:
+    issue_type = str(issue.get("issue_type", "")).strip().lower()
+    target_obj_ids = [int(x) for x in issue.get("target_obj_ids", [])]
+    bad_object_ids = _assessment_bad_object_ids(assessment)
+    overlap_pairs = _assessment_overlap_pairs(assessment)
+
+    unresolved_reasons: list[str] = []
+    if issue_type == "poor_boundary":
+        for obj_id in target_obj_ids:
+            if obj_id in bad_object_ids:
+                unresolved_reasons.append(f"obj_{obj_id}_still_bad")
+            if any(obj_id in pair for pair in overlap_pairs):
+                unresolved_reasons.append(f"obj_{obj_id}_still_overlaps")
+    elif issue_type == "merged_objects":
+        target_pairs = {
+            tuple(sorted((target_obj_ids[i], target_obj_ids[j])))
+            for i in range(len(target_obj_ids))
+            for j in range(i + 1, len(target_obj_ids))
+        }
+        for pair in target_pairs:
+            if pair in overlap_pairs:
+                unresolved_reasons.append(
+                    f"pair_{pair[0]}_{pair[1]}_still_overlaps"
+                )
+        for obj_id in target_obj_ids:
+            if obj_id in bad_object_ids:
+                unresolved_reasons.append(f"obj_{obj_id}_still_bad")
+    elif issue_type == "missing_object":
+        if bool((assessment or {}).get("missing_creatures")):
+            unresolved_reasons.append("missing_creatures_still_true")
+    else:
+        if _assessment_has_mask_issues(assessment):
+            unresolved_reasons.append("mask_issue_still_present")
+
+    return {
+        "issue_id": issue.get("issue_id"),
+        "issue_type": issue_type,
+        "target_obj_ids": target_obj_ids,
+        "resolved": not unresolved_reasons,
+        "unresolved_reasons": unresolved_reasons,
+    }
 
 
 def _issue_crop_box(
@@ -570,6 +687,7 @@ def generate_mask_candidates_for_issue(
         temporal_masks = []
         reference_area = None
         current_mask = None
+        pinned_candidates: list[dict[str, Any]] = []
         if target_obj_id != "new_object":
             current_mask = _frame_mask_by_obj_id(
                 results_by_frame, frame_index, int(target_obj_id), frame_h, frame_w
@@ -600,13 +718,31 @@ def generate_mask_candidates_for_issue(
                 other_masks=list(other_masks_by_obj_id.values()),
                 reference_area=reference_area,
             )
-            scored_candidates.append(
+            pinned_candidates.append(
                 {
                     "candidate_id": "current",
                     "prompt_text": "current_mask",
                     "mask_full": current_mask,
                     "mask_rle": encode_binary_mask_to_rle(current_mask),
                     **current_scores,
+                }
+            )
+            remove_scores = _score_candidate(
+                np.zeros_like(current_mask, dtype=bool),
+                sam_score=0.0,
+                temporal_masks=temporal_masks,
+                other_masks=list(other_masks_by_obj_id.values()),
+                reference_area=reference_area,
+            )
+            pinned_candidates.append(
+                {
+                    "candidate_id": "remove_mask",
+                    "prompt_text": "remove_mask",
+                    "mask_full": np.zeros_like(current_mask, dtype=bool),
+                    "mask_rle": encode_binary_mask_to_rle(
+                        np.zeros_like(current_mask, dtype=bool)
+                    ),
+                    **remove_scores,
                 }
             )
 
@@ -629,7 +765,20 @@ def generate_mask_candidates_for_issue(
             )
 
         scored_candidates.sort(key=lambda row: row.get("total_score", 0.0), reverse=True)
-        candidate_sets[target_obj_id] = scored_candidates[: max(1, int(max_candidates))]
+        final_rows: list[dict[str, Any]] = []
+        seen_candidate_ids: set[str] = set()
+        for row in pinned_candidates:
+            final_rows.append(row)
+            seen_candidate_ids.add(str(row.get("candidate_id")))
+        for row in scored_candidates:
+            candidate_id = str(row.get("candidate_id"))
+            if candidate_id in seen_candidate_ids:
+                continue
+            final_rows.append(row)
+            seen_candidate_ids.add(candidate_id)
+            if len(final_rows) >= max(1, int(max_candidates)):
+                break
+        candidate_sets[target_obj_id] = final_rows[: max(1, int(max_candidates))]
 
     candidate_summary = {
         key: [
@@ -678,7 +827,7 @@ def _resolve_chooser_system_prompt(
         f"the intended {domain}.\n"
         "Prefer boundary quality, temporal consistency, and avoiding overlap with other objects.\n"
         "Return STRICT JSON only with schema "
-        '{"decision":"choose_candidate|keep_current|unrepairable","selected_candidate_id":str,'
+        '{"decision":"choose_candidate|keep_current|remove_mask|unrepairable","selected_candidate_id":str,'
         '"confidence":float,"reason":str}.'
     )
 
@@ -784,12 +933,13 @@ def choose_candidate_with_mllm(
         f"Initial prompt context: '{initial_text_prompt}'.\n"
         f"Repair issue: {issue_desc} on frame {frame_index}.\n"
         "Choose the best candidate mask. Candidate 'current' means keep the existing mask if present.\n"
+        "Candidate 'remove_mask' means suppress this object mask in the repaired window.\n"
         "If none of the candidates are usable, return decision='unrepairable'.\n"
         "Candidates:\n"
         f"{candidate_text}\n"
         "Return STRICT JSON ONLY with schema:\n"
         "{"
-        '"decision":"choose_candidate|keep_current|unrepairable",'
+        '"decision":"choose_candidate|keep_current|remove_mask|unrepairable",'
         '"selected_candidate_id":str,'
         '"confidence":float,'
         '"reason":str'
@@ -837,13 +987,20 @@ def choose_candidate_with_mllm(
     valid_ids = {row["candidate_id"] for row in candidate_rows}
     if isinstance(parsed, dict):
         decision_raw = str(parsed.get("decision", "")).strip().lower()
-        if decision_raw in {"choose_candidate", "keep_current", "unrepairable"}:
+        if decision_raw in {
+            "choose_candidate",
+            "keep_current",
+            "remove_mask",
+            "unrepairable",
+        }:
             decision = decision_raw
         selected_raw = str(parsed.get("selected_candidate_id", "current")).strip()
         if selected_raw in valid_ids:
             selected_candidate_id = selected_raw
         elif decision == "keep_current" and "current" in valid_ids:
             selected_candidate_id = "current"
+        elif decision == "remove_mask" and "remove_mask" in valid_ids:
+            selected_candidate_id = "remove_mask"
         try:
             confidence = float(parsed.get("confidence", 0.0))
         except Exception:
@@ -905,34 +1062,42 @@ def apply_repair_action(
     frame_size_wh: tuple[int, int],
     image_size: int,
     selected_masks_by_obj_id: dict[int, np.ndarray],
+    remove_obj_ids: set[int] | None,
     repair_window: int,
 ) -> dict[str, Any]:
-    replace_obj_ids = set(int(x) for x in selected_masks_by_obj_id.keys())
-    session_id = backend.start_session(resource_path=video_path, image_size=image_size)
     updated_frames: dict[int, dict[str, Any]] = {}
-    try:
-        for obj_id, mask in selected_masks_by_obj_id.items():
-            backend.add_mask_prompt(
-                session_id=session_id,
-                frame_idx=int(frame_index),
-                obj_id=int(obj_id),
-                mask=np.asarray(mask).astype(bool),
-            )
+    replace_obj_ids = set(int(x) for x in selected_masks_by_obj_id.keys())
+    remove_obj_ids = {int(x) for x in (remove_obj_ids or set())}
+    replace_obj_ids |= remove_obj_ids
 
-        request = {
-            "session_id": session_id,
-            "type": "propagate_in_video",
-            "start_frame_index": int(frame_index),
-            "propagation_direction": "both",
-            "max_frame_num_to_track": int(repair_window),
-        }
-        for output in backend.propagate(request):
-            updated_frames[int(output["frame_index"])] = output["outputs"]
-    finally:
+    if selected_masks_by_obj_id:
+        session_id = backend.start_session(resource_path=video_path, image_size=image_size)
         try:
-            backend.close_session(session_id)
-        except Exception:
-            pass
+            for obj_id, mask in selected_masks_by_obj_id.items():
+                backend.add_mask_prompt(
+                    session_id=session_id,
+                    frame_idx=int(frame_index),
+                    obj_id=int(obj_id),
+                    mask=np.asarray(mask).astype(bool),
+                )
+
+            request = {
+                "session_id": session_id,
+                "type": "propagate_in_video",
+                "start_frame_index": int(frame_index),
+                "propagation_direction": "both",
+                "max_frame_num_to_track": int(repair_window),
+            }
+            for output in backend.propagate(request):
+                updated_frames[int(output["frame_index"])] = output["outputs"]
+        finally:
+            try:
+                backend.close_session(session_id)
+            except Exception:
+                pass
+    elif remove_obj_ids:
+        if frame_index in results_by_frame:
+            updated_frames[int(frame_index)] = {}
 
     merged_frame_indices: list[int] = []
     for updated_frame_index, patched_outputs in updated_frames.items():
@@ -947,13 +1112,138 @@ def apply_repair_action(
     return {
         "frame_index": int(frame_index),
         "replace_obj_ids": sorted(replace_obj_ids),
+        "remove_obj_ids": sorted(remove_obj_ids),
         "updated_frame_indices": sorted(merged_frame_indices),
     }
+
+
+def _issues_crop_box(
+    *,
+    frame_issues: list[dict[str, Any]],
+    frame_bgr: np.ndarray,
+    results_by_frame: dict[int, dict[str, Any]],
+    frame_h: int,
+    frame_w: int,
+    search_radius: int,
+) -> tuple[int, int, int, int]:
+    boxes: list[tuple[int, int, int, int]] = []
+    for issue in frame_issues:
+        boxes.append(
+            _issue_crop_box(
+                issue=issue,
+                frame_bgr=frame_bgr,
+                results_by_frame=results_by_frame,
+                frame_h=frame_h,
+                frame_w=frame_w,
+                search_radius=search_radius,
+            )
+        )
+    if not boxes:
+        return (0, 0, frame_w - 1, frame_h - 1)
+    return _union_xyxy(boxes, frame_w, frame_h)
+
+
+def _write_visual_debug_sample(
+    *,
+    visual_debug_dir: str,
+    sample_index: int,
+    video_path: str,
+    frame_index: int,
+    frame_issues: list[dict[str, Any]],
+    before_results_by_frame: dict[int, dict[str, Any]],
+    after_results_by_frame: dict[int, dict[str, Any]],
+    action: dict[str, Any],
+    attempt_choices: list[dict[str, Any]],
+    verification: dict[str, Any] | None,
+    repair_window: int,
+) -> dict[str, Any] | None:
+    frame_bgr = read_video_frame(video_path, frame_index)
+    if frame_bgr is None:
+        return None
+
+    frame_h, frame_w = frame_bgr.shape[:2]
+    crop_xyxy = _issues_crop_box(
+        frame_issues=frame_issues,
+        frame_bgr=frame_bgr,
+        results_by_frame=before_results_by_frame,
+        frame_h=frame_h,
+        frame_w=frame_w,
+        search_radius=max(2, int(repair_window)),
+    )
+    replace_obj_ids = {int(x) for x in action.get("replace_obj_ids", [])}
+    before_outputs = before_results_by_frame.get(frame_index, {})
+    after_outputs = after_results_by_frame.get(frame_index, {})
+
+    before_target_masks = _collect_masks_by_obj_ids(
+        before_outputs, frame_h, frame_w, replace_obj_ids
+    )
+    after_target_masks = _collect_masks_by_obj_ids(
+        after_outputs, frame_h, frame_w, replace_obj_ids
+    )
+    before_all_masks = _collect_masks_by_obj_ids(before_outputs, frame_h, frame_w)
+    after_all_masks = _collect_masks_by_obj_ids(after_outputs, frame_h, frame_w)
+
+    sample_name = (
+        f"sample_{sample_index:03d}_f{frame_index:05d}_"
+        f"{'pass' if verification and verification.get('verification_passed') else 'fail'}"
+    )
+    sample_dir = os.path.join(visual_debug_dir, sample_name)
+    os.makedirs(sample_dir, exist_ok=True)
+
+    before_after_path = os.path.join(sample_dir, "before_after.jpg")
+    raw_crop = frame_bgr[
+        crop_xyxy[1] : crop_xyxy[3] + 1,
+        crop_xyxy[0] : crop_xyxy[2] + 1,
+    ].copy()
+    _build_labeled_collage(
+        [
+            ("raw crop", raw_crop),
+            (
+                "before targets",
+                _render_multi_mask_overlay(frame_bgr, before_target_masks, crop_xyxy),
+            ),
+            (
+                "after targets",
+                _render_multi_mask_overlay(frame_bgr, after_target_masks, crop_xyxy),
+            ),
+            ("before all", _render_multi_mask_overlay(frame_bgr, before_all_masks, crop_xyxy)),
+            ("after all", _render_multi_mask_overlay(frame_bgr, after_all_masks, crop_xyxy)),
+        ],
+        before_after_path,
+        cols=2,
+        tile_max_edge=420,
+    )
+
+    copied_choice_paths: list[str] = []
+    for choice in attempt_choices:
+        dst_name = (
+            f"choice_{str(choice.get('target_obj_id')).replace(' ', '_')}_"
+            f"{str(choice.get('selected_candidate_id', 'unknown')).replace(' ', '_')}.jpg"
+        )
+        dst_path = os.path.join(sample_dir, dst_name)
+        if _copy_file_if_exists(choice.get("collage_path"), dst_path):
+            copied_choice_paths.append(dst_path)
+
+    sample_payload = {
+        "frame_index": int(frame_index),
+        "attempt_index": int(action.get("attempt_index", 0)),
+        "issue_ids": [issue.get("issue_id") for issue in frame_issues],
+        "replace_obj_ids": sorted(replace_obj_ids),
+        "remove_obj_ids": sorted(int(x) for x in action.get("remove_obj_ids", [])),
+        "updated_frame_indices": action.get("updated_frame_indices", []),
+        "verification": verification,
+        "choices": attempt_choices,
+        "before_after_path": before_after_path,
+        "choice_collages": copied_choice_paths,
+    }
+    _write_json(os.path.join(sample_dir, "sample.json"), sample_payload)
+    return sample_payload
 
 
 def _verify_frame_cluster(
     *,
     frame_index: int,
+    frame_issues: list[dict[str, Any]],
     results_by_frame: dict[int, dict[str, Any]],
     video_path: str,
     send_generate_request_fn: Callable[[list[dict[str, Any]]], str | None],
@@ -1007,7 +1297,16 @@ def _verify_frame_cluster(
         if assessment.get("is_bad_frame"):
             bad_frame_indices.append(int(verify_index))
 
-    center_frame_bad = bool(center_assessment and center_assessment.get("is_bad_frame"))
+    broad_center_frame_bad = bool(center_assessment and center_assessment.get("is_bad_frame"))
+    center_assessment_missing = center_assessment is None
+    raw_video_invalid = _assessment_is_raw_video_invalid(center_assessment)
+    issue_results = [
+        _evaluate_issue_resolution(issue, center_assessment) for issue in frame_issues
+    ]
+    unresolved_issue_ids = [
+        row["issue_id"] for row in issue_results if not bool(row.get("resolved"))
+    ]
+    center_frame_bad = bool(center_assessment_missing or raw_video_invalid or unresolved_issue_ids)
     neighbor_bad_frame_indices = sorted(
         idx for idx in set(bad_frame_indices) if int(idx) != int(frame_index)
     )
@@ -1016,9 +1315,18 @@ def _verify_frame_cluster(
         "frame_index": int(frame_index),
         "verify_indices": verify_indices,
         "bad_frame_indices": sorted(set(bad_frame_indices)),
+        "broad_center_frame_bad": bool(broad_center_frame_bad),
         "center_frame_bad": bool(center_frame_bad),
+        "center_assessment_missing": bool(center_assessment_missing),
+        "raw_video_invalid": bool(raw_video_invalid),
         "neighbor_bad_frame_indices": neighbor_bad_frame_indices,
-        "verification_passed": not bool(center_frame_bad),
+        "issue_results": issue_results,
+        "unresolved_issue_ids": unresolved_issue_ids,
+        "verification_passed": (
+            not bool(center_assessment_missing)
+            and not bool(raw_video_invalid)
+            and not bool(unresolved_issue_ids)
+        ),
         "assessments": assessments,
         "requests": requests,
     }
@@ -1060,9 +1368,12 @@ def repair_postprop_failures(
     choices_log: list[dict[str, Any]] = []
     actions_log: list[dict[str, Any]] = []
     verification_log: list[dict[str, Any]] = []
+    visual_debug_samples: list[dict[str, Any]] = []
     repaired_frame_indices: set[int] = set()
-    unresolved_frame_indices: set[int] = set(raw_video_invalid_frame_indices)
+    unresolved_mask_issue_frame_indices: set[int] = set()
     next_obj_id_local = int(next_obj_id)
+    visual_debug_dir = os.path.join(output_dir, "visual_debug")
+    os.makedirs(visual_debug_dir, exist_ok=True)
 
     for frame_index in sorted(issues_by_frame.keys()):
         frame_issues = issues_by_frame[frame_index]
@@ -1073,9 +1384,11 @@ def repair_postprop_failures(
         for attempt_index in range(max(1, int(max_attempts_per_frame))):
             _restore_window(results_by_frame, original_snapshot, frame_index, repair_window)
             selected_masks_by_obj_id: dict[int, np.ndarray] = {}
+            remove_obj_ids: set[int] = set()
             tentative_new_obj_id = next_obj_id_local
             attempt_ok = True
             attempt_has_noncurrent_selection = False
+            attempt_choices: list[dict[str, Any]] = []
 
             for issue in frame_issues:
                 try:
@@ -1143,6 +1456,7 @@ def repair_postprop_failures(
                         attempt_ok = False
                         break
                     choices_log.append(dict(choice, attempt_index=int(attempt_index)))
+                    attempt_choices.append(dict(choice, attempt_index=int(attempt_index)))
 
                     if choice["decision"] == "unrepairable":
                         attempt_ok = False
@@ -1166,6 +1480,11 @@ def repair_postprop_failures(
                         selected_masks_by_obj_id[tentative_new_obj_id] = selected_row["mask_full"]
                         tentative_new_obj_id += 1
                     else:
+                        if selected_candidate_id == "remove_mask" or choice["decision"] == "remove_mask":
+                            attempt_has_noncurrent_selection = True
+                            remove_obj_ids.add(int(target_obj_id))
+                            selected_masks_by_obj_id.pop(int(target_obj_id), None)
+                            continue
                         if selected_candidate_id == "current" and choice["decision"] == "keep_current":
                             current_mask = _frame_mask_by_obj_id(
                                 results_by_frame,
@@ -1183,7 +1502,7 @@ def repair_postprop_failures(
                 if not attempt_ok:
                     break
 
-            if attempt_ok and selected_masks_by_obj_id:
+            if attempt_ok and (selected_masks_by_obj_id or remove_obj_ids):
                 if not attempt_has_noncurrent_selection:
                     actions_log.append(
                         {
@@ -1206,6 +1525,7 @@ def repair_postprop_failures(
                         frame_size_wh=(frame_size_hw[1], frame_size_hw[0]),
                         image_size=image_size,
                         selected_masks_by_obj_id=selected_masks_by_obj_id,
+                        remove_obj_ids=remove_obj_ids,
                         repair_window=repair_window,
                     )
                 except Exception as exc:
@@ -1229,6 +1549,7 @@ def repair_postprop_failures(
                     try:
                         verification = _verify_frame_cluster(
                             frame_index=frame_index,
+                            frame_issues=frame_issues,
                             results_by_frame=results_by_frame,
                             video_path=video_path,
                             send_generate_request_fn=send_generate_request_fn,
@@ -1249,12 +1570,42 @@ def repair_postprop_failures(
                         continue
                     verification["attempt_index"] = int(attempt_index)
                     verification_log.append(verification)
+                    visual_sample = _write_visual_debug_sample(
+                        visual_debug_dir=visual_debug_dir,
+                        sample_index=len(visual_debug_samples),
+                        video_path=video_path,
+                        frame_index=frame_index,
+                        frame_issues=frame_issues,
+                        before_results_by_frame=original_snapshot,
+                        after_results_by_frame=results_by_frame,
+                        action=action,
+                        attempt_choices=attempt_choices,
+                        verification=verification,
+                        repair_window=repair_window,
+                    )
+                    if visual_sample is not None:
+                        visual_debug_samples.append(visual_sample)
                     if verification.get("verification_passed", False):
                         frame_repaired = True
                         repaired_frame_indices.update(action["updated_frame_indices"])
                         next_obj_id_local = tentative_new_obj_id
                         break
                 else:
+                    visual_sample = _write_visual_debug_sample(
+                        visual_debug_dir=visual_debug_dir,
+                        sample_index=len(visual_debug_samples),
+                        video_path=video_path,
+                        frame_index=frame_index,
+                        frame_issues=frame_issues,
+                        before_results_by_frame=original_snapshot,
+                        after_results_by_frame=results_by_frame,
+                        action=action,
+                        attempt_choices=attempt_choices,
+                        verification=None,
+                        repair_window=repair_window,
+                    )
+                    if visual_sample is not None:
+                        visual_debug_samples.append(visual_sample)
                     frame_repaired = True
                     repaired_frame_indices.update(action["updated_frame_indices"])
                     next_obj_id_local = tentative_new_obj_id
@@ -1262,13 +1613,18 @@ def repair_postprop_failures(
 
         if not frame_repaired:
             _restore_window(results_by_frame, original_snapshot, frame_index, repair_window)
-            unresolved_frame_indices.add(int(frame_index))
+            unresolved_mask_issue_frame_indices.add(int(frame_index))
 
     final_invalid_frame_indices = sorted(
         set(int(x) for x in hard_invalid_frame_indices)
         | set(int(x) for x in raw_video_invalid_frame_indices)
-        | set(int(x) for x in unresolved_frame_indices)
     )
+
+    visual_manifest = {
+        "sample_count": len(visual_debug_samples),
+        "samples": visual_debug_samples,
+    }
+    _write_json(os.path.join(visual_debug_dir, "manifest.json"), visual_manifest)
 
     report = {
         "mode": "postprop_repair",
@@ -1283,9 +1639,12 @@ def repair_postprop_failures(
         "actions": actions_log,
         "verification": verification_log,
         "repaired_frame_indices": sorted(repaired_frame_indices),
-        "unresolved_frame_indices": sorted(unresolved_frame_indices),
+        "unresolved_frame_indices": sorted(unresolved_mask_issue_frame_indices),
+        "mask_issue_frame_indices": sorted(unresolved_mask_issue_frame_indices),
         "raw_video_invalid_frame_indices": sorted(raw_video_invalid_frame_indices),
         "final_invalid_frame_indices": final_invalid_frame_indices,
+        "visual_debug_dir": visual_debug_dir,
+        "visual_debug_manifest_path": os.path.join(visual_debug_dir, "manifest.json"),
         "next_obj_id": int(next_obj_id_local),
     }
     _write_json(os.path.join(output_dir, "postprop_repair_report.json"), report)

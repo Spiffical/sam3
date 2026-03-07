@@ -1,0 +1,368 @@
+{
+  "schema_version": 1,
+  "run_status": "success",
+  "runtime_sec": 8307.663,
+  "video_path": "/project/rpp-kmoran/merileo/data/onc/rank01_taxa001_ann001_AXISCAMACCC8E891285_20210707T220008.000Z_t00000.mp4",
+  "model": "Qwen/Qwen3.5-27B",
+  "prompt": "identify and segment small creatures in the underwater scene",
+  "prompt_profile": "underwater",
+  "artifacts": {
+    "run_metrics_path": "/scratch/merileo/sam3/runs/Qwen_Qwen3.5-27B/run_metrics.json",
+    "output_video_path": "/scratch/merileo/sam3/runs/Qwen_Qwen3.5-27B/output_video.mp4",
+    "frame_outputs_json_path": "/scratch/merileo/sam3/runs/Qwen_Qwen3.5-27B/frame_outputs_rle.json",
+    "generated_prompts_path": "/scratch/merileo/sam3/runs/Qwen_Qwen3.5-27B/generated_prompts.json",
+    "postprop_qa_report_path": "/scratch/merileo/sam3/runs/Qwen_Qwen3.5-27B/postprop_qa_report.json",
+    "postprop_repair_report_path": "/scratch/merileo/sam3/runs/Qwen_Qwen3.5-27B/postprop_repair/postprop_repair_report.json",
+    "frame_keep_drop_path": "/scratch/merileo/sam3/runs/Qwen_Qwen3.5-27B/frame_keep_drop.json"
+  },
+  "metrics_excerpt": {
+    "hard_invalid_frame_count": 58,
+    "invalid_frame_count": 286,
+    "postprop_qa_bad_frame_count": 288,
+    "postprop_repair_issue_count": 1094,
+    "postprop_repair_repaired_frame_count": 23,
+    "postprop_repair_unresolved_frame_count": 228,
+    "invalid_frame_source_effective": "mllm+postprop_repair",
+    "invalid_frame_sample": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "postprop_repair_unresolved_frame_sample": [
+      51,
+      53,
+      54,
+      55,
+      56,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      68,
+      69,
+      70,
+      71,
+      79,
+      80
+    ]
+  },
+  "postprop_qa_summary": {
+    "bad_frame_count": 288,
+    "bad_frame_ratio": 0.96,
+    "assessment_count": 300
+  },
+  "postprop_repair_summary": {
+    "issue_type_counts": {
+      "poor_boundary": 890,
+      "missing_object": 160,
+      "merged_objects": 44
+    },
+    "choice_decision_counts": {
+      "keep_current": 1021,
+      "unrepairable": 306,
+      "choose_candidate": 212
+    },
+    "choice_selected_candidate_counts": {
+      "current": 1510,
+      "marine_creature_0": 7,
+      "marine_creature_2": 5,
+      "small_creature_0": 3,
+      "marine_creature_1": 3,
+      "small_creature_1": 3,
+      "small_creature_3": 2,
+      "marine_creature_5": 2,
+      "small_creature_2": 1,
+      "marine_creature_7": 1,
+      "marine_creature_4": 1,
+      "marine_creature_3": 1
+    },
+    "current_only_action_count": 98,
+    "noncurrent_action_count": 21,
+    "verification_outcomes": {
+      "center_frame_bad": 73,
+      "passed": 2
+    },
+    "skipped_current_only_action_samples": [
+      {
+        "frame_index": 53,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          1,
+          2,
+          3,
+          5,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 54,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          1,
+          2,
+          3
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 60,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          3,
+          4,
+          5,
+          6
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 64,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          4,
+          6,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 65,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          1,
+          3,
+          4,
+          6,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 66,
+        "attempt_index": 1,
+        "replace_obj_ids": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 69,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 71,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          1,
+          3,
+          4,
+          5,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 80,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 81,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          1,
+          3,
+          4,
+          5,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 82,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          5,
+          7
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      },
+      {
+        "frame_index": 83,
+        "attempt_index": 0,
+        "replace_obj_ids": [
+          1,
+          2,
+          5,
+          6
+        ],
+        "skipped": true,
+        "skip_reason": "all_selected_current"
+      }
+    ],
+    "neighbor_only_verification_failure_samples": [],
+    "center_frame_verification_failure_samples": [
+      {
+        "frame_index": 58,
+        "attempt_index": 1,
+        "bad_frame_indices": [
+          57,
+          58,
+          59
+        ]
+      },
+      {
+        "frame_index": 66,
+        "attempt_index": 0,
+        "bad_frame_indices": [
+          65,
+          66,
+          67
+        ]
+      },
+      {
+        "frame_index": 88,
+        "attempt_index": 0,
+        "bad_frame_indices": [
+          88,
+          89
+        ]
+      },
+      {
+        "frame_index": 90,
+        "attempt_index": 1,
+        "bad_frame_indices": [
+          89,
+          90,
+          91
+        ]
+      },
+      {
+        "frame_index": 102,
+        "attempt_index": 0,
+        "bad_frame_indices": [
+          101,
+          102,
+          103
+        ]
+      },
+      {
+        "frame_index": 102,
+        "attempt_index": 1,
+        "bad_frame_indices": [
+          101,
+          102,
+          103
+        ]
+      },
+      {
+        "frame_index": 107,
+        "attempt_index": 0,
+        "bad_frame_indices": [
+          106,
+          107,
+          108
+        ]
+      },
+      {
+        "frame_index": 107,
+        "attempt_index": 1,
+        "bad_frame_indices": [
+          106,
+          107,
+          108
+        ]
+      },
+      {
+        "frame_index": 117,
+        "attempt_index": 0,
+        "bad_frame_indices": [
+          116,
+          117,
+          118
+        ]
+      },
+      {
+        "frame_index": 117,
+        "attempt_index": 1,
+        "bad_frame_indices": [
+          116,
+          117,
+          118
+        ]
+      },
+      {
+        "frame_index": 118,
+        "attempt_index": 0,
+        "bad_frame_indices": [
+          117,
+          118,
+          119
+        ]
+      },
+      {
+        "frame_index": 118,
+        "attempt_index": 1,
+        "bad_frame_indices": [
+          117,
+          118,
+          119
+        ]
+      }
+    ],
+    "error_samples": []
+  }
+}

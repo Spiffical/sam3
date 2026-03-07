@@ -535,7 +535,7 @@ def write_frame_keep_drop_json(
     add_reason(hard_invalid_frame_indices, "hard_invalid_video")
     add_reason(postprop_bad_frame_indices, "postprop_bad")
     add_reason(repaired_frame_indices, "repaired")
-    add_reason(unresolved_frame_indices, "repair_unresolved")
+    add_reason(unresolved_frame_indices, "mask_issue_unresolved")
     add_reason(raw_video_invalid_frame_indices, "postprop_raw_video_invalid")
 
     invalid_set = set(int(x) for x in final_invalid_frame_indices)
@@ -621,6 +621,10 @@ def _summarize_postprop_repair_report(report: dict[str, Any]) -> dict[str, Any]:
         if row.get("verification_passed"):
             verification_outcomes["passed"] += 1
             continue
+        if row.get("raw_video_invalid"):
+            verification_outcomes["raw_video_invalid"] += 1
+        if row.get("unresolved_issue_ids"):
+            verification_outcomes["issue_unresolved"] += 1
         if row.get("center_frame_bad"):
             verification_outcomes["center_frame_bad"] += 1
             if len(center_failures) < 12:
@@ -629,6 +633,7 @@ def _summarize_postprop_repair_report(report: dict[str, Any]) -> dict[str, Any]:
                         "frame_index": row.get("frame_index"),
                         "attempt_index": row.get("attempt_index"),
                         "bad_frame_indices": row.get("bad_frame_indices", []),
+                        "unresolved_issue_ids": row.get("unresolved_issue_ids", []),
                     }
                 )
         else:
@@ -692,6 +697,12 @@ def write_codex_debug_report(output_dir: str, metrics: dict[str, Any]) -> str:
                 "postprop_repair_report_path", ""
             ),
             "frame_keep_drop_path": metrics.get("frame_keep_drop_path", ""),
+            "postprop_repair_visual_debug_dir": metrics.get(
+                "postprop_repair_visual_debug_dir", ""
+            ),
+            "postprop_repair_visual_debug_manifest_path": metrics.get(
+                "postprop_repair_visual_debug_manifest_path", ""
+            ),
         },
         "metrics_excerpt": {
             "hard_invalid_frame_count": metrics.get("hard_invalid_frame_count"),
@@ -703,6 +714,9 @@ def write_codex_debug_report(output_dir: str, metrics: dict[str, Any]) -> str:
             ),
             "postprop_repair_unresolved_frame_count": metrics.get(
                 "postprop_repair_unresolved_frame_count"
+            ),
+            "postprop_repair_mask_issue_frame_count": metrics.get(
+                "postprop_repair_mask_issue_frame_count"
             ),
             "invalid_frame_source_effective": metrics.get(
                 "invalid_frame_source_effective", ""
@@ -1971,8 +1985,17 @@ def run() -> int:
                     metrics["postprop_repair_unresolved_frame_count"] = len(
                         repair_report.get("unresolved_frame_indices", [])
                     )
+                    metrics["postprop_repair_mask_issue_frame_count"] = len(
+                        repair_report.get("mask_issue_frame_indices", [])
+                    )
                     metrics["postprop_repair_raw_video_invalid_frame_count"] = len(
                         repair_report.get("raw_video_invalid_frame_indices", [])
+                    )
+                    metrics["postprop_repair_visual_debug_dir"] = repair_report.get(
+                        "visual_debug_dir", ""
+                    )
+                    metrics["postprop_repair_visual_debug_manifest_path"] = repair_report.get(
+                        "visual_debug_manifest_path", ""
                     )
                     repaired_sample = repair_report.get("repaired_frame_indices", [])
                     unresolved_sample = repair_report.get(

@@ -465,6 +465,8 @@ for key in (
     "generated_prompts_path",
     "postprop_qa_report_path",
     "postprop_repair_report_path",
+    "postprop_repair_visual_debug_dir",
+    "postprop_repair_visual_debug_manifest_path",
     "frame_keep_drop_path",
     "codex_debug_report_path",
 ):
