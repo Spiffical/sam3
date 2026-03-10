@@ -1,0 +1,24 @@
+{
+  "video_path": "/home/sbialek/ONC/seatube-downloader/downloads/stationary2335_worms/dense_worms_unique_taxa_10s_valid/rank01_taxa001_ann001_AXISCAMACCC8E891285_20210707T220008.000Z_t00000.mp4",
+  "output_video_path": "/home/sbialek/ONC/sam3/output/overlay.mp4",
+  "prompt": "small creatures",
+  "device": "cuda",
+  "confidence_threshold": 0.4,
+  "min_score": 0.1,
+  "min_mask_area": 16,
+  "mask_alpha": 0.3,
+  "codec": "mp4v",
+  "fps": 30.0,
+  "frame_size_hw": [
+    768,
+    1024
+  ],
+  "requested_max_frames": 300,
+  "processed_frames": 300,
+  "frames_with_masks": 246,
+  "total_drawn_masks": 1373,
+  "avg_drawn_masks_per_frame": 4.576666666666667,
+  "runtime_sec": 352.06602787971497,
+  "throughput_fps": 0.8521128886155879,
+  "finished_at_local": "2026-03-09 16:04:14"
+}

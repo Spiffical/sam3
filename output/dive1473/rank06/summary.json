@@ -1,0 +1,24 @@
+{
+  "video_path": "/home/sbialek/ONC/seatube-downloader/downloads/dive1473_worms/dense_worms_unique_taxa_10s/rank06_taxa005_ann021_INSITEZEUSPLUS_DEEPDISCOVERER_20190706T210001.000Z-LOW_t00230.mp4",
+  "output_video_path": "/home/sbialek/ONC/sam3/output/dive1473/rank06/overlay.mp4",
+  "prompt": "small creatures",
+  "device": "cuda",
+  "confidence_threshold": 0.4,
+  "min_score": 0.1,
+  "min_mask_area": 16,
+  "mask_alpha": 0.3,
+  "codec": "mp4v",
+  "fps": 29.97002997002997,
+  "frame_size_hw": [
+    360,
+    640
+  ],
+  "requested_max_frames": 300,
+  "processed_frames": 300,
+  "frames_with_masks": 67,
+  "total_drawn_masks": 76,
+  "avg_drawn_masks_per_frame": 0.25333333333333335,
+  "runtime_sec": 350.06753039360046,
+  "throughput_fps": 0.8569775084901283,
+  "finished_at_local": "2026-03-09 16:38:48"
+}
