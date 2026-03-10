@@ -61,8 +61,8 @@ Slurm options:
   --cpus-per-task <n>                 Default: 16
   --mem <spec>                        Default: 128000M
   --time <hh:mm:ss>                   Default: 08:00:00
-  --output <path>                     Optional sbatch stdout path
-  --error <path>                      Optional sbatch stderr path
+  --output <path>                     Default: /scratch/$USER/sam3/logs/agent_every_frame/out/%x-%j.out
+  --error <path>                      Default: /scratch/$USER/sam3/logs/agent_every_frame/err/%x-%j.err
 
 Example:
   nibi_model_compare/submit_sam3_agent_every_frame.sh \
@@ -199,12 +199,14 @@ if [[ ! -f "$SBATCH_TEMPLATE" ]]; then
 fi
 
 if [[ -z "$output_path" ]]; then
-  output_path="/home/$USER/sam3/logs/%x-%j.out"
+  output_path="${SCRATCH:-/scratch/$USER}/sam3/logs/agent_every_frame/out/%x-%j.out"
 fi
 if [[ -z "$error_path" ]]; then
-  error_path="/home/$USER/sam3/logs/%x-%j.err"
+  error_path="${SCRATCH:-/scratch/$USER}/sam3/logs/agent_every_frame/err/%x-%j.err"
 fi
-mkdir -p "$(dirname "$output_path")" "$(dirname "$error_path")"
+if [[ "$dry_run" != "1" ]]; then
+  mkdir -p "$(dirname "$output_path")" "$(dirname "$error_path")"
+fi
 
 sbatch_cmd=(sbatch --parsable)
 [[ -n "$account" ]] && sbatch_cmd+=(--account "$account")

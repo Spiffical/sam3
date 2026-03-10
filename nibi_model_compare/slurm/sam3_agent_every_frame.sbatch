@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128000M
 #SBATCH --time=08:00:00
-#SBATCH --output=/home/%u/sam3/logs/%x-%j.out
-#SBATCH --error=/home/%u/sam3/logs/%x-%j.err
+#SBATCH --output=/scratch/%u/sam3/logs/agent_every_frame/out/%x-%j.out
+#SBATCH --error=/scratch/%u/sam3/logs/agent_every_frame/err/%x-%j.err
 
 set -euo pipefail
 
@@ -91,17 +91,11 @@ REPO_ROOT="${REPO_ROOT:-$PWD}"
 PROJECT_ROOT="${PROJECT_ROOT:-$REPO_ROOT}"
 ACCOUNT_NAME="${SLURM_JOB_ACCOUNT:-${SLURM_ACCOUNT:-${ACCOUNT:-}}}"
 if [[ -z "${DEFAULT_PROJECT_PREFIX:-}" ]]; then
-  if [[ -n "$ACCOUNT_NAME" ]]; then
-    DEFAULT_PROJECT_PREFIX="/project/${ACCOUNT_NAME}/$USER"
-  elif [[ -n "${VIDEO_PATH:-}" && "${VIDEO_PATH}" =~ ^/project/([^/]+)/ ]]; then
-    DEFAULT_PROJECT_PREFIX="/project/${BASH_REMATCH[1]}/$USER"
-  else
-    DEFAULT_PROJECT_PREFIX="/project/$USER/$USER"
-  fi
+  DEFAULT_PROJECT_PREFIX="${SCRATCH:-/scratch/$USER}/sam3"
 fi
 PROJECT_CACHE_ROOT="${PROJECT_CACHE_ROOT:-$DEFAULT_PROJECT_PREFIX/hf-cache}"
-LOG_ROOT="${LOG_ROOT:-/home/$USER/sam3/logs}"
-mkdir -p "$LOG_ROOT" "$PROJECT_ROOT" "$PROJECT_CACHE_ROOT"
+LOG_ROOT="${LOG_ROOT:-${SCRATCH:-/scratch/$USER}/sam3/logs/agent_every_frame}"
+mkdir -p "$LOG_ROOT/out" "$LOG_ROOT/err" "$PROJECT_ROOT" "$PROJECT_CACHE_ROOT"
 cd "$REPO_ROOT"
 
 ENV_FILE="${ENV_FILE:-$REPO_ROOT/.env}"
