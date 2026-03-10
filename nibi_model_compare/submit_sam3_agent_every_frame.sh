@@ -193,6 +193,21 @@ if [[ -z "$video_path" ]]; then
   exit 1
 fi
 
+if ! limit_mm_per_prompt="$(python3 - "$limit_mm_per_prompt" <<'PY'
+import json
+import sys
+
+value = sys.argv[1]
+try:
+    parsed = json.loads(value)
+except Exception as exc:
+    raise SystemExit(f"Invalid --limit-mm-per-prompt JSON: {value}\n{exc}")
+print(json.dumps(parsed, separators=(",", ":")))
+PY
+)"; then
+  exit 1
+fi
+
 if [[ ! -f "$SBATCH_TEMPLATE" ]]; then
   echo "Missing sbatch template: $SBATCH_TEMPLATE" >&2
   exit 1

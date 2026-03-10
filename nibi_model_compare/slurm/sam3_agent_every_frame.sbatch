@@ -113,7 +113,7 @@ if [[ -n "${HUGGINGFACE_HUB_TOKEN:-}" && -z "${HF_TOKEN:-}" ]]; then
   export HF_TOKEN="$HUGGINGFACE_HUB_TOKEN"
 fi
 
-module purge
+module --force purge
 module load StdEnv/2023
 module load python/3.11 cuda cudnn
 module load scipy-stack
@@ -187,6 +187,18 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-{\"image\":1,\"video\":0}}"
+LIMIT_MM_PER_PROMPT="$(python3 - "$LIMIT_MM_PER_PROMPT" <<'PY'
+import json
+import sys
+
+value = sys.argv[1]
+try:
+    parsed = json.loads(value)
+except Exception as exc:
+    raise SystemExit(f"Invalid LIMIT_MM_PER_PROMPT JSON: {value}\n{exc}")
+print(json.dumps(parsed, separators=(",", ":")))
+PY
+)"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-1024}"
 MAX_GENERATIONS="${MAX_GENERATIONS:-10}"
 DEBUG="${DEBUG:-0}"
@@ -222,6 +234,20 @@ if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
   if [[ -n "${SLURM_TMPDIR:-}" ]]; then
     APPTAINER_BINDPATH="${APPTAINER_BINDPATH},${SLURM_TMPDIR}:${SLURM_TMPDIR}"
   fi
+  APPTAINER_BINDPATH="$(python3 - "$APPTAINER_BINDPATH" <<'PY'
+import sys
+
+seen = set()
+parts = []
+for raw in sys.argv[1].split(","):
+    item = raw.strip()
+    if not item or item in seen:
+        continue
+    seen.add(item)
+    parts.append(item)
+print(",".join(parts))
+PY
+)"
   mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR" "$APPTAINER_HOME"
   if [[ ! -f "$APPTAINER_IMAGE" ]]; then
     echo "Apptainer image missing; pulling: $APPTAINER_IMAGE"
@@ -240,7 +266,6 @@ if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
   export APPTAINERENV_TRITON_CACHE_DIR="$TRITON_CACHE_DIR"
   export APPTAINERENV_TORCHINDUCTOR_CACHE_DIR="$TORCHINDUCTOR_CACHE_DIR"
   export APPTAINERENV_NUMBA_CACHE_DIR="$NUMBA_CACHE_DIR"
-  export APPTAINERENV_TRANSFORMERS_CACHE="$HF_HUB_CACHE"
   export APPTAINERENV_HF_HUB_DISABLE_XET="$HF_HUB_DISABLE_XET"
   export APPTAINERENV_REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
   export APPTAINERENV_CURL_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
@@ -287,7 +312,7 @@ fi
 VLLM_PID=$!
 
 cleanup() {
-  kill "$VLLM_PID" || true
+  kill "$VLLM_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
