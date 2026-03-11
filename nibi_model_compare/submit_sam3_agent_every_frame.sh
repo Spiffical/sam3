@@ -208,6 +208,16 @@ PY
   exit 1
 fi
 
+if ! limit_mm_per_prompt_b64="$(python3 - "$limit_mm_per_prompt" <<'PY'
+import base64
+import sys
+
+print(base64.b64encode(sys.argv[1].encode("utf-8")).decode("ascii"))
+PY
+)"; then
+  exit 1
+fi
+
 if [[ ! -f "$SBATCH_TEMPLATE" ]]; then
   echo "Missing sbatch template: $SBATCH_TEMPLATE" >&2
   exit 1
@@ -224,6 +234,7 @@ if [[ "$dry_run" != "1" ]]; then
 fi
 
 sbatch_cmd=(sbatch --parsable)
+[[ -n "$limit_mm_per_prompt_b64" ]] && sbatch_cmd+=(--export "ALL,SUBMITTED_LIMIT_MM_PER_PROMPT_B64=$limit_mm_per_prompt_b64")
 [[ -n "$account" ]] && sbatch_cmd+=(--account "$account")
 [[ -n "$partition" ]] && sbatch_cmd+=(--partition "$partition")
 [[ -n "$gpus_per_node" ]] && sbatch_cmd+=(--gpus-per-node "$gpus_per_node")
@@ -252,6 +263,7 @@ env_vars=(
   "MAX_NUM_SEQS=$max_num_seqs"
   "GPU_MEMORY_UTILIZATION=$gpu_memory_utilization"
   "SUBMITTED_LIMIT_MM_PER_PROMPT=$limit_mm_per_prompt"
+  "SUBMITTED_LIMIT_MM_PER_PROMPT_B64=$limit_mm_per_prompt_b64"
   "VLLM_RUNTIME=$vllm_runtime"
   "APPTAINER_IMAGE=$apptainer_image"
   "VLLM_CUDA_VISIBLE_DEVICES=$vllm_cuda_visible_devices"

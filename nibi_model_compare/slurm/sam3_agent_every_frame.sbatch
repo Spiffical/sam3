@@ -186,7 +186,21 @@ TP_SIZE="${TP_SIZE:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
-LIMIT_MM_PER_PROMPT="${SUBMITTED_LIMIT_MM_PER_PROMPT:-${LIMIT_MM_PER_PROMPT:-{\"image\":1,\"video\":0}}}"
+if [[ -n "${SUBMITTED_LIMIT_MM_PER_PROMPT_B64:-}" ]]; then
+  LIMIT_MM_PER_PROMPT="$(python3 - "$SUBMITTED_LIMIT_MM_PER_PROMPT_B64" <<'PY'
+import base64
+import sys
+
+value = sys.argv[1]
+try:
+    print(base64.b64decode(value).decode("utf-8"))
+except Exception as exc:
+    raise SystemExit(f"Invalid SUBMITTED_LIMIT_MM_PER_PROMPT_B64: {exc}")
+PY
+)"
+else
+  LIMIT_MM_PER_PROMPT="${SUBMITTED_LIMIT_MM_PER_PROMPT:-${LIMIT_MM_PER_PROMPT:-{\"image\":1,\"video\":0}}}"
+fi
 LIMIT_MM_PER_PROMPT="$(python3 - "$LIMIT_MM_PER_PROMPT" <<'PY'
 import json
 import sys
