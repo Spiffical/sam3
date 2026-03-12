@@ -35,7 +35,7 @@ LLM/vLLM options:
   --max-model-len <n>                 Default: 16384
   --max-num-seqs <n>                  Default: 1
   --gpu-memory-utilization <f>        Default: 0.90
-  --limit-mm-per-prompt <json>        Default: {"image":1,"video":0}
+  --limit-mm-per-prompt <json>        Default: {"image":3,"video":0}
   --vllm-runtime <auto|venv|apptainer> Default: auto
   --apptainer-image <path>            Optional SIF path
   --vllm-cuda-visible-devices <ids>   Default: 0
@@ -83,7 +83,7 @@ Example:
     --max-model-len 16384 \
     --max-num-seqs 1 \
     --gpu-memory-utilization 0.90 \
-    --limit-mm-per-prompt '{"image":1,"video":0}' \
+    --limit-mm-per-prompt '{"image":3,"video":0}' \
     --video-path /project/rpp-kmoran/$USER/data/onc/input.mp4 \
     --prompt "small creatures" \
     --prompt-profile underwater \
@@ -111,7 +111,7 @@ tp_size="1"
 max_model_len="16384"
 max_num_seqs="1"
 gpu_memory_utilization="0.90"
-limit_mm_per_prompt='{"image":1,"video":0}'
+limit_mm_per_prompt='{"image":3,"video":0}'
 vllm_runtime="auto"
 apptainer_image=""
 vllm_cuda_visible_devices="0"
