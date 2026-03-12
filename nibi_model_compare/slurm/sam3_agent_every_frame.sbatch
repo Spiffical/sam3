@@ -215,11 +215,26 @@ PY
 )"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-1024}"
 MAX_GENERATIONS="${MAX_GENERATIONS:-10}"
+IMAGE_DETAIL="${IMAGE_DETAIL:-high}"
+MAX_IMAGES_PER_REQUEST="${MAX_IMAGES_PER_REQUEST:-3}"
+AGENT_IMAGE_MAX_EDGE="${AGENT_IMAGE_MAX_EDGE:-768}"
+AGENT_IMAGE_MIN_EDGE="${AGENT_IMAGE_MIN_EDGE:-384}"
 DEBUG="${DEBUG:-0}"
 KEEP_ARTIFACTS="${KEEP_ARTIFACTS:-0}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-1}"
-export SAM3_MAX_IMAGES_PER_REQUEST="${SAM3_MAX_IMAGES_PER_REQUEST:-3}"
-export SAM3_AGENT_IMAGE_MAX_EDGE="${SAM3_AGENT_IMAGE_MAX_EDGE:-512}"
+SKIP_INVALID_FRAMES="${SKIP_INVALID_FRAMES:-0}"
+INVALID_FRAME_SOURCE="${INVALID_FRAME_SOURCE:-mllm}"
+MLLM_INVALID_WINDOW_SIZE="${MLLM_INVALID_WINDOW_SIZE:-8}"
+MLLM_INVALID_WINDOW_STRIDE="${MLLM_INVALID_WINDOW_STRIDE:-8}"
+MLLM_INVALID_MAX_COMPLETION_TOKENS="${MLLM_INVALID_MAX_COMPLETION_TOKENS:-1024}"
+MLLM_INVALID_PROMPT_PATH="${MLLM_INVALID_PROMPT_PATH:-}"
+MLLM_INVALID_MAX_JSON_RETRIES="${MLLM_INVALID_MAX_JSON_RETRIES:-2}"
+MLLM_INVALID_COLLAGE_COLS="${MLLM_INVALID_COLLAGE_COLS:-2}"
+MLLM_INVALID_COLLAGE_TILE_MAX_EDGE="${MLLM_INVALID_COLLAGE_TILE_MAX_EDGE:-768}"
+INVALID_FRAME_BLACK_MEAN_THRESHOLD="${INVALID_FRAME_BLACK_MEAN_THRESHOLD:-8.0}"
+INVALID_FRAME_WHITE_MEAN_THRESHOLD="${INVALID_FRAME_WHITE_MEAN_THRESHOLD:-247.0}"
+INVALID_FRAME_LOW_STD_THRESHOLD="${INVALID_FRAME_LOW_STD_THRESHOLD:-2.5}"
+INVALID_FRAME_LOW_ENTROPY_THRESHOLD="${INVALID_FRAME_LOW_ENTROPY_THRESHOLD:-0.08}"
 MAX_FRAMES="${MAX_FRAMES:-}"
 DEVICE="${DEVICE:-cuda}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
@@ -364,7 +379,50 @@ RUN_CMD=(
   --device "$DEVICE"
   --max-generations "$MAX_GENERATIONS"
   --max-completion-tokens "$MAX_COMPLETION_TOKENS"
+  --image-detail "$IMAGE_DETAIL"
+  --max-images-per-request "$MAX_IMAGES_PER_REQUEST"
+  --agent-image-max-edge "$AGENT_IMAGE_MAX_EDGE"
+  --agent-image-min-edge "$AGENT_IMAGE_MIN_EDGE"
 )
+if [[ "$SKIP_INVALID_FRAMES" == "1" ]]; then
+  RUN_CMD+=(--skip-invalid-frames)
+fi
+if [[ -n "$INVALID_FRAME_SOURCE" ]]; then
+  RUN_CMD+=(--invalid-frame-source "$INVALID_FRAME_SOURCE")
+fi
+if [[ -n "$MLLM_INVALID_WINDOW_SIZE" ]]; then
+  RUN_CMD+=(--mllm-invalid-window-size "$MLLM_INVALID_WINDOW_SIZE")
+fi
+if [[ -n "$MLLM_INVALID_WINDOW_STRIDE" ]]; then
+  RUN_CMD+=(--mllm-invalid-window-stride "$MLLM_INVALID_WINDOW_STRIDE")
+fi
+if [[ -n "$MLLM_INVALID_MAX_COMPLETION_TOKENS" ]]; then
+  RUN_CMD+=(--mllm-invalid-max-completion-tokens "$MLLM_INVALID_MAX_COMPLETION_TOKENS")
+fi
+if [[ -n "$MLLM_INVALID_PROMPT_PATH" ]]; then
+  RUN_CMD+=(--mllm-invalid-prompt-path "$MLLM_INVALID_PROMPT_PATH")
+fi
+if [[ -n "$MLLM_INVALID_MAX_JSON_RETRIES" ]]; then
+  RUN_CMD+=(--mllm-invalid-max-json-retries "$MLLM_INVALID_MAX_JSON_RETRIES")
+fi
+if [[ -n "$MLLM_INVALID_COLLAGE_COLS" ]]; then
+  RUN_CMD+=(--mllm-invalid-collage-cols "$MLLM_INVALID_COLLAGE_COLS")
+fi
+if [[ -n "$MLLM_INVALID_COLLAGE_TILE_MAX_EDGE" ]]; then
+  RUN_CMD+=(--mllm-invalid-collage-tile-max-edge "$MLLM_INVALID_COLLAGE_TILE_MAX_EDGE")
+fi
+if [[ -n "$INVALID_FRAME_BLACK_MEAN_THRESHOLD" ]]; then
+  RUN_CMD+=(--invalid-frame-black-mean-threshold "$INVALID_FRAME_BLACK_MEAN_THRESHOLD")
+fi
+if [[ -n "$INVALID_FRAME_WHITE_MEAN_THRESHOLD" ]]; then
+  RUN_CMD+=(--invalid-frame-white-mean-threshold "$INVALID_FRAME_WHITE_MEAN_THRESHOLD")
+fi
+if [[ -n "$INVALID_FRAME_LOW_STD_THRESHOLD" ]]; then
+  RUN_CMD+=(--invalid-frame-low-std-threshold "$INVALID_FRAME_LOW_STD_THRESHOLD")
+fi
+if [[ -n "$INVALID_FRAME_LOW_ENTROPY_THRESHOLD" ]]; then
+  RUN_CMD+=(--invalid-frame-low-entropy-threshold "$INVALID_FRAME_LOW_ENTROPY_THRESHOLD")
+fi
 if [[ "$CONTINUE_ON_ERROR" == "1" ]]; then
   RUN_CMD+=(--continue-on-error)
 fi
@@ -414,6 +472,7 @@ for key in (
     "output_video_path",
     "summary_path",
     "frame_results_path",
+    "invalid_frame_report_path",
     "frame_inputs_dir",
     "frame_artifacts_dir",
 ):
@@ -451,6 +510,7 @@ cat > "$OUT_ROOT/README.md" <<EOF
 Files to review first:
 - ${FINAL_OUT}/summary.json
 - ${FINAL_OUT}/frame_results.jsonl
+- ${FINAL_OUT}/frame_validity/invalid_frame_report.json
 - ${FINAL_OUT}/overlay.mp4
 EOF
 

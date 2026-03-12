@@ -46,10 +46,27 @@ Runner options:
   --device <cuda|cpu>                 Default: cuda
   --max-generations <n>               Default: 10
   --max-completion-tokens <n>         Default: 1024
+  --image-detail <low|high>           Default: high
+  --max-images-per-request <n>        Default: 3
+  --agent-image-max-edge <n>          Default: 768
+  --agent-image-min-edge <n>          Default: 384
   --max-frames <n>                    Optional frame cap
   --checkpoint-path <path>            Optional local SAM3 checkpoint
   --system-prompt-path <path>         Optional override for base system prompt
   --iterative-system-prompt-path <path> Optional override for iterative system prompt
+  --skip-invalid-frames               Run corrupt-frame pre-pass and skip those frames
+  --invalid-frame-source <mode>       heuristic|mllm|hybrid (default: mllm)
+  --mllm-invalid-window-size <n>      Default: 8
+  --mllm-invalid-window-stride <n>    Default: 8
+  --mllm-invalid-max-completion-tokens <n> Default: 1024
+  --mllm-invalid-prompt-path <path>   Optional override prompt for corrupt-frame scan
+  --mllm-invalid-max-json-retries <n> Default: 2
+  --mllm-invalid-collage-cols <n>     Default: 2
+  --mllm-invalid-collage-tile-max-edge <n> Default: 768
+  --invalid-frame-black-mean-threshold <f> Default: 8.0
+  --invalid-frame-white-mean-threshold <f> Default: 247.0
+  --invalid-frame-low-std-threshold <f> Default: 2.5
+  --invalid-frame-low-entropy-threshold <f> Default: 0.08
   --debug                             Keep full per-frame agent debug artifacts
   --keep-artifacts                    Preserve per-frame images and agent folders
   --continue-on-error                 Continue on frame-level agent errors (default)
@@ -84,11 +101,20 @@ Example:
     --max-num-seqs 1 \
     --gpu-memory-utilization 0.90 \
     --limit-mm-per-prompt '{"image":3,"video":0}' \
+    --image-detail high \
+    --max-images-per-request 3 \
+    --agent-image-max-edge 768 \
+    --agent-image-min-edge 384 \
     --video-path /project/rpp-kmoran/$USER/data/onc/input.mp4 \
     --prompt "small creatures" \
     --prompt-profile underwater \
     --max-generations 10 \
     --max-completion-tokens 1024 \
+    --skip-invalid-frames \
+    --invalid-frame-source mllm \
+    --mllm-invalid-window-size 8 \
+    --mllm-invalid-window-stride 8 \
+    --mllm-invalid-max-completion-tokens 1024 \
     --continue-on-error
 EOF
 }
@@ -121,10 +147,27 @@ runner_gpu_ids="0"
 device="cuda"
 max_generations="10"
 max_completion_tokens="1024"
+image_detail="high"
+max_images_per_request="3"
+agent_image_max_edge="768"
+agent_image_min_edge="384"
 max_frames=""
 checkpoint_path=""
 system_prompt_path=""
 iterative_system_prompt_path=""
+skip_invalid_frames=0
+invalid_frame_source="mllm"
+mllm_invalid_window_size="8"
+mllm_invalid_window_stride="8"
+mllm_invalid_max_completion_tokens="1024"
+mllm_invalid_prompt_path=""
+mllm_invalid_max_json_retries="2"
+mllm_invalid_collage_cols="2"
+mllm_invalid_collage_tile_max_edge="768"
+invalid_frame_black_mean_threshold="8.0"
+invalid_frame_white_mean_threshold="247.0"
+invalid_frame_low_std_threshold="2.5"
+invalid_frame_low_entropy_threshold="0.08"
 debug=0
 keep_artifacts=0
 continue_on_error=1
@@ -166,10 +209,27 @@ while [[ $# -gt 0 ]]; do
     --device) device="$2"; shift 2 ;;
     --max-generations) max_generations="$2"; shift 2 ;;
     --max-completion-tokens) max_completion_tokens="$2"; shift 2 ;;
+    --image-detail) image_detail="$2"; shift 2 ;;
+    --max-images-per-request) max_images_per_request="$2"; shift 2 ;;
+    --agent-image-max-edge) agent_image_max_edge="$2"; shift 2 ;;
+    --agent-image-min-edge) agent_image_min_edge="$2"; shift 2 ;;
     --max-frames) max_frames="$2"; shift 2 ;;
     --checkpoint-path) checkpoint_path="$2"; shift 2 ;;
     --system-prompt-path) system_prompt_path="$2"; shift 2 ;;
     --iterative-system-prompt-path) iterative_system_prompt_path="$2"; shift 2 ;;
+    --skip-invalid-frames) skip_invalid_frames=1; shift ;;
+    --invalid-frame-source) invalid_frame_source="$2"; shift 2 ;;
+    --mllm-invalid-window-size) mllm_invalid_window_size="$2"; shift 2 ;;
+    --mllm-invalid-window-stride) mllm_invalid_window_stride="$2"; shift 2 ;;
+    --mllm-invalid-max-completion-tokens) mllm_invalid_max_completion_tokens="$2"; shift 2 ;;
+    --mllm-invalid-prompt-path) mllm_invalid_prompt_path="$2"; shift 2 ;;
+    --mllm-invalid-max-json-retries) mllm_invalid_max_json_retries="$2"; shift 2 ;;
+    --mllm-invalid-collage-cols) mllm_invalid_collage_cols="$2"; shift 2 ;;
+    --mllm-invalid-collage-tile-max-edge) mllm_invalid_collage_tile_max_edge="$2"; shift 2 ;;
+    --invalid-frame-black-mean-threshold) invalid_frame_black_mean_threshold="$2"; shift 2 ;;
+    --invalid-frame-white-mean-threshold) invalid_frame_white_mean_threshold="$2"; shift 2 ;;
+    --invalid-frame-low-std-threshold) invalid_frame_low_std_threshold="$2"; shift 2 ;;
+    --invalid-frame-low-entropy-threshold) invalid_frame_low_entropy_threshold="$2"; shift 2 ;;
     --debug) debug=1; shift ;;
     --keep-artifacts) keep_artifacts=1; shift ;;
     --continue-on-error) continue_on_error=1; shift ;;
@@ -272,6 +332,23 @@ env_vars=(
   "DEVICE=$device"
   "MAX_GENERATIONS=$max_generations"
   "MAX_COMPLETION_TOKENS=$max_completion_tokens"
+  "IMAGE_DETAIL=$image_detail"
+  "MAX_IMAGES_PER_REQUEST=$max_images_per_request"
+  "AGENT_IMAGE_MAX_EDGE=$agent_image_max_edge"
+  "AGENT_IMAGE_MIN_EDGE=$agent_image_min_edge"
+  "SKIP_INVALID_FRAMES=$skip_invalid_frames"
+  "INVALID_FRAME_SOURCE=$invalid_frame_source"
+  "MLLM_INVALID_WINDOW_SIZE=$mllm_invalid_window_size"
+  "MLLM_INVALID_WINDOW_STRIDE=$mllm_invalid_window_stride"
+  "MLLM_INVALID_MAX_COMPLETION_TOKENS=$mllm_invalid_max_completion_tokens"
+  "MLLM_INVALID_PROMPT_PATH=$mllm_invalid_prompt_path"
+  "MLLM_INVALID_MAX_JSON_RETRIES=$mllm_invalid_max_json_retries"
+  "MLLM_INVALID_COLLAGE_COLS=$mllm_invalid_collage_cols"
+  "MLLM_INVALID_COLLAGE_TILE_MAX_EDGE=$mllm_invalid_collage_tile_max_edge"
+  "INVALID_FRAME_BLACK_MEAN_THRESHOLD=$invalid_frame_black_mean_threshold"
+  "INVALID_FRAME_WHITE_MEAN_THRESHOLD=$invalid_frame_white_mean_threshold"
+  "INVALID_FRAME_LOW_STD_THRESHOLD=$invalid_frame_low_std_threshold"
+  "INVALID_FRAME_LOW_ENTROPY_THRESHOLD=$invalid_frame_low_entropy_threshold"
   "DEBUG=$debug"
   "KEEP_ARTIFACTS=$keep_artifacts"
   "CONTINUE_ON_ERROR=$continue_on_error"

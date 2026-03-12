@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import shutil
+import sys
 import time
 from functools import partial
 from pathlib import Path
@@ -33,6 +34,9 @@ send_generate_request_orig = None
 sam3_inference = None
 remove_overlapping_masks = None
 visualize = None
+analyze_frame_quality = None
+scan_video_frame_quality = None
+discover_invalid_frames_with_mllm = None
 
 
 def ensure_runtime_deps() -> None:
@@ -40,6 +44,8 @@ def ensure_runtime_deps() -> None:
     global Sam3Processor, build_sam3_image_model
     global agent_inference, send_generate_request_orig
     global sam3_inference, remove_overlapping_masks, visualize
+    global analyze_frame_quality, scan_video_frame_quality
+    global discover_invalid_frames_with_mllm
     if cv2 is not None and np is not None and Image is not None and torch is not None:
         return
 
@@ -65,6 +71,12 @@ def ensure_runtime_deps() -> None:
     except ImportError:
         missing.append("pillow")
     try:
+        repo_root_str = str(REPO_ROOT)
+        nibi_root_str = str(REPO_ROOT / "nibi_model_compare")
+        if repo_root_str not in sys.path:
+            sys.path.insert(0, repo_root_str)
+        if nibi_root_str not in sys.path:
+            sys.path.insert(0, nibi_root_str)
         from sam3.model.sam3_image_processor import Sam3Processor as _Sam3Processor
         from sam3.model_builder import (
             build_sam3_image_model as _build_sam3_image_model,
@@ -78,6 +90,13 @@ def ensure_runtime_deps() -> None:
             sam3_inference as _sam3_inference,
         )
         from sam3.agent.viz import visualize as _visualize
+        from frame_quality import (
+            analyze_frame_quality as _analyze_frame_quality,
+            scan_video_frame_quality as _scan_video_frame_quality,
+        )
+        from frame_quality_mllm import (
+            discover_invalid_frames_with_mllm as _discover_invalid_frames_with_mllm,
+        )
     except ImportError as exc:
         missing.append(str(exc))
     else:
@@ -88,6 +107,9 @@ def ensure_runtime_deps() -> None:
         remove_overlapping_masks = _remove_overlapping_masks
         sam3_inference = _sam3_inference
         visualize = _visualize
+        analyze_frame_quality = _analyze_frame_quality
+        scan_video_frame_quality = _scan_video_frame_quality
+        discover_invalid_frames_with_mllm = _discover_invalid_frames_with_mllm
 
     if missing:
         raise RuntimeError(
@@ -230,6 +252,30 @@ def parse_args() -> argparse.Namespace:
         help="Maximum agent generations per frame. Default: 10",
     )
     parser.add_argument(
+        "--image-detail",
+        choices=["low", "high"],
+        default=os.environ.get("SAM3_IMAGE_DETAIL", "high"),
+        help="Multimodal image detail setting for MLLM requests. Default: high",
+    )
+    parser.add_argument(
+        "--max-images-per-request",
+        type=int,
+        default=int(os.environ.get("SAM3_MAX_IMAGES_PER_REQUEST", "3")),
+        help="Maximum number of images to keep in one MLLM request. Default: 3",
+    )
+    parser.add_argument(
+        "--agent-image-max-edge",
+        type=int,
+        default=int(os.environ.get("SAM3_AGENT_IMAGE_MAX_EDGE", "768")),
+        help="Maximum image edge for MLLM requests before downscaling. Default: 768",
+    )
+    parser.add_argument(
+        "--agent-image-min-edge",
+        type=int,
+        default=int(os.environ.get("SAM3_AGENT_IMAGE_MIN_EDGE", "384")),
+        help="Minimum image edge to back off to on context overflow. Default: 384",
+    )
+    parser.add_argument(
         "--output-dir",
         default="",
         help="Output directory. Default: <video_stem>_sam3_agent_every_frame",
@@ -306,7 +352,189 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional override for the iterative mask-checking system prompt.",
     )
+    parser.add_argument(
+        "--skip-invalid-frames",
+        action="store_true",
+        help=(
+            "Run a pre-pass invalid/corrupt-frame scan and skip those frames during "
+            "agent analysis."
+        ),
+    )
+    parser.add_argument(
+        "--invalid-frame-source",
+        choices=["heuristic", "mllm", "hybrid"],
+        default="mllm",
+        help="Source for corrupt-frame detection when --skip-invalid-frames is set. Default: mllm",
+    )
+    parser.add_argument(
+        "--invalid-frame-black-mean-threshold",
+        type=float,
+        default=8.0,
+        help="Heuristic invalid-frame black mean threshold. Default: 8.0",
+    )
+    parser.add_argument(
+        "--invalid-frame-white-mean-threshold",
+        type=float,
+        default=247.0,
+        help="Heuristic invalid-frame white mean threshold. Default: 247.0",
+    )
+    parser.add_argument(
+        "--invalid-frame-low-std-threshold",
+        type=float,
+        default=2.5,
+        help="Heuristic invalid-frame low-std threshold. Default: 2.5",
+    )
+    parser.add_argument(
+        "--invalid-frame-low-entropy-threshold",
+        type=float,
+        default=0.08,
+        help="Heuristic invalid-frame low-entropy threshold. Default: 0.08",
+    )
+    parser.add_argument(
+        "--mllm-invalid-window-size",
+        type=int,
+        default=8,
+        help="Frame-validity MLLM window size. Default: 8",
+    )
+    parser.add_argument(
+        "--mllm-invalid-window-stride",
+        type=int,
+        default=8,
+        help="Frame-validity MLLM window stride. Default: 8",
+    )
+    parser.add_argument(
+        "--mllm-invalid-max-completion-tokens",
+        type=int,
+        default=1024,
+        help="Max completion tokens for invalid-frame MLLM pass. Default: 1024",
+    )
+    parser.add_argument(
+        "--mllm-invalid-prompt-path",
+        default="",
+        help="Optional system prompt override for invalid-frame MLLM classification.",
+    )
+    parser.add_argument(
+        "--mllm-invalid-max-json-retries",
+        type=int,
+        default=2,
+        help="Maximum JSON repair retries for invalid-frame MLLM classification. Default: 2",
+    )
+    parser.add_argument(
+        "--mllm-invalid-collage-cols",
+        type=int,
+        default=2,
+        help="Number of collage columns for invalid-frame MLLM pass. Default: 2",
+    )
+    parser.add_argument(
+        "--mllm-invalid-collage-tile-max-edge",
+        type=int,
+        default=768,
+        help="Collage tile max edge for invalid-frame MLLM pass. Default: 768",
+    )
     return parser.parse_args()
+
+
+def discover_invalid_frames_for_agent_loop(
+    *,
+    args: argparse.Namespace,
+    video_path: str,
+    total_frames: int,
+    output_dir: str,
+    send_generate_request_fn: Any,
+) -> tuple[set[int], dict[str, Any], str]:
+    frame_validity_dir = os.path.join(output_dir, "frame_validity")
+    os.makedirs(frame_validity_dir, exist_ok=True)
+
+    heuristic_report: dict[str, Any] | None = None
+    mllm_report: dict[str, Any] | None = None
+
+    if args.invalid_frame_source in {"heuristic", "hybrid"}:
+        heuristic_report = scan_video_frame_quality(
+            video_path,
+            black_mean_threshold=float(args.invalid_frame_black_mean_threshold),
+            white_mean_threshold=float(args.invalid_frame_white_mean_threshold),
+            low_std_threshold=float(args.invalid_frame_low_std_threshold),
+            low_entropy_threshold=float(args.invalid_frame_low_entropy_threshold),
+        )
+
+    if args.invalid_frame_source in {"mllm", "hybrid"}:
+        mllm_send_req = partial(
+            send_generate_request_fn,
+            max_tokens=int(args.mllm_invalid_max_completion_tokens),
+        )
+        mllm_report = discover_invalid_frames_with_mllm(
+            video_path=video_path,
+            send_generate_request_fn=mllm_send_req,
+            initial_text_prompt=args.prompt,
+            total_frames=int(total_frames),
+            output_dir=frame_validity_dir,
+            window_size=int(args.mllm_invalid_window_size),
+            window_stride=int(args.mllm_invalid_window_stride),
+            use_collage=True,
+            collage_cols=int(args.mllm_invalid_collage_cols),
+            collage_tile_max_edge=int(args.mllm_invalid_collage_tile_max_edge),
+            prompt_profile=str(args.prompt_profile),
+            prompt_template_path=(
+                str(Path(args.mllm_invalid_prompt_path).resolve())
+                if args.mllm_invalid_prompt_path
+                else None
+            ),
+            max_json_retries=int(args.mllm_invalid_max_json_retries),
+            fill_missing_with_heuristic=True,
+        )
+
+    heuristic_invalid = (
+        set(int(x) for x in heuristic_report.get("invalid_frame_indices", []))
+        if heuristic_report
+        else set()
+    )
+    mllm_invalid = (
+        set(int(x) for x in mllm_report.get("invalid_frame_indices", []))
+        if mllm_report
+        else set()
+    )
+
+    if args.invalid_frame_source == "heuristic":
+        invalid_frames = heuristic_invalid
+    elif args.invalid_frame_source == "mllm":
+        invalid_frames = mllm_invalid
+    else:
+        invalid_frames = heuristic_invalid | mllm_invalid
+
+    report = {
+        "enabled": True,
+        "mode": str(args.invalid_frame_source),
+        "invalid_frame_indices": sorted(invalid_frames),
+        "invalid_frame_count": len(invalid_frames),
+        "invalid_frame_ratio": (
+            len(invalid_frames) / float(max(1, int(total_frames)))
+        ),
+        "heuristic_invalid_frame_indices": sorted(heuristic_invalid),
+        "mllm_invalid_frame_indices": sorted(mllm_invalid),
+        "heuristic_report": heuristic_report,
+        "mllm_report": mllm_report,
+        "config": {
+            "black_mean_threshold": float(args.invalid_frame_black_mean_threshold),
+            "white_mean_threshold": float(args.invalid_frame_white_mean_threshold),
+            "low_std_threshold": float(args.invalid_frame_low_std_threshold),
+            "low_entropy_threshold": float(args.invalid_frame_low_entropy_threshold),
+            "mllm_window_size": int(args.mllm_invalid_window_size),
+            "mllm_window_stride": int(args.mllm_invalid_window_stride),
+            "mllm_max_completion_tokens": int(
+                args.mllm_invalid_max_completion_tokens
+            ),
+            "mllm_max_json_retries": int(args.mllm_invalid_max_json_retries),
+            "mllm_collage_cols": int(args.mllm_invalid_collage_cols),
+            "mllm_collage_tile_max_edge": int(
+                args.mllm_invalid_collage_tile_max_edge
+            ),
+        },
+    }
+    report_path = os.path.join(frame_validity_dir, "invalid_frame_report.json")
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+    return invalid_frames, report, report_path
 
 
 def make_output_paths(args: argparse.Namespace) -> tuple[str, str, str]:
@@ -447,6 +675,16 @@ def main() -> int:
         raise FileNotFoundError(f"Video does not exist: {video_path}")
 
     os.environ["SAM3_AGENT_PROMPT_PROFILE"] = str(args.prompt_profile)
+    os.environ["SAM3_IMAGE_DETAIL"] = str(args.image_detail)
+    os.environ["SAM3_MAX_IMAGES_PER_REQUEST"] = str(
+        max(1, int(args.max_images_per_request))
+    )
+    os.environ["SAM3_AGENT_IMAGE_MAX_EDGE"] = str(
+        max(128, int(args.agent_image_max_edge))
+    )
+    os.environ["SAM3_AGENT_IMAGE_MIN_EDGE"] = str(
+        max(128, int(args.agent_image_min_edge))
+    )
     if args.system_prompt_path:
         os.environ["SAM3_SYSTEM_PROMPT_PATH"] = str(
             Path(args.system_prompt_path).resolve()
@@ -454,6 +692,61 @@ def main() -> int:
     if args.iterative_system_prompt_path:
         os.environ["SAM3_ITERATIVE_SYSTEM_PROMPT_PATH"] = str(
             Path(args.iterative_system_prompt_path).resolve()
+        )
+
+    api_key = (
+        args.api_key
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("VLLM_API_KEY")
+        or "DUMMY_API_KEY"
+    )
+    send_req_base = partial(
+        send_generate_request_orig,
+        server_url=args.server_url,
+        model=args.model,
+        api_key=api_key,
+    )
+    send_req = partial(send_req_base, max_tokens=int(args.max_completion_tokens))
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    max_frames = int(args.max_frames) if int(args.max_frames) > 0 else total_frames
+    if max_frames <= 0:
+        raise RuntimeError("Video appears to contain no frames.")
+    cap.release()
+
+    invalid_frame_set: set[int] = set()
+    invalid_frame_report: dict[str, Any] = {
+        "enabled": False,
+        "mode": "",
+        "invalid_frame_indices": [],
+        "invalid_frame_count": 0,
+        "invalid_frame_ratio": 0.0,
+    }
+    invalid_frame_report_path = ""
+    if args.skip_invalid_frames:
+        log(
+            "Running pre-pass invalid/corrupt-frame scan "
+            f"with source={args.invalid_frame_source!r}..."
+        )
+        invalid_frame_set, invalid_frame_report, invalid_frame_report_path = (
+            discover_invalid_frames_for_agent_loop(
+                args=args,
+                video_path=video_path,
+                total_frames=max_frames,
+                output_dir=output_dir,
+                send_generate_request_fn=send_req_base,
+            )
+        )
+        log(
+            "Corrupt-frame scan complete. "
+            f"Skipping {len(invalid_frame_set)} frame(s) during agent analysis."
         )
 
     log("Building SAM3 image model for the local tool loop...")
@@ -469,31 +762,9 @@ def main() -> int:
     )
     local_service = LocalSam3Service(image_processor)
 
-    api_key = (
-        args.api_key
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("VLLM_API_KEY")
-        or "DUMMY_API_KEY"
-    )
-    send_req = partial(
-        send_generate_request_orig,
-        server_url=args.server_url,
-        model=args.model,
-        api_key=api_key,
-        max_tokens=int(args.max_completion_tokens),
-    )
-
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    max_frames = int(args.max_frames) if int(args.max_frames) > 0 else total_frames
-    if max_frames <= 0:
-        raise RuntimeError("Video appears to contain no frames.")
 
     writer = cv2.VideoWriter(
         output_video_path,
@@ -522,6 +793,8 @@ def main() -> int:
     total_masks = 0
     frames_with_masks = 0
     error_count = 0
+    skipped_invalid_frames = 0
+    analyzed_frames = 0
 
     with open(frame_results_path, "w", encoding="utf-8") as frame_results_handle:
         try:
@@ -529,6 +802,33 @@ def main() -> int:
                 ret, frame_bgr = cap.read()
                 if not ret:
                     break
+
+                if frame_index in invalid_frame_set:
+                    writer.write(frame_bgr)
+                    processed_frames += 1
+                    skipped_invalid_frames += 1
+                    per_frame_payload = {
+                        "frame_index": int(frame_index),
+                        "num_masks": 0,
+                        "segment_prompts": [],
+                        "history_len": 0,
+                        "frame_runtime_sec": 0.0,
+                        "error": None,
+                        "skipped": True,
+                        "skip_reason": "invalid_corrupt_frame",
+                    }
+                    write_frame_result(frame_results_handle, per_frame_payload)
+                    avg_masks = total_masks / float(max(1, analyzed_frames))
+                    progress.update(
+                        1,
+                        postfix={
+                            "masks": 0,
+                            "avg_masks": f"{avg_masks:.2f}",
+                            "errors": error_count,
+                            "skipped": skipped_invalid_frames,
+                        },
+                    )
+                    continue
 
                 frame_name = f"frame_{frame_index:06d}.jpg"
                 if args.keep_artifacts or args.debug:
@@ -585,6 +885,7 @@ def main() -> int:
                 num_masks = len(final_outputs.get("pred_masks", []))
                 segment_prompts = history_segment_prompts(history)
                 processed_frames += 1
+                analyzed_frames += 1
                 total_masks += int(num_masks)
                 if num_masks > 0:
                     frames_with_masks += 1
@@ -596,16 +897,19 @@ def main() -> int:
                     "history_len": int(len(history)),
                     "frame_runtime_sec": float(time.time() - frame_start),
                     "error": frame_error,
+                    "skipped": False,
+                    "skip_reason": "",
                 }
                 write_frame_result(frame_results_handle, per_frame_payload)
 
-                avg_masks = total_masks / float(max(1, processed_frames))
+                avg_masks = total_masks / float(max(1, analyzed_frames))
                 progress.update(
                     1,
                     postfix={
                         "masks": num_masks,
                         "avg_masks": f"{avg_masks:.2f}",
                         "errors": error_count,
+                        "skipped": skipped_invalid_frames,
                     },
                 )
         finally:
@@ -631,13 +935,31 @@ def main() -> int:
         "device": args.device,
         "max_generations": int(args.max_generations),
         "max_completion_tokens": int(args.max_completion_tokens),
+        "image_detail": str(args.image_detail),
+        "max_images_per_request": int(args.max_images_per_request),
+        "agent_image_max_edge": int(args.agent_image_max_edge),
+        "agent_image_min_edge": int(args.agent_image_min_edge),
         "fps": float(fps),
         "frame_size_hw": [int(frame_h), int(frame_w)],
         "processed_frames": int(processed_frames),
+        "analyzed_frames": int(analyzed_frames),
         "frames_with_masks": int(frames_with_masks),
         "total_masks": int(total_masks),
-        "avg_masks_per_frame": float(total_masks) / float(max(1, processed_frames)),
+        "avg_masks_per_frame": float(total_masks) / float(max(1, analyzed_frames)),
+        "avg_masks_per_analyzed_frame": float(total_masks)
+        / float(max(1, analyzed_frames)),
         "error_count": int(error_count),
+        "skip_invalid_frames": bool(args.skip_invalid_frames),
+        "skipped_invalid_frame_count": int(skipped_invalid_frames),
+        "invalid_frame_source": str(args.invalid_frame_source),
+        "invalid_frame_report_path": invalid_frame_report_path,
+        "invalid_frame_count": int(invalid_frame_report.get("invalid_frame_count", 0)),
+        "invalid_frame_ratio": float(
+            invalid_frame_report.get("invalid_frame_ratio", 0.0)
+        ),
+        "invalid_frame_sample": list(
+            invalid_frame_report.get("invalid_frame_indices", [])[:20]
+        ),
         "keep_artifacts": bool(args.keep_artifacts),
         "debug": bool(args.debug),
         "continue_on_error": bool(args.continue_on_error),
