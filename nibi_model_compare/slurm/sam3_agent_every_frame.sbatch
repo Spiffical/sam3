@@ -158,6 +158,16 @@ if [[ -z "$VIDEO_PATH" ]]; then
   echo "VIDEO_PATH must be set."
   exit 1
 fi
+VIDEO_SAFE="$(python3 - "$VIDEO_PATH" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+stem = Path(sys.argv[1]).stem
+safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+print(safe or "video")
+PY
+)"
 PROMPT="${PROMPT:-small creatures}"
 PROMPT_PROFILE="${PROMPT_PROFILE:-underwater}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-27B}"
@@ -244,16 +254,19 @@ RUNNER_CUDA_VISIBLE_DEVICES="${RUNNER_CUDA_VISIBLE_DEVICES:-1}"
 RUNNER_GPU_IDS="${RUNNER_GPU_IDS:-0}"
 VLLM_CUDA_VISIBLE_DEVICES="${VLLM_CUDA_VISIBLE_DEVICES:-0}"
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-OUT_ROOT="${OUT_ROOT:-${SCRATCH:-/scratch/$USER}/sam3/runs/agent_every_frame_${SLURM_JOB_ID}_${RUN_TS}}"
+OUT_BASE="${OUT_ROOT:-${SCRATCH:-/scratch/$USER}/sam3/runs/agent_every_frame}"
+RUN_LABEL="${RUN_TS}_job${SLURM_JOB_ID}"
 export SERVER_PORT
 
 TMP_BASE="${SLURM_TMPDIR:-/tmp/$USER/slurm_${SLURM_JOB_ID}}"
 STAGE_ROOT="${TMP_BASE}/sam3_agent_every_frame"
 MODEL_SAFE="${MODEL_ID//\//_}"
 STAGE_OUT="${STAGE_ROOT}/${MODEL_SAFE}"
-FINAL_OUT="${OUT_ROOT}/${MODEL_SAFE}"
+VIDEO_ROOT="${OUT_BASE}/${VIDEO_SAFE}"
+RUN_ROOT="${VIDEO_ROOT}/${RUN_LABEL}"
+FINAL_OUT="${RUN_ROOT}/${MODEL_SAFE}"
 
-mkdir -p "$STAGE_OUT" "$FINAL_OUT" "$OUT_ROOT"
+mkdir -p "$STAGE_OUT" "$FINAL_OUT" "$RUN_ROOT" "$VIDEO_ROOT" "$OUT_BASE"
 
 echo "=== Launching vLLM ==="
 if [[ "$VLLM_RUNTIME" == "apptainer" ]]; then
@@ -495,16 +508,19 @@ if command -v rsync >/dev/null 2>&1; then
   rsync -a --ignore-existing "$HF_HUB_CACHE/" "$PERSISTENT_CACHE_ROOT/hub/" || true
 fi
 
-cat > "$OUT_ROOT/README.md" <<EOF
+cat > "$RUN_ROOT/README.md" <<EOF
 # SAM3 Agent Every-Frame Job Output
 
 - Job ID: ${SLURM_JOB_ID}
 - Node list: ${SLURM_JOB_NODELIST}
 - Model: ${MODEL_ID}
 - Video: ${VIDEO_PATH}
+- Video key: ${VIDEO_SAFE}
 - Prompt: ${PROMPT}
 - Prompt profile: ${PROMPT_PROFILE}
-- Output root: ${OUT_ROOT}
+- Output base: ${OUT_BASE}
+- Video folder: ${VIDEO_ROOT}
+- Run folder: ${RUN_ROOT}
 - Model output folder: ${FINAL_OUT}
 
 Files to review first:
@@ -514,8 +530,12 @@ Files to review first:
 - ${FINAL_OUT}/overlay.mp4
 EOF
 
+ln -sfn "$RUN_ROOT" "${VIDEO_ROOT}/latest"
+
 if [[ -d "$STAGE_OUT" ]]; then
   safe_delete_dir "$STAGE_OUT"
 fi
 
+echo "Video folder: $VIDEO_ROOT"
+echo "Run folder: $RUN_ROOT"
 echo "Final output folder: $FINAL_OUT"

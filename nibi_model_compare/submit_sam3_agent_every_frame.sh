@@ -24,7 +24,7 @@ Common options:
   --model-revision <rev>              Optional HF revision
   --venv-path <path>                  Default: <repo>/.venv
   --env-file <path>                   Default: <repo>/.env
-  --output-root <path>                Default: /scratch/$USER/sam3/runs
+  --output-root <path>                Base dir. Default: /scratch/$USER/sam3/runs/agent_every_frame
   --job-name <name>                   Default: sam3_agent_frames
   --dry-run                           Print env + sbatch command only
   -h, --help                          Show help
@@ -78,8 +78,15 @@ Slurm options:
   --cpus-per-task <n>                 Default: 16
   --mem <spec>                        Default: 128000M
   --time <hh:mm:ss>                   Default: 08:00:00
-  --output <path>                     Default: /scratch/$USER/sam3/logs/agent_every_frame/out/%x-%j.out
-  --error <path>                      Default: /scratch/$USER/sam3/logs/agent_every_frame/err/%x-%j.err
+  --output <path>                     Default: /scratch/$USER/sam3/logs/agent_every_frame/<video>/out/%x-%j.out
+  --error <path>                      Default: /scratch/$USER/sam3/logs/agent_every_frame/<video>/err/%x-%j.err
+
+Output layout:
+  <output-root>/<video_stem>/<timestamp>_job<jobid>/<model_safe>/
+    overlay.mp4
+    summary.json
+    frame_results.jsonl
+    frame_validity/invalid_frame_report.json
 
 Example:
   nibi_model_compare/submit_sam3_agent_every_frame.sh \
@@ -128,7 +135,7 @@ model_id="Qwen/Qwen3.5-27B"
 model_revision=""
 venv_path="${REPO_ROOT}/.venv"
 env_file="${REPO_ROOT}/.env"
-output_root="${SCRATCH:-/scratch/$USER}/sam3/runs"
+output_root="${SCRATCH:-/scratch/$USER}/sam3/runs/agent_every_frame"
 job_name="sam3_agent_frames"
 dry_run=0
 
@@ -253,6 +260,19 @@ if [[ -z "$video_path" ]]; then
   exit 1
 fi
 
+if ! video_safe="$(python3 - "$video_path" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+stem = Path(sys.argv[1]).stem
+safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+print(safe or "video")
+PY
+)"; then
+  exit 1
+fi
+
 if ! limit_mm_per_prompt="$(python3 - "$limit_mm_per_prompt" <<'PY'
 import json
 import sys
@@ -284,10 +304,10 @@ if [[ ! -f "$SBATCH_TEMPLATE" ]]; then
 fi
 
 if [[ -z "$output_path" ]]; then
-  output_path="${SCRATCH:-/scratch/$USER}/sam3/logs/agent_every_frame/out/%x-%j.out"
+  output_path="${SCRATCH:-/scratch/$USER}/sam3/logs/agent_every_frame/${video_safe}/out/%x-%j.out"
 fi
 if [[ -z "$error_path" ]]; then
-  error_path="${SCRATCH:-/scratch/$USER}/sam3/logs/agent_every_frame/err/%x-%j.err"
+  error_path="${SCRATCH:-/scratch/$USER}/sam3/logs/agent_every_frame/${video_safe}/err/%x-%j.err"
 fi
 if [[ "$dry_run" != "1" ]]; then
   mkdir -p "$(dirname "$output_path")" "$(dirname "$error_path")"
@@ -371,3 +391,5 @@ fi
 
 job_id="$(env "${env_vars[@]}" "${sbatch_cmd[@]}")"
 echo "Submitted job: ${job_id}"
+echo "Video log folder: ${SCRATCH:-/scratch/$USER}/sam3/logs/agent_every_frame/${video_safe}"
+echo "Video output base: ${output_root}/${video_safe}"
