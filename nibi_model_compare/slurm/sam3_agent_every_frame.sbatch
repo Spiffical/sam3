@@ -485,6 +485,7 @@ for key in (
     "output_video_path",
     "summary_path",
     "frame_results_path",
+    "frame_outputs_path",
     "invalid_frame_report_path",
     "frame_inputs_dir",
     "frame_artifacts_dir",
@@ -526,6 +527,7 @@ cat > "$RUN_ROOT/README.md" <<EOF
 Files to review first:
 - ${FINAL_OUT}/summary.json
 - ${FINAL_OUT}/frame_results.jsonl
+- ${FINAL_OUT}/frame_outputs_rle.json
 - ${FINAL_OUT}/frame_validity/invalid_frame_report.json
 - ${FINAL_OUT}/overlay.mp4
 EOF

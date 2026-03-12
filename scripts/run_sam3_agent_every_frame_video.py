@@ -37,6 +37,7 @@ visualize = None
 analyze_frame_quality = None
 scan_video_frame_quality = None
 discover_invalid_frames_with_mllm = None
+encode_binary_mask_to_rle = None
 
 
 def ensure_runtime_deps() -> None:
@@ -46,6 +47,7 @@ def ensure_runtime_deps() -> None:
     global sam3_inference, remove_overlapping_masks, visualize
     global analyze_frame_quality, scan_video_frame_quality
     global discover_invalid_frames_with_mllm
+    global encode_binary_mask_to_rle
     if cv2 is not None and np is not None and Image is not None and torch is not None:
         return
 
@@ -97,6 +99,9 @@ def ensure_runtime_deps() -> None:
         from frame_quality_mllm import (
             discover_invalid_frames_with_mllm as _discover_invalid_frames_with_mllm,
         )
+        from frame_output_utils import (
+            encode_binary_mask_to_rle as _encode_binary_mask_to_rle,
+        )
     except ImportError as exc:
         missing.append(str(exc))
     else:
@@ -110,6 +115,7 @@ def ensure_runtime_deps() -> None:
         analyze_frame_quality = _analyze_frame_quality
         scan_video_frame_quality = _scan_video_frame_quality
         discover_invalid_frames_with_mllm = _discover_invalid_frames_with_mllm
+        encode_binary_mask_to_rle = _encode_binary_mask_to_rle
 
     if missing:
         raise RuntimeError(
@@ -294,6 +300,11 @@ def parse_args() -> argparse.Namespace:
         "--frame-results-path",
         default="",
         help="Optional JSONL file to write per-frame agent results.",
+    )
+    parser.add_argument(
+        "--frame-outputs-path",
+        default="",
+        help="Optional JSON file to write per-frame mask outputs. Default: <output-dir>/frame_outputs_rle.json",
     )
     parser.add_argument(
         "--codec",
@@ -537,7 +548,7 @@ def discover_invalid_frames_for_agent_loop(
     return invalid_frames, report, report_path
 
 
-def make_output_paths(args: argparse.Namespace) -> tuple[str, str, str]:
+def make_output_paths(args: argparse.Namespace) -> tuple[str, str, str, str]:
     video_path = Path(args.video_path).resolve()
     if args.output_dir:
         output_dir = Path(args.output_dir).resolve()
@@ -560,7 +571,17 @@ def make_output_paths(args: argparse.Namespace) -> tuple[str, str, str]:
         if args.frame_results_path
         else output_dir / "frame_results.jsonl"
     )
-    return str(output_video_path), str(summary_path), str(frame_results_path)
+    frame_outputs_path = (
+        Path(args.frame_outputs_path).resolve()
+        if args.frame_outputs_path
+        else output_dir / "frame_outputs_rle.json"
+    )
+    return (
+        str(output_video_path),
+        str(summary_path),
+        str(frame_results_path),
+        str(frame_outputs_path),
+    )
 
 
 class LocalSam3Service:
@@ -664,11 +685,58 @@ def write_frame_result(handle: Any, payload: dict[str, Any]) -> None:
     handle.flush()
 
 
+def _normalize_pred_mask_rle(
+    mask_rle: Any,
+    *,
+    frame_h: int,
+    frame_w: int,
+) -> dict[str, Any]:
+    if isinstance(mask_rle, dict):
+        counts = mask_rle.get("counts", "")
+        size = mask_rle.get("size") or [int(frame_h), int(frame_w)]
+        if isinstance(counts, bytes):
+            counts = counts.decode("utf-8")
+        return {"size": [int(size[0]), int(size[1])], "counts": str(counts)}
+    if isinstance(mask_rle, str):
+        return {"size": [int(frame_h), int(frame_w)], "counts": mask_rle}
+    return encode_binary_mask_to_rle(np.asarray(mask_rle) > 0)
+
+
+def serialize_agent_frame_outputs(
+    *,
+    frame_index: int,
+    frame_h: int,
+    frame_w: int,
+    final_outputs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    outputs = dict(final_outputs or {})
+    pred_masks = list(outputs.get("pred_masks") or [])
+    pred_scores = list(outputs.get("pred_scores") or [])
+    pred_boxes = list(outputs.get("pred_boxes") or [])
+
+    rle_masks = [
+        _normalize_pred_mask_rle(mask_rle, frame_h=frame_h, frame_w=frame_w)
+        for mask_rle in pred_masks
+    ]
+    obj_ids = list(range(1, len(rle_masks) + 1))
+
+    return {
+        "frame_index": int(frame_index),
+        "out_obj_ids": obj_ids,
+        "out_probs": pred_scores[: len(rle_masks)],
+        "out_tracker_probs": [],
+        "out_boxes_xywh": pred_boxes[: len(rle_masks)],
+        "out_binary_masks_rle": rle_masks,
+    }
+
+
 def main() -> int:
     args = parse_args()
     ensure_runtime_deps()
 
-    output_video_path, summary_path, frame_results_path = make_output_paths(args)
+    output_video_path, summary_path, frame_results_path, frame_outputs_path = (
+        make_output_paths(args)
+    )
     output_dir = str(Path(output_video_path).resolve().parent)
     video_path = str(Path(args.video_path).resolve())
     if not os.path.isfile(video_path):
@@ -795,6 +863,7 @@ def main() -> int:
     error_count = 0
     skipped_invalid_frames = 0
     analyzed_frames = 0
+    frame_output_rows: list[dict[str, Any]] = []
 
     with open(frame_results_path, "w", encoding="utf-8") as frame_results_handle:
         try:
@@ -807,6 +876,14 @@ def main() -> int:
                     writer.write(frame_bgr)
                     processed_frames += 1
                     skipped_invalid_frames += 1
+                    frame_output_rows.append(
+                        serialize_agent_frame_outputs(
+                            frame_index=frame_index,
+                            frame_h=frame_h,
+                            frame_w=frame_w,
+                            final_outputs={},
+                        )
+                    )
                     per_frame_payload = {
                         "frame_index": int(frame_index),
                         "num_masks": 0,
@@ -901,6 +978,14 @@ def main() -> int:
                     "skip_reason": "",
                 }
                 write_frame_result(frame_results_handle, per_frame_payload)
+                frame_output_rows.append(
+                    serialize_agent_frame_outputs(
+                        frame_index=frame_index,
+                        frame_h=frame_h,
+                        frame_w=frame_w,
+                        final_outputs=final_outputs,
+                    )
+                )
 
                 avg_masks = total_masks / float(max(1, analyzed_frames))
                 progress.update(
@@ -924,6 +1009,7 @@ def main() -> int:
         "output_video_path": output_video_path,
         "summary_path": summary_path,
         "frame_results_path": frame_results_path,
+        "frame_outputs_path": frame_outputs_path,
         "frame_inputs_dir": frame_inputs_dir if (args.keep_artifacts or args.debug) else "",
         "frame_artifacts_dir": (
             frame_artifacts_dir if (args.keep_artifacts or args.debug) else ""
@@ -972,9 +1058,24 @@ def main() -> int:
         json.dump(summary, handle, indent=2)
         handle.write("\n")
 
+    frame_outputs_payload = {
+        "format_version": 2,
+        "source": "sam3_agent_every_frame",
+        "frame_size_hw": [int(frame_h), int(frame_w)],
+        "total_video_frames": int(processed_frames),
+        "num_frames_with_outputs": len(frame_output_rows),
+        "invalid_frame_indices": sorted(int(x) for x in invalid_frame_set),
+        "keyframe_indices": [],
+        "frames": frame_output_rows,
+    }
+    with open(frame_outputs_path, "w", encoding="utf-8") as handle:
+        json.dump(frame_outputs_payload, handle, indent=2)
+        handle.write("\n")
+
     log(f"Wrote overlay video: {output_video_path}")
     log(f"Wrote summary JSON: {summary_path}")
     log(f"Wrote per-frame results: {frame_results_path}")
+    log(f"Wrote frame outputs JSON: {frame_outputs_path}")
     if args.keep_artifacts or args.debug:
         log(f"Preserved frame artifacts under: {frame_artifacts_dir}")
     log(

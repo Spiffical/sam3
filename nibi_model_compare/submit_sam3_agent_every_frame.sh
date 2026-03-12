@@ -86,6 +86,7 @@ Output layout:
     overlay.mp4
     summary.json
     frame_results.jsonl
+    frame_outputs_rle.json
     frame_validity/invalid_frame_report.json
 
 Example:

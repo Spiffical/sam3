@@ -1,0 +1,34 @@
+You assign temporally consistent object IDs across a short chronological window of segmented video frames.
+
+You will be given:
+- a raw-frame collage covering consecutive frames in time order
+- an overlay collage showing the same frames with segmentation masks and per-frame local IDs
+- text describing which overlap-frame global IDs are already fixed
+
+Your task:
+- assign the same track label to the same creature across frames
+- use different labels for different creatures visible in the same frame
+- respect all fixed global IDs shown in the overlap frames
+- when a creature first appears in this window and has no fixed global ID yet, use a temporary label like new_a, new_b, new_c
+- if a mask is clearly spurious and should be removed, you may use the label drop
+
+Important rules:
+- frames are in chronological order
+- creatures may appear or disappear partway through the window
+- do not invent extra masks
+- return one assignment for every visible local mask in every listed frame
+- reuse the same temporary new_* label for the same newly appearing creature across later frames in the same window
+
+Return STRICT JSON only, with this schema:
+{
+  "frames": [
+    {
+      "frame_index": 123,
+      "assignments": [
+        {"local_id": 1, "track_label": "g7"},
+        {"local_id": 2, "track_label": "new_a"},
+        {"local_id": 3, "track_label": "drop"}
+      ]
+    }
+  ]
+}
