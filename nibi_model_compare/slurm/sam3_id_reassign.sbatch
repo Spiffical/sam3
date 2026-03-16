@@ -4,7 +4,7 @@
 #SBATCH --job-name=sam3_id_reassign
 #SBATCH --account=rpp-kmoran
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=h100:1
+#SBATCH --gpus-per-node=h100:2
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=96000M
 #SBATCH --time=04:00:00
@@ -160,7 +160,7 @@ print(base64.b64decode(value).decode("utf-8"))
 PY
 )"
 else
-  LIMIT_MM_PER_PROMPT="${SUBMITTED_LIMIT_MM_PER_PROMPT:-${LIMIT_MM_PER_PROMPT:-{\"image\":2,\"video\":0}}}"
+  LIMIT_MM_PER_PROMPT="${SUBMITTED_LIMIT_MM_PER_PROMPT:-${LIMIT_MM_PER_PROMPT:-{\"image\":3,\"video\":0}}}"
 fi
 LIMIT_MM_PER_PROMPT="$(python3 - "$LIMIT_MM_PER_PROMPT" <<'PY'
 import json
@@ -176,22 +176,32 @@ PY
 )"
 PROMPT_PROFILE="${PROMPT_PROFILE:-underwater}"
 PROMPT_PATH="${PROMPT_PATH:-}"
+MISSING_MASK_PROMPT_PATH="${MISSING_MASK_PROMPT_PATH:-}"
+VERIFY_GAP_FILL_PROMPT_PATH="${VERIFY_GAP_FILL_PROMPT_PATH:-}"
 OUTPUT_SUBDIR="${OUTPUT_SUBDIR:-consistent_ids_mllm}"
 OUTPUT_VIDEO_NAME="${OUTPUT_VIDEO_NAME:-overlay_consistent_ids.mp4}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-1024}"
 MAX_JSON_RETRIES="${MAX_JSON_RETRIES:-2}"
 WINDOW_SIZE="${WINDOW_SIZE:-10}"
 WINDOW_STRIDE="${WINDOW_STRIDE:-8}"
+MAX_GAP_ISSUES_PER_WINDOW="${MAX_GAP_ISSUES_PER_WINDOW:-8}"
+GAP_FILL_MAX_ATTEMPTS="${GAP_FILL_MAX_ATTEMPTS:-4}"
+GAP_FILL_POINT_CANDIDATES="${GAP_FILL_POINT_CANDIDATES:-6}"
 IMAGE_DETAIL="${IMAGE_DETAIL:-high}"
 MAX_IMAGES_PER_REQUEST="${MAX_IMAGES_PER_REQUEST:-3}"
 IMAGE_MAX_EDGE="${IMAGE_MAX_EDGE:-768}"
 IMAGE_MIN_EDGE="${IMAGE_MIN_EDGE:-384}"
 COLLAGE_COLS="${COLLAGE_COLS:-2}"
 COLLAGE_TILE_MAX_EDGE="${COLLAGE_TILE_MAX_EDGE:-320}"
+SAM3_GPU_IDS="${SAM3_GPU_IDS:-0}"
+SAM3_IMAGE_SIZE="${SAM3_IMAGE_SIZE:-1008}"
+SAM3_OFFLOAD_VIDEO_TO_CPU="${SAM3_OFFLOAD_VIDEO_TO_CPU:-0}"
+FILL_MISSING_MASKS="${FILL_MISSING_MASKS:-1}"
 RENDER_VIDEO="${RENDER_VIDEO:-1}"
 DEBUG="${DEBUG:-0}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-0}"
 VLLM_CUDA_VISIBLE_DEVICES="${VLLM_CUDA_VISIBLE_DEVICES:-0}"
+RUNNER_CUDA_VISIBLE_DEVICES="${RUNNER_CUDA_VISIBLE_DEVICES:-1}"
 export SERVER_PORT
 
 echo "=== Launching vLLM ==="
@@ -318,15 +328,32 @@ RUN_CMD+=(
   --max-json-retries "$MAX_JSON_RETRIES"
   --window-size "$WINDOW_SIZE"
   --window-stride "$WINDOW_STRIDE"
+  --max-gap-issues-per-window "$MAX_GAP_ISSUES_PER_WINDOW"
+  --gap-fill-max-attempts "$GAP_FILL_MAX_ATTEMPTS"
+  --gap-fill-point-candidates "$GAP_FILL_POINT_CANDIDATES"
   --image-detail "$IMAGE_DETAIL"
   --max-images-per-request "$MAX_IMAGES_PER_REQUEST"
   --image-max-edge "$IMAGE_MAX_EDGE"
   --image-min-edge "$IMAGE_MIN_EDGE"
   --collage-cols "$COLLAGE_COLS"
   --collage-tile-max-edge "$COLLAGE_TILE_MAX_EDGE"
+  --sam3-gpu-ids "$SAM3_GPU_IDS"
+  --sam3-image-size "$SAM3_IMAGE_SIZE"
 )
 if [[ -n "$PROMPT_PATH" ]]; then
   RUN_CMD+=(--prompt-path "$PROMPT_PATH")
+fi
+if [[ -n "$MISSING_MASK_PROMPT_PATH" ]]; then
+  RUN_CMD+=(--missing-mask-prompt-path "$MISSING_MASK_PROMPT_PATH")
+fi
+if [[ -n "$VERIFY_GAP_FILL_PROMPT_PATH" ]]; then
+  RUN_CMD+=(--verify-gap-fill-prompt-path "$VERIFY_GAP_FILL_PROMPT_PATH")
+fi
+if [[ "$SAM3_OFFLOAD_VIDEO_TO_CPU" == "1" ]]; then
+  RUN_CMD+=(--sam3-offload-video-to-cpu)
+fi
+if [[ "$FILL_MISSING_MASKS" != "1" ]]; then
+  RUN_CMD+=(--no-fill-missing-masks)
 fi
 if [[ "$RENDER_VIDEO" != "1" ]]; then
   RUN_CMD+=(--no-render-video)
@@ -339,6 +366,6 @@ if [[ "$CONTINUE_ON_ERROR" == "1" ]]; then
 fi
 
 echo "=== Running ID reassignment job ==="
-"${RUN_CMD[@]}"
+CUDA_VISIBLE_DEVICES="$RUNNER_CUDA_VISIBLE_DEVICES" "${RUN_CMD[@]}"
 
 echo "Finished ID reassignment for ${#INPUT_DIRS[@]} input run(s)."

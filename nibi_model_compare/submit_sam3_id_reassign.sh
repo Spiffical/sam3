@@ -21,6 +21,8 @@ Common options:
   --batch-name <name>                 Optional log-group name. Default: first input dir name
   --prompt-profile <name>             Default: underwater
   --prompt-path <path>                Optional override system prompt for reassignment
+  --missing-mask-prompt-path <path>   Optional override system prompt for missing-mask detection
+  --verify-gap-fill-prompt-path <path> Optional override system prompt for gap-fill verification
   --output-subdir <name>              Default: consistent_ids_mllm
   --output-video-name <name>          Default: overlay_consistent_ids.mp4
   --venv-path <path>                  Default: <repo>/.venv
@@ -37,29 +39,37 @@ LLM/vLLM options:
   --max-model-len <n>                 Default: 16384
   --max-num-seqs <n>                  Default: 1
   --gpu-memory-utilization <f>        Default: 0.90
-  --limit-mm-per-prompt <json>        Default: {"image":2,"video":0}
+  --limit-mm-per-prompt <json>        Default: {"image":3,"video":0}
   --vllm-runtime <auto|venv|apptainer> Default: auto
   --apptainer-image <path>            Optional SIF path
   --vllm-cuda-visible-devices <ids>   Default: 0
+  --runner-cuda-visible-devices <ids> Default: 1
 
 Reassignment options:
   --max-completion-tokens <n>         Default: 1024
   --max-json-retries <n>              Default: 2
   --window-size <n>                   Default: 10
   --window-stride <n>                 Default: 8
+  --max-gap-issues-per-window <n>     Default: 8
+  --gap-fill-max-attempts <n>         Default: 4
+  --gap-fill-point-candidates <n>     Default: 6
   --image-detail <low|high>           Default: high
   --max-images-per-request <n>        Default: 3
   --image-max-edge <n>                Default: 768
   --image-min-edge <n>                Default: 384
   --collage-cols <n>                  Default: 2
   --collage-tile-max-edge <n>         Default: 320
+  --sam3-gpu-ids <ids>                Default: 0
+  --sam3-image-size <n>               Default: 1008
+  --sam3-offload-video-to-cpu         Offload SAM3 frames to CPU memory during gap fill
+  --no-fill-missing-masks             Disable the gap-fill stage
   --debug                             Keep extra window-level debug artifacts
   --continue-on-error                 Continue to later input dirs if one fails
   --no-render-video                   Skip writing the relabeled overlay video
 
 Slurm options:
   --partition <name>                  Optional partition
-  --gpus-per-node <spec>              Default: h100:1
+  --gpus-per-node <spec>              Default: h100:2
   --cpus-per-task <n>                 Default: 12
   --mem <spec>                        Default: 96000M
   --time <hh:mm:ss>                   Default: 04:00:00
@@ -73,6 +83,8 @@ partition=""
 batch_name=""
 prompt_profile="underwater"
 prompt_path=""
+missing_mask_prompt_path=""
+verify_gap_fill_prompt_path=""
 output_subdir="consistent_ids_mllm"
 output_video_name="overlay_consistent_ids.mp4"
 venv_path="${REPO_ROOT}/.venv"
@@ -87,26 +99,34 @@ tp_size="1"
 max_model_len="16384"
 max_num_seqs="1"
 gpu_memory_utilization="0.90"
-limit_mm_per_prompt='{"image":2,"video":0}'
+limit_mm_per_prompt='{"image":3,"video":0}'
 vllm_runtime="auto"
 apptainer_image=""
 vllm_cuda_visible_devices="0"
+runner_cuda_visible_devices="1"
 
 max_completion_tokens="1024"
 max_json_retries="2"
 window_size="10"
 window_stride="8"
+max_gap_issues_per_window="8"
+gap_fill_max_attempts="4"
+gap_fill_point_candidates="6"
 image_detail="high"
 max_images_per_request="3"
 image_max_edge="768"
 image_min_edge="384"
 collage_cols="2"
 collage_tile_max_edge="320"
+sam3_gpu_ids="0"
+sam3_image_size="1008"
+sam3_offload_video_to_cpu=0
+fill_missing_masks=1
 render_video=1
 debug=0
 continue_on_error=0
 
-gpus_per_node="h100:1"
+gpus_per_node="h100:2"
 cpus_per_task="12"
 mem="96000M"
 time_limit="04:00:00"
@@ -123,6 +143,8 @@ while [[ $# -gt 0 ]]; do
     --batch-name) batch_name="$2"; shift 2 ;;
     --prompt-profile) prompt_profile="$2"; shift 2 ;;
     --prompt-path) prompt_path="$2"; shift 2 ;;
+    --missing-mask-prompt-path) missing_mask_prompt_path="$2"; shift 2 ;;
+    --verify-gap-fill-prompt-path) verify_gap_fill_prompt_path="$2"; shift 2 ;;
     --output-subdir) output_subdir="$2"; shift 2 ;;
     --output-video-name) output_video_name="$2"; shift 2 ;;
     --venv-path) venv_path="$2"; shift 2 ;;
@@ -141,17 +163,25 @@ while [[ $# -gt 0 ]]; do
     --vllm-runtime) vllm_runtime="$2"; shift 2 ;;
     --apptainer-image) apptainer_image="$2"; shift 2 ;;
     --vllm-cuda-visible-devices) vllm_cuda_visible_devices="$2"; shift 2 ;;
+    --runner-cuda-visible-devices) runner_cuda_visible_devices="$2"; shift 2 ;;
 
     --max-completion-tokens) max_completion_tokens="$2"; shift 2 ;;
     --max-json-retries) max_json_retries="$2"; shift 2 ;;
     --window-size) window_size="$2"; shift 2 ;;
     --window-stride) window_stride="$2"; shift 2 ;;
+    --max-gap-issues-per-window) max_gap_issues_per_window="$2"; shift 2 ;;
+    --gap-fill-max-attempts) gap_fill_max_attempts="$2"; shift 2 ;;
+    --gap-fill-point-candidates) gap_fill_point_candidates="$2"; shift 2 ;;
     --image-detail) image_detail="$2"; shift 2 ;;
     --max-images-per-request) max_images_per_request="$2"; shift 2 ;;
     --image-max-edge) image_max_edge="$2"; shift 2 ;;
     --image-min-edge) image_min_edge="$2"; shift 2 ;;
     --collage-cols) collage_cols="$2"; shift 2 ;;
     --collage-tile-max-edge) collage_tile_max_edge="$2"; shift 2 ;;
+    --sam3-gpu-ids) sam3_gpu_ids="$2"; shift 2 ;;
+    --sam3-image-size) sam3_image_size="$2"; shift 2 ;;
+    --sam3-offload-video-to-cpu) sam3_offload_video_to_cpu=1; shift ;;
+    --no-fill-missing-masks) fill_missing_masks=0; shift ;;
     --debug) debug=1; shift ;;
     --continue-on-error) continue_on_error=1; shift ;;
     --no-render-video) render_video=0; shift ;;
@@ -181,7 +211,9 @@ import sys
 
 p = Path(sys.argv[1]).expanduser()
 name = p.name or "id_reassign"
-if "_job" in p.parent.name and p.parent.parent.name:
+if p.parent.name == "latest" and p.parent.parent.name:
+    name = p.parent.parent.name
+elif "_job" in p.parent.name and p.parent.parent.name:
     name = p.parent.parent.name
 elif p.parent.name:
     name = p.parent.name
@@ -286,6 +318,8 @@ env_vars=(
   "BATCH_SAFE=$batch_safe"
   "PROMPT_PROFILE=$prompt_profile"
   "PROMPT_PATH=$prompt_path"
+  "MISSING_MASK_PROMPT_PATH=$missing_mask_prompt_path"
+  "VERIFY_GAP_FILL_PROMPT_PATH=$verify_gap_fill_prompt_path"
   "OUTPUT_SUBDIR=$output_subdir"
   "OUTPUT_VIDEO_NAME=$output_video_name"
   "MODEL_ID=$model_id"
@@ -300,16 +334,24 @@ env_vars=(
   "VLLM_RUNTIME=$vllm_runtime"
   "APPTAINER_IMAGE=$apptainer_image"
   "VLLM_CUDA_VISIBLE_DEVICES=$vllm_cuda_visible_devices"
+  "RUNNER_CUDA_VISIBLE_DEVICES=$runner_cuda_visible_devices"
   "MAX_COMPLETION_TOKENS=$max_completion_tokens"
   "MAX_JSON_RETRIES=$max_json_retries"
   "WINDOW_SIZE=$window_size"
   "WINDOW_STRIDE=$window_stride"
+  "MAX_GAP_ISSUES_PER_WINDOW=$max_gap_issues_per_window"
+  "GAP_FILL_MAX_ATTEMPTS=$gap_fill_max_attempts"
+  "GAP_FILL_POINT_CANDIDATES=$gap_fill_point_candidates"
   "IMAGE_DETAIL=$image_detail"
   "MAX_IMAGES_PER_REQUEST=$max_images_per_request"
   "IMAGE_MAX_EDGE=$image_max_edge"
   "IMAGE_MIN_EDGE=$image_min_edge"
   "COLLAGE_COLS=$collage_cols"
   "COLLAGE_TILE_MAX_EDGE=$collage_tile_max_edge"
+  "SAM3_GPU_IDS=$sam3_gpu_ids"
+  "SAM3_IMAGE_SIZE=$sam3_image_size"
+  "SAM3_OFFLOAD_VIDEO_TO_CPU=$sam3_offload_video_to_cpu"
+  "FILL_MISSING_MASKS=$fill_missing_masks"
   "RENDER_VIDEO=$render_video"
   "DEBUG=$debug"
   "CONTINUE_ON_ERROR=$continue_on_error"

@@ -1,0 +1,16 @@
+You are verifying whether a candidate segmentation mask correctly fills a previously missing underwater creature on a target frame.
+
+You will see:
+- the raw target frame
+- the candidate mask overlay on the target frame
+- a collage of nearby reference frames showing the same animal already segmented
+
+Decision rules:
+- Return "accept" only if the candidate clearly segments the same animal shown in the references.
+- Return "retry" if the animal appears to be visible but this candidate is wrong, incomplete, or attached to the wrong blob and another click is worth trying.
+- Return "reject" if the issue is not repairable from this frame or the target animal is not clearly visible enough.
+- Do not accept marine snow, background texture, rocks, shadows, or a mask that simply duplicates an already segmented animal on the target frame.
+- If you return "retry", provide one improved click point [x, y] on the target frame when possible.
+
+Return strict JSON only with this schema:
+{"decision":"accept|retry|reject","reason":str,"suggested_point":[x,y]|null}

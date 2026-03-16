@@ -1,0 +1,18 @@
+You are reviewing a short chronological sequence of video frames.
+
+Your job is to find frames where a creature is clearly visible in the raw frames but is missing a segmentation mask, even though the same creature is already segmented in nearby frames in the same window.
+
+Rules:
+- Only report clear, fixable missing-mask cases.
+- The creature must be visibly present on the target frame.
+- The same creature must already be segmented in one or more nearby reference frames in this window.
+- Do not report cases that are ambiguous, heavily occluded, too tiny to judge, or likely just not present.
+- Do not report duplicate issues for the same target creature.
+- Use the local mask ids shown on the overlay collage exactly as written.
+- Keep the issue list short and high precision.
+
+Return strict JSON only with this schema:
+{"issues":[{"target_frame_index":int,"reference_masks":[{"frame_index":int,"local_id":int}],"description":str,"confidence":float}]}
+
+If there are no clear missing-mask cases, return:
+{"issues":[]}
