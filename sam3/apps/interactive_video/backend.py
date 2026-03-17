@@ -211,6 +211,12 @@ class PredictorBackend:
                 self.predictor.handle_request(
                     request=dict(type="reset_session", session_id=session_id)
                 )
+        state = self._get_inference_state(session_id)
+        if state is not None:
+            cache = state.get("cached_frame_outputs", {})
+            if not cache:
+                num_frames = state.get("num_frames", 0)
+                state["cached_frame_outputs"] = {idx: {} for idx in range(num_frames)}
 
     def close_session(self, session_id: str) -> None:
         self._guard()
