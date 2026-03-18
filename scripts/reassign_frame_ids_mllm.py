@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -197,7 +197,7 @@ def resolve_missing_mask_prompt(prompt_profile: str, prompt_path: str | None) ->
         "Find clearly visible creatures that are missing segmentation masks in some "
         "frames even though the same creature is already segmented in nearby frames. "
         'Return strict JSON only with schema {"issues":[{"target_frame_index":int,'
-        '"reference_masks":[{"frame_index":int,"local_id":int}],"description":str,'
+        '"reference_mask":{"frame_index":int,"local_id":int},"description":str,'
         '"confidence":float}]}. Only report clear, fixable gaps.'
     )
 
@@ -379,6 +379,14 @@ def parse_args() -> argparse.Namespace:
         dest="fill_missing_masks",
         action="store_false",
         help="Skip the missing-mask repair stage and only do ID reassignment.",
+    )
+    parser.add_argument(
+        "--allow-drop-assignments",
+        action="store_true",
+        help=(
+            "Allow the MLLM ID reassignment stage to emit drop labels that remove masks. "
+            "Disabled by default to preserve masks unless explicitly requested."
+        ),
     )
     parser.add_argument(
         "--codec",
@@ -877,6 +885,7 @@ def request_window_assignment(
     inventory_text: str,
     next_global_id: int,
     max_json_retries: int,
+    allow_drop_assignments: bool,
 ) -> tuple[dict[str, Any] | None, str | None]:
     messages = [
         {"role": "system", "content": system_prompt},
@@ -894,7 +903,12 @@ def request_window_assignment(
                         f"Use existing anchored labels exactly as given. "
                         f"For newly appearing creatures, start with temporary labels like new_a, new_b. "
                         f"The next available permanent global id after this window starts at g{int(next_global_id)}. "
-                        "Return strict JSON only."
+                        + (
+                            "Preserve every existing mask and do not use drop labels. "
+                            if not allow_drop_assignments
+                            else "Only use drop for clearly spurious masks that should be removed. "
+                        )
+                        + "Return strict JSON only."
                     ),
                 },
             ],
@@ -1048,6 +1062,10 @@ def sanitize_missing_issue_response(
             continue
 
         raw_refs = raw_issue.get("reference_masks", [])
+        if isinstance(raw_issue.get("reference_mask"), dict):
+            raw_refs = [raw_issue.get("reference_mask")] + (
+                raw_refs if isinstance(raw_refs, list) else []
+            )
         if not isinstance(raw_refs, list):
             continue
         ref_pairs: list[dict[str, int]] = []
@@ -1073,23 +1091,36 @@ def sanitize_missing_issue_response(
         if not ref_pairs:
             continue
 
-        issue_key = (target_frame_index, tuple((r["frame_index"], r["local_id"]) for r in ref_pairs))
-        if issue_key in seen:
-            continue
-        seen.add(issue_key)
+        ref_pairs.sort(
+            key=lambda ref: (
+                abs(int(ref["frame_index"]) - target_frame_index),
+                int(ref["frame_index"]),
+                int(ref["local_id"]),
+            )
+        )
         try:
             confidence = float(raw_issue.get("confidence", 0.0))
         except Exception:
             confidence = 0.0
 
-        issues.append(
-            {
-                "target_frame_index": int(target_frame_index),
-                "reference_masks": ref_pairs,
-                "description": str(raw_issue.get("description", "")).strip(),
-                "confidence": confidence,
-            }
-        )
+        description = str(raw_issue.get("description", "")).strip()
+        for split_index, ref_pair in enumerate(ref_pairs):
+            issue_key = (target_frame_index, int(ref_pair["frame_index"]), int(ref_pair["local_id"]))
+            if issue_key in seen:
+                continue
+            seen.add(issue_key)
+            issues.append(
+                {
+                    "target_frame_index": int(target_frame_index),
+                    "reference_masks": [ref_pair],
+                    "description": description,
+                    "confidence": confidence,
+                    "source_reference_count": len(ref_pairs),
+                    "source_reference_split_index": int(split_index),
+                }
+            )
+            if len(issues) >= max(1, int(max_issues)):
+                break
         if len(issues) >= max(1, int(max_issues)):
             break
     return issues
@@ -1119,6 +1150,8 @@ def request_missing_mask_issues(
                         f"Frames in this chronological window: {window_frame_indices}\n\n"
                         f"{inventory_text}\n\n"
                         f"Find at most {int(max_issues)} clearly visible missing-mask cases. "
+                        "Each reported issue must describe exactly one missing creature, not a bundle. "
+                        "Each issue must include exactly one reference_mask showing that same creature in a nearby frame. "
                         "A valid issue means the same creature is already segmented in nearby frame(s) "
                         "inside this window, but it is visibly present and unsegmented on the target frame. "
                         "Do not report ambiguous, occluded, tiny, or low-confidence cases. "
@@ -1150,7 +1183,7 @@ def request_missing_mask_issues(
                         "text": (
                             "Your previous response did not contain valid JSON. "
                             "Return strict JSON only with schema "
-                            '{"issues":[{"target_frame_index":int,"reference_masks":[{"frame_index":int,"local_id":int}],"description":str,"confidence":float}]}.'
+                            '{"issues":[{"target_frame_index":int,"reference_mask":{"frame_index":int,"local_id":int},"description":str,"confidence":float}]}.'
                         ),
                     }
                 ],
@@ -1241,6 +1274,55 @@ def find_mask_item(
     return None
 
 
+def estimate_target_hint_bbox_xyxy(
+    *,
+    target_frame_index: int,
+    reference_masks: list[dict[str, int]],
+    mask_items_by_frame: dict[int, list[dict[str, Any]]],
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int, int, int] | None:
+    references: list[tuple[int, tuple[int, int, int, int]]] = []
+    for ref in reference_masks:
+        frame_index = int(ref["frame_index"])
+        local_id = int(ref["local_id"])
+        item = find_mask_item(mask_items_by_frame, frame_index=frame_index, local_id=local_id)
+        bbox_xyxy = item.get("bbox_xyxy") if item is not None else None
+        if bbox_xyxy is None:
+            continue
+        references.append((frame_index, bbox_xyxy))
+
+    if not references:
+        return None
+
+    references.sort(key=lambda pair: pair[0])
+    before = [pair for pair in references if pair[0] < int(target_frame_index)]
+    after = [pair for pair in references if pair[0] > int(target_frame_index)]
+
+    if before and after:
+        before_idx, (bx1, by1, bx2, by2) = before[-1]
+        after_idx, (ax1, ay1, ax2, ay2) = after[0]
+        span = max(1, int(after_idx) - int(before_idx))
+        alpha = float(int(target_frame_index) - int(before_idx)) / float(span)
+        x1 = int(round((1.0 - alpha) * bx1 + alpha * ax1))
+        y1 = int(round((1.0 - alpha) * by1 + alpha * ay1))
+        x2 = int(round((1.0 - alpha) * bx2 + alpha * ax2))
+        y2 = int(round((1.0 - alpha) * by2 + alpha * ay2))
+    else:
+        _frame_index, (x1, y1, x2, y2) = min(
+            references,
+            key=lambda pair: abs(int(pair[0]) - int(target_frame_index)),
+        )
+
+    x1 = max(0, min(int(frame_w) - 1, int(x1)))
+    y1 = max(0, min(int(frame_h) - 1, int(y1)))
+    x2 = max(0, min(int(frame_w) - 1, int(x2)))
+    y2 = max(0, min(int(frame_h) - 1, int(y2)))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
 def build_point_candidates(
     *,
     target_frame_index: int,
@@ -1264,6 +1346,27 @@ def build_point_candidates(
 
     references.sort(key=lambda pair: pair[0])
     candidate_points: list[tuple[int, int]] = []
+
+    hint_bbox_xyxy = estimate_target_hint_bbox_xyxy(
+        target_frame_index=target_frame_index,
+        reference_masks=reference_masks,
+        mask_items_by_frame=mask_items_by_frame,
+        frame_w=frame_w,
+        frame_h=frame_h,
+    )
+    if hint_bbox_xyxy is not None:
+        x1, y1, x2, y2 = hint_bbox_xyxy
+        cx = int(round((x1 + x2) / 2.0))
+        cy = int(round((y1 + y2) / 2.0))
+        candidate_points.extend(
+            [
+                (cx, cy),
+                (int(round((x1 + cx) / 2.0)), cy),
+                (int(round((x2 + cx) / 2.0)), cy),
+                (cx, int(round((y1 + cy) / 2.0))),
+                (cx, int(round((y2 + cy) / 2.0))),
+            ]
+        )
 
     before = [pair for pair in references if pair[0] < int(target_frame_index)]
     after = [pair for pair in references if pair[0] > int(target_frame_index)]
@@ -1329,6 +1432,91 @@ def build_point_candidates(
     return deduped[: max(1, int(max_candidates))]
 
 
+def build_point_prompt_points(
+    *,
+    point_xy: tuple[int, int],
+    hint_bbox_xyxy: tuple[int, int, int, int] | None,
+    frame_w: int,
+    frame_h: int,
+) -> list[tuple[int, int, int]]:
+    points: list[tuple[int, int, int]] = []
+
+    def _append(point: tuple[int, int] | None, label: int) -> None:
+        if point is None:
+            return
+        normalized = normalize_point_xy(point, frame_w=frame_w, frame_h=frame_h)
+        if normalized is None:
+            return
+        entry = (int(normalized[0]), int(normalized[1]), int(label))
+        if entry not in points:
+            points.append(entry)
+
+    center = normalize_point_xy(point_xy, frame_w=frame_w, frame_h=frame_h)
+    if center is None:
+        return []
+    _append(center, 1)
+
+    if hint_bbox_xyxy is not None:
+        x1, y1, x2, y2 = hint_bbox_xyxy
+        width = max(4, int(x2 - x1))
+        height = max(4, int(y2 - y1))
+        dx = max(2, int(round(width * 0.12)))
+        dy = max(2, int(round(height * 0.12)))
+        cx, cy = center
+        for offset in ((dx, 0), (-dx, 0), (0, dy), (0, -dy)):
+            _append((cx + offset[0], cy + offset[1]), 1)
+        border = max(3, int(round(min(width, height) * 0.08)))
+        for negative in (
+            (x1 - border, cy),
+            (x2 + border, cy),
+            (cx, y1 - border),
+            (cx, y2 + border),
+        ):
+            _append(negative, 0)
+
+    return points
+
+
+def render_point_prompt_debug(
+    frame_bgr: Any,
+    *,
+    prompt_points: list[tuple[int, int, int]],
+    hint_bbox_xyxy: tuple[int, int, int, int] | None = None,
+    existing_items: list[dict[str, Any]] | None = None,
+) -> Any:
+    output = frame_bgr.copy()
+    if existing_items:
+        output = draw_mask_focus(output, focus_items=[], existing_items=existing_items)
+    if hint_bbox_xyxy is not None:
+        x1, y1, x2, y2 = hint_bbox_xyxy
+        cv2.rectangle(output, (int(x1), int(y1)), (int(x2), int(y2)), (255, 220, 40), 2)
+    for idx, (x, y, label) in enumerate(prompt_points, start=1):
+        color = (60, 220, 60) if int(label) > 0 else (40, 60, 220)
+        cv2.circle(output, (int(x), int(y)), 6, color, -1)
+        cv2.circle(output, (int(x), int(y)), 9, (255, 255, 255), 1)
+        cv2.putText(
+            output,
+            f"{'+' if int(label) > 0 else '-'}{idx}",
+            (int(x) + 8, int(y) - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            output,
+            f"{'+' if int(label) > 0 else '-'}{idx}",
+            (int(x) + 8, int(y) - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+    return output
+
+
 def serialize_backend_outputs(
     *,
     frame_index: int,
@@ -1365,6 +1553,28 @@ def serialize_backend_outputs(
         "out_tracker_probs": out_tracker_probs,
         "out_boxes_xywh": out_boxes_xywh,
         "out_binary_masks_rle": rle_masks,
+    }
+
+
+def summarize_backend_outputs(
+    *,
+    frame_index: int,
+    outputs: dict[str, Any],
+    frame_h: int,
+    frame_w: int,
+) -> dict[str, Any]:
+    serialized = serialize_backend_outputs(
+        frame_index=frame_index,
+        outputs=outputs,
+        frame_h=frame_h,
+        frame_w=frame_w,
+    )
+    return {
+        "frame_index": int(frame_index),
+        "num_masks": len(serialized.get("out_binary_masks_rle") or []),
+        "out_obj_ids": [int(x) for x in serialized.get("out_obj_ids") or []],
+        "out_probs": list(serialized.get("out_probs") or []),
+        "out_boxes_xywh": list(serialized.get("out_boxes_xywh") or []),
     }
 
 
@@ -1544,6 +1754,8 @@ def repair_missing_masks_in_window(
             "description": issue.get("description", ""),
             "confidence": float(issue.get("confidence", 0.0)),
             "reference_masks": issue.get("reference_masks", []),
+            "source_reference_count": int(issue.get("source_reference_count", 1)),
+            "source_reference_split_index": int(issue.get("source_reference_split_index", 0)),
             "status": "unresolved",
             "attempts": [],
         }
@@ -1556,6 +1768,7 @@ def repair_missing_masks_in_window(
         cv2.imwrite(str(target_frame_path), target_frame_bgr)
 
         reference_tiles: list[tuple[int, Any]] = []
+        reference_summaries: list[dict[str, Any]] = []
         for ref in issue["reference_masks"]:
             ref_frame_index = int(ref["frame_index"])
             ref_local_id = int(ref["local_id"])
@@ -1563,6 +1776,16 @@ def repair_missing_masks_in_window(
             ref_item = find_mask_item(mask_items_by_frame, frame_index=ref_frame_index, local_id=ref_local_id)
             if ref_frame_bgr is None or ref_item is None:
                 continue
+            reference_summaries.append(
+                {
+                    "frame_index": int(ref_frame_index),
+                    "local_id": int(ref_local_id),
+                    "centroid": list(ref_item["centroid"]) if ref_item.get("centroid") is not None else None,
+                    "bbox_xyxy": list(ref_item["bbox_xyxy"]) if ref_item.get("bbox_xyxy") is not None else None,
+                    "score": ref_item.get("score"),
+                    "area": int(ref_item.get("area") or 0),
+                }
+            )
             rendered = draw_mask_focus(
                 ref_frame_bgr,
                 focus_items=[ref_item],
@@ -1580,6 +1803,22 @@ def repair_missing_masks_in_window(
             cols=min(int(args.collage_cols), max(1, len(reference_tiles))),
             tile_max_edge=int(args.collage_tile_max_edge),
         )
+        issue_report["reference_summaries"] = reference_summaries
+        issue_report["debug_paths"] = {
+            "target_frame_path": str(target_frame_path),
+            "reference_collage_path": str(reference_collage_path),
+        }
+
+        target_hint_bbox_xyxy = estimate_target_hint_bbox_xyxy(
+            target_frame_index=target_frame_index,
+            reference_masks=list(issue["reference_masks"]),
+            mask_items_by_frame=mask_items_by_frame,
+            frame_w=frame_w,
+            frame_h=frame_h,
+        )
+        issue_report["target_hint_bbox_xyxy"] = (
+            list(target_hint_bbox_xyxy) if target_hint_bbox_xyxy is not None else None
+        )
 
         initial_candidates = build_point_candidates(
             target_frame_index=target_frame_index,
@@ -1589,6 +1828,9 @@ def repair_missing_masks_in_window(
             frame_h=frame_h,
             max_candidates=int(args.gap_fill_point_candidates),
         )
+        issue_report["initial_point_candidates"] = [
+            [int(point[0]), int(point[1])] for point in initial_candidates
+        ]
         if not initial_candidates:
             issue_report["failure_reason"] = "no_point_candidates"
             report["issues"].append(issue_report)
@@ -1604,18 +1846,53 @@ def repair_missing_masks_in_window(
             attempt_dir = issue_dir / f"attempt_{attempt_index:02d}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
             candidate_overlay_path = attempt_dir / "candidate_overlay.jpg"
+            prompt_overlay_path = attempt_dir / "point_prompt_overlay.jpg"
+            prompt_points = build_point_prompt_points(
+                point_xy=point_xy,
+                hint_bbox_xyxy=target_hint_bbox_xyxy,
+                frame_w=frame_w,
+                frame_h=frame_h,
+            )
             attempt_report: dict[str, Any] = {
                 "attempt_index": int(attempt_index),
                 "point_xy": [int(point_xy[0]), int(point_xy[1])],
+                "prompt_points": [
+                    {"x": int(x), "y": int(y), "label": int(label)}
+                    for x, y, label in prompt_points
+                ],
+                "candidate_overlay_path": str(candidate_overlay_path),
+                "point_prompt_overlay_path": str(prompt_overlay_path),
             }
+
+            target_existing_items = decode_frame_row_masks(
+                working_frame_rows_by_index[target_frame_index],
+                frame_h=frame_h,
+                frame_w=frame_w,
+            )
+            rendered_prompt = render_point_prompt_debug(
+                target_frame_bgr,
+                prompt_points=prompt_points,
+                hint_bbox_xyxy=target_hint_bbox_xyxy,
+                existing_items=target_existing_items,
+            )
+            cv2.imwrite(str(prompt_overlay_path), rendered_prompt)
 
             backend.reset_session(session_id)
             response = backend.add_point_prompt(
                 session_id=session_id,
                 frame_idx=target_frame_index,
                 obj_id=1,
-                points=[(float(point_xy[0]), float(point_xy[1]), 1)],
+                points=[
+                    (float(x), float(y), int(label))
+                    for x, y, label in prompt_points
+                ],
                 frame_size=(frame_w, frame_h),
+            )
+            attempt_report["backend_output_summary"] = summarize_backend_outputs(
+                frame_index=target_frame_index,
+                outputs=response.get("outputs", {}),
+                frame_h=frame_h,
+                frame_w=frame_w,
             )
             candidate_item = select_point_prompt_candidate(
                 frame_index=target_frame_index,
@@ -1626,15 +1903,11 @@ def repair_missing_masks_in_window(
             )
             if candidate_item is None:
                 attempt_report["decision"] = "retry"
+                attempt_report["verification_status"] = "not_run"
                 attempt_report["failure_reason"] = "no_mask_from_point_prompt"
                 issue_report["attempts"].append(attempt_report)
                 continue
 
-            target_existing_items = decode_frame_row_masks(
-                working_frame_rows_by_index[target_frame_index],
-                frame_h=frame_h,
-                frame_w=frame_w,
-            )
             max_existing_iou = 0.0
             for existing_item in target_existing_items:
                 max_existing_iou = max(
@@ -1642,6 +1915,11 @@ def repair_missing_masks_in_window(
                     binary_mask_iou(candidate_item["mask"], existing_item["mask"]),
                 )
             attempt_report["max_existing_iou"] = float(max_existing_iou)
+            attempt_report["candidate_bbox_xyxy"] = (
+                list(candidate_item["bbox_xyxy"]) if candidate_item.get("bbox_xyxy") is not None else None
+            )
+            attempt_report["candidate_area"] = int(candidate_item.get("area") or 0)
+            attempt_report["candidate_score"] = candidate_item.get("score")
 
             rendered_candidate = draw_mask_focus(
                 target_frame_bgr,
@@ -1691,6 +1969,7 @@ def repair_missing_masks_in_window(
                 frame_h=frame_h,
             )
             attempt_report["decision"] = decision
+            attempt_report["verification_status"] = decision
             attempt_report["reason"] = str((verdict_parsed or {}).get("reason", "")).strip()
             attempt_report["suggested_point"] = list(suggested_point) if suggested_point else None
 
@@ -1740,6 +2019,25 @@ def repair_missing_masks_in_window(
 
     report["accepted_issue_count"] = sum(1 for issue in report["issues"] if issue.get("status") == "accepted")
     report["unresolved_issue_count"] = sum(1 for issue in report["issues"] if issue.get("status") != "accepted")
+    report["failure_reason_counts"] = dict(
+        Counter(str(issue.get("failure_reason")) for issue in report["issues"] if issue.get("failure_reason"))
+    )
+    report["attempt_failure_reason_counts"] = dict(
+        Counter(
+            str(attempt.get("failure_reason"))
+            for issue in report["issues"]
+            for attempt in issue.get("attempts", [])
+            if attempt.get("failure_reason")
+        )
+    )
+    report["verification_status_counts"] = dict(
+        Counter(
+            str(attempt.get("verification_status"))
+            for issue in report["issues"]
+            for attempt in issue.get("attempts", [])
+            if attempt.get("verification_status") is not None
+        )
+    )
     if args.debug:
         write_json(gap_dir / "gap_fill_report.json", report)
     return report, local_ids_by_frame, mask_items_by_frame
@@ -1752,13 +2050,15 @@ def apply_window_assignments(
     existing_frame_assignments: dict[int, dict[int, int]],
     parsed_assignments: dict[int, dict[int, str | None]],
     next_global_id: int,
-) -> tuple[dict[int, dict[int, int]], dict[int, list[int]], int]:
+    allow_drop_assignments: bool,
+) -> tuple[dict[int, dict[int, int]], dict[int, list[int]], dict[int, list[int]], int]:
     resolved: dict[int, dict[int, int]] = {
         int(frame_idx): {int(k): int(v) for k, v in mapping.items()}
         for frame_idx, mapping in existing_frame_assignments.items()
         if frame_idx in window_frame_indices
     }
     dropped_by_frame: dict[int, list[int]] = {}
+    ignored_drops_by_frame: dict[int, list[int]] = {}
     temp_label_to_gid: dict[str, int] = {}
     anchor_global_ids = {
         int(global_id)
@@ -1800,8 +2100,11 @@ def apply_window_assignments(
             if normalized is None:
                 chosen_global_id = None
             elif normalized.lower() == "drop":
-                dropped_by_frame.setdefault(int(frame_index), []).append(local_id)
-                continue
+                if bool(allow_drop_assignments):
+                    dropped_by_frame.setdefault(int(frame_index), []).append(local_id)
+                    continue
+                ignored_drops_by_frame.setdefault(int(frame_index), []).append(local_id)
+                chosen_global_id = None
             elif re.fullmatch(r"g\d+", normalized.lower()):
                 requested_gid = int(normalized[1:])
                 if requested_gid in anchor_global_ids and requested_gid not in assigned_global_ids:
@@ -1845,7 +2148,7 @@ def apply_window_assignments(
             frame_fixed[local_id] = int(chosen_global_id)
             assigned_global_ids.add(int(chosen_global_id))
 
-    return resolved, dropped_by_frame, next_global_id
+    return resolved, dropped_by_frame, ignored_drops_by_frame, next_global_id
 
 
 def relabel_frame_row(
@@ -2028,6 +2331,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
 
     frame_assignments: dict[int, dict[int, int]] = {}
     dropped_local_ids_by_frame: dict[int, set[int]] = {}
+    ignored_drop_labels_by_frame: dict[int, set[int]] = {}
     next_global_id = 1
     window_reports: list[dict[str, Any]] = []
     raw_response_failures = 0
@@ -2169,6 +2473,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
                 inventory_text=inventory_text,
                 next_global_id=next_global_id,
                 max_json_retries=int(args.max_json_retries),
+                allow_drop_assignments=bool(args.allow_drop_assignments),
             )
             if parsed is None:
                 raw_response_failures += 1
@@ -2179,12 +2484,18 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
                 local_ids_by_frame=local_ids_by_frame,
             )
 
-            resolved_window_assignments, dropped_by_frame, next_global_id = apply_window_assignments(
+            (
+                resolved_window_assignments,
+                dropped_by_frame,
+                ignored_drops_by_frame,
+                next_global_id,
+            ) = apply_window_assignments(
                 window_frame_indices=window_frame_indices,
                 mask_items_by_frame=mask_items_by_frame,
                 existing_frame_assignments=frame_assignments,
                 parsed_assignments=sanitized_assignments,
                 next_global_id=next_global_id,
+                allow_drop_assignments=bool(args.allow_drop_assignments),
             )
 
             for frame_index, mapping in resolved_window_assignments.items():
@@ -2193,6 +2504,10 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
                 )
             for frame_index, local_ids in dropped_by_frame.items():
                 dropped_local_ids_by_frame.setdefault(int(frame_index), set()).update(
+                    int(local_id) for local_id in local_ids
+                )
+            for frame_index, local_ids in ignored_drops_by_frame.items():
+                ignored_drop_labels_by_frame.setdefault(int(frame_index), set()).update(
                     int(local_id) for local_id in local_ids
                 )
 
@@ -2217,6 +2532,10 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
                 "dropped_local_ids": {
                     str(frame_index): [int(x) for x in sorted(local_ids)]
                     for frame_index, local_ids in sorted(dropped_by_frame.items())
+                },
+                "ignored_drop_labels": {
+                    str(frame_index): [int(x) for x in sorted(local_ids)]
+                    for frame_index, local_ids in sorted(ignored_drops_by_frame.items())
                 },
             }
             window_reports.append(window_report)
@@ -2268,6 +2587,23 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
             changed_frames += 1
         relabeled_mask_count += len(new_ids)
 
+    gap_fill_failure_reason_counts = Counter()
+    gap_fill_attempt_failure_reason_counts = Counter()
+    gap_fill_verification_status_counts = Counter()
+    windows_with_detected_gap_fill_issues = 0
+    for window_report in window_reports:
+        gap_fill_report = window_report.get("gap_fill_report") or {}
+        issues = gap_fill_report.get("issues") or []
+        if issues:
+            windows_with_detected_gap_fill_issues += 1
+        gap_fill_failure_reason_counts.update(gap_fill_report.get("failure_reason_counts") or {})
+        gap_fill_attempt_failure_reason_counts.update(
+            gap_fill_report.get("attempt_failure_reason_counts") or {}
+        )
+        gap_fill_verification_status_counts.update(
+            gap_fill_report.get("verification_status_counts") or {}
+        )
+
     consistent_payload = {
         "format_version": int(frame_outputs_payload.get("format_version", 2)),
         "source": "sam3_agent_every_frame_consistent_ids_mllm",
@@ -2306,6 +2642,9 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
                 "dropped_local_ids": [
                     int(x) for x in sorted(dropped_local_ids_by_frame.get(frame_index, set()))
                 ],
+                "ignored_drop_labels": [
+                    int(x) for x in sorted(ignored_drop_labels_by_frame.get(frame_index, set()))
+                ],
             }
         )
 
@@ -2319,6 +2658,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         "overlay_output_path": str(overlay_output_path) if args.render_video else "",
         "prompt_profile": str(args.prompt_profile),
         "fill_missing_masks": bool(args.fill_missing_masks),
+        "allow_drop_assignments": bool(args.allow_drop_assignments),
         "window_size": int(args.window_size),
         "window_stride": int(args.window_stride),
         "window_count": len(windows),
@@ -2327,6 +2667,11 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         "gap_fill_accepted_issue_count": int(gap_fill_accepted_issue_count),
         "gap_fill_unresolved_issue_count": int(gap_fill_unresolved_issue_count),
         "gap_filled_frame_count": int(gap_filled_frame_count),
+        "windows_with_detected_gap_fill_issues": int(windows_with_detected_gap_fill_issues),
+        "gap_fill_failure_reason_counts": dict(gap_fill_failure_reason_counts),
+        "gap_fill_attempt_failure_reason_counts": dict(gap_fill_attempt_failure_reason_counts),
+        "gap_fill_verification_status_counts": dict(gap_fill_verification_status_counts),
+        "ignored_drop_label_count": int(sum(len(v) for v in ignored_drop_labels_by_frame.values())),
         "total_video_frames": int(total_video_frames),
         "valid_window_frames": len(valid_frame_indices),
         "changed_frame_count": int(changed_frames),
@@ -2348,10 +2693,16 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         "window_count": int(len(windows)),
         "valid_frame_count": int(len(valid_frame_indices)),
         "fill_missing_masks": bool(args.fill_missing_masks),
+        "allow_drop_assignments": bool(args.allow_drop_assignments),
         "gap_fill_detection_failure_count": int(gap_fill_detection_failures),
         "gap_fill_accepted_issue_count": int(gap_fill_accepted_issue_count),
         "gap_fill_unresolved_issue_count": int(gap_fill_unresolved_issue_count),
         "gap_filled_frame_count": int(gap_filled_frame_count),
+        "windows_with_detected_gap_fill_issues": int(windows_with_detected_gap_fill_issues),
+        "gap_fill_failure_reason_counts": dict(gap_fill_failure_reason_counts),
+        "gap_fill_attempt_failure_reason_counts": dict(gap_fill_attempt_failure_reason_counts),
+        "gap_fill_verification_status_counts": dict(gap_fill_verification_status_counts),
+        "ignored_drop_label_count": int(sum(len(v) for v in ignored_drop_labels_by_frame.values())),
         "changed_frame_count": int(changed_frames),
         "relabeled_mask_count": int(relabeled_mask_count),
         "num_global_ids": int(max(0, next_global_id - 1)),

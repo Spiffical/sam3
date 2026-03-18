@@ -10,12 +10,13 @@ Your task:
 - use different labels for different creatures visible in the same frame
 - respect all fixed global IDs shown in the overlap frames
 - when a creature first appears in this window and has no fixed global ID yet, use a temporary label like new_a, new_b, new_c
-- if a mask is clearly spurious and should be removed, you may use the label drop
+- preserve existing masks unless the caller explicitly says dropping is allowed
 
 Important rules:
 - frames are in chronological order
 - creatures may appear or disappear partway through the window
 - do not invent extra masks
+- do not drop or delete masks unless the caller explicitly says dropping is allowed
 - return one assignment for every visible local mask in every listed frame
 - reuse the same temporary new_* label for the same newly appearing creature across later frames in the same window
 
@@ -27,7 +28,7 @@ Return STRICT JSON only, with this schema:
       "assignments": [
         {"local_id": 1, "track_label": "g7"},
         {"local_id": 2, "track_label": "new_a"},
-        {"local_id": 3, "track_label": "drop"}
+        {"local_id": 3, "track_label": "new_b"}
       ]
     }
   ]
