@@ -1556,6 +1556,16 @@ def serialize_backend_outputs(
     }
 
 
+def unwrap_backend_outputs(response: Any) -> dict[str, Any]:
+    """Accept both backend response shapes: flat outputs or {'outputs': ...}."""
+    if not isinstance(response, dict):
+        return {}
+    nested = response.get("outputs")
+    if isinstance(nested, dict):
+        return nested
+    return response
+
+
 def summarize_backend_outputs(
     *,
     frame_index: int,
@@ -1888,15 +1898,16 @@ def repair_missing_masks_in_window(
                 ],
                 frame_size=(frame_w, frame_h),
             )
+            backend_outputs = unwrap_backend_outputs(response)
             attempt_report["backend_output_summary"] = summarize_backend_outputs(
                 frame_index=target_frame_index,
-                outputs=response.get("outputs", {}),
+                outputs=backend_outputs,
                 frame_h=frame_h,
                 frame_w=frame_w,
             )
             candidate_item = select_point_prompt_candidate(
                 frame_index=target_frame_index,
-                outputs=response.get("outputs", {}),
+                outputs=backend_outputs,
                 requested_obj_id=1,
                 frame_h=frame_h,
                 frame_w=frame_w,
