@@ -50,6 +50,8 @@ Reassignment options:
   --max-json-retries <n>              Default: 2
   --window-size <n>                   Default: 10
   --window-stride <n>                 Default: 8
+  --assignment-history-frames <n>     Default: 8
+  --assignment-heuristic-min-score <f> Default: 0.85
   --max-gap-issues-per-window <n>     Default: 8
   --gap-fill-max-attempts <n>         Default: 4
   --gap-fill-point-candidates <n>     Default: 6
@@ -109,6 +111,8 @@ max_completion_tokens="1024"
 max_json_retries="2"
 window_size="10"
 window_stride="8"
+assignment_history_frames="8"
+assignment_heuristic_min_score="0.85"
 max_gap_issues_per_window="8"
 gap_fill_max_attempts="4"
 gap_fill_point_candidates="6"
@@ -169,6 +173,8 @@ while [[ $# -gt 0 ]]; do
     --max-json-retries) max_json_retries="$2"; shift 2 ;;
     --window-size) window_size="$2"; shift 2 ;;
     --window-stride) window_stride="$2"; shift 2 ;;
+    --assignment-history-frames) assignment_history_frames="$2"; shift 2 ;;
+    --assignment-heuristic-min-score) assignment_heuristic_min_score="$2"; shift 2 ;;
     --max-gap-issues-per-window) max_gap_issues_per_window="$2"; shift 2 ;;
     --gap-fill-max-attempts) gap_fill_max_attempts="$2"; shift 2 ;;
     --gap-fill-point-candidates) gap_fill_point_candidates="$2"; shift 2 ;;
@@ -339,6 +345,8 @@ env_vars=(
   "MAX_JSON_RETRIES=$max_json_retries"
   "WINDOW_SIZE=$window_size"
   "WINDOW_STRIDE=$window_stride"
+  "ASSIGNMENT_HISTORY_FRAMES=$assignment_history_frames"
+  "ASSIGNMENT_HEURISTIC_MIN_SCORE=$assignment_heuristic_min_score"
   "MAX_GAP_ISSUES_PER_WINDOW=$max_gap_issues_per_window"
   "GAP_FILL_MAX_ATTEMPTS=$gap_fill_max_attempts"
   "GAP_FILL_POINT_CANDIDATES=$gap_fill_point_candidates"
