@@ -283,6 +283,21 @@ def parse_args() -> argparse.Namespace:
         help="Maximum tokens per MLLM completion. Default: 1024",
     )
     parser.add_argument(
+        "--assignment-history-frames",
+        type=int,
+        default=8,
+        help=(
+            "How many already-processed prior frames to consult when reusing an "
+            "existing global ID during assignment resolution. Default: 8"
+        ),
+    )
+    parser.add_argument(
+        "--assignment-heuristic-min-score",
+        type=float,
+        default=0.85,
+        help="Minimum heuristic match score needed to reuse an existing global ID. Default: 0.85",
+    )
+    parser.add_argument(
         "--max-json-retries",
         type=int,
         default=2,
@@ -756,6 +771,7 @@ def heuristic_match_global_id(
     prior_items: list[dict[str, Any]],
     prior_assignments: dict[int, int],
     disallowed_global_ids: set[int],
+    min_score: float = 0.85,
 ) -> int | None:
     best_global_id: int | None = None
     best_score = 0.0
@@ -781,9 +797,74 @@ def heuristic_match_global_id(
             best_score = score
             best_global_id = int(global_id)
 
-    if best_score >= 0.85:
+    if best_score >= float(min_score):
         return best_global_id
     return None
+
+
+def collect_recent_assignment_history(
+    *,
+    frame_index: int,
+    resolved_window_assignments: dict[int, dict[int, int]],
+    existing_frame_assignments: dict[int, dict[int, int]],
+    mask_items_by_frame: dict[int, list[dict[str, Any]]],
+    working_frame_rows_by_index: dict[int, dict[str, Any]],
+    frame_h: int,
+    frame_w: int,
+    history_frame_budget: int,
+) -> list[tuple[list[dict[str, Any]], dict[int, int]]]:
+    budget = max(0, int(history_frame_budget))
+    if budget <= 0:
+        return []
+
+    ordered_frames: list[int] = []
+    seen_frames: set[int] = set()
+
+    for prior_frame in sorted(
+        (int(fi) for fi in resolved_window_assignments.keys() if int(fi) < int(frame_index)),
+        reverse=True,
+    ):
+        if prior_frame in seen_frames:
+            continue
+        ordered_frames.append(prior_frame)
+        seen_frames.add(prior_frame)
+        if len(ordered_frames) >= budget:
+            break
+
+    if len(ordered_frames) < budget:
+        for prior_frame in sorted(
+            (int(fi) for fi in existing_frame_assignments.keys() if int(fi) < int(frame_index)),
+            reverse=True,
+        ):
+            if prior_frame in seen_frames:
+                continue
+            ordered_frames.append(prior_frame)
+            seen_frames.add(prior_frame)
+            if len(ordered_frames) >= budget:
+                break
+
+    history_pairs: list[tuple[list[dict[str, Any]], dict[int, int]]] = []
+    for prior_frame in ordered_frames:
+        prior_mapping = resolved_window_assignments.get(prior_frame) or existing_frame_assignments.get(prior_frame) or {}
+        if not prior_mapping:
+            continue
+
+        prior_items = mask_items_by_frame.get(prior_frame)
+        if prior_items is None:
+            prior_row = working_frame_rows_by_index.get(prior_frame)
+            if prior_row is None:
+                continue
+            prior_items = decode_frame_row_masks(prior_row, frame_h, frame_w)
+
+        if prior_items:
+            history_pairs.append(
+                (
+                    prior_items,
+                    {int(k): int(v) for k, v in prior_mapping.items()},
+                )
+            )
+
+    return history_pairs
 
 
 def normalize_track_label(value: Any) -> str | None:
@@ -901,7 +982,9 @@ def request_window_assignment(
                         f"{anchor_text}\n\n"
                         f"{inventory_text}\n\n"
                         f"Use existing anchored labels exactly as given. "
-                        f"For newly appearing creatures, start with temporary labels like new_a, new_b. "
+                        f"Be conservative about creating new track labels: only use temporary labels like new_a, new_b "
+                        f"when a creature clearly does not match any already-anchored creature continuing through the overlap frames. "
+                        f"If a creature plausibly continues from an anchored overlap creature, reuse that anchored g-label instead of inventing a new_* label. "
                         f"The next available permanent global id after this window starts at g{int(next_global_id)}. "
                         + (
                             "Preserve every existing mask and do not use drop labels. "
@@ -2058,10 +2141,15 @@ def apply_window_assignments(
     *,
     window_frame_indices: list[int],
     mask_items_by_frame: dict[int, list[dict[str, Any]]],
+    working_frame_rows_by_index: dict[int, dict[str, Any]],
+    frame_h: int,
+    frame_w: int,
     existing_frame_assignments: dict[int, dict[int, int]],
     parsed_assignments: dict[int, dict[int, str | None]],
     next_global_id: int,
     allow_drop_assignments: bool,
+    assignment_history_frames: int,
+    assignment_heuristic_min_score: float,
 ) -> tuple[dict[int, dict[int, int]], dict[int, list[int]], dict[int, list[int]], int]:
     resolved: dict[int, dict[int, int]] = {
         int(frame_idx): {int(k): int(v) for k, v in mapping.items()}
@@ -2086,18 +2174,16 @@ def apply_window_assignments(
         frame_fixed = resolved.setdefault(int(frame_index), {})
         frame_model_map = parsed_assignments.get(frame_index, {})
         assigned_global_ids = set(int(gid) for gid in frame_fixed.values())
-        prior_frames = [
-            window_frame_indices[idx]
-            for idx in range(max(0, pos - 2), pos)
-            if window_frame_indices[idx] in resolved
-        ]
-        prior_pairs = [
-            (
-                mask_items_by_frame.get(prior_frame, []),
-                resolved.get(prior_frame, {}),
-            )
-            for prior_frame in prior_frames
-        ]
+        prior_pairs = collect_recent_assignment_history(
+            frame_index=frame_index,
+            resolved_window_assignments=resolved,
+            existing_frame_assignments=existing_frame_assignments,
+            mask_items_by_frame=mask_items_by_frame,
+            working_frame_rows_by_index=working_frame_rows_by_index,
+            frame_h=frame_h,
+            frame_w=frame_w,
+            history_frame_budget=assignment_history_frames,
+        )
 
         for item in mask_items:
             local_id = int(item["local_id"])
@@ -2107,29 +2193,45 @@ def apply_window_assignments(
             model_label = frame_model_map.get(local_id)
             normalized = normalize_track_label(model_label)
             chosen_global_id: int | None = None
+            heuristic_gid: int | None = None
+
+            for prior_items, prior_mapping in prior_pairs:
+                heuristic_gid = heuristic_match_global_id(
+                    current_item=item,
+                    prior_items=prior_items,
+                    prior_assignments=prior_mapping,
+                    disallowed_global_ids=assigned_global_ids,
+                    min_score=assignment_heuristic_min_score,
+                )
+                if heuristic_gid is not None:
+                    break
 
             if normalized is None:
-                chosen_global_id = None
+                chosen_global_id = heuristic_gid
             elif normalized.lower() == "drop":
                 if bool(allow_drop_assignments):
                     dropped_by_frame.setdefault(int(frame_index), []).append(local_id)
                     continue
                 ignored_drops_by_frame.setdefault(int(frame_index), []).append(local_id)
-                chosen_global_id = None
+                chosen_global_id = heuristic_gid
             elif re.fullmatch(r"g\d+", normalized.lower()):
                 requested_gid = int(normalized[1:])
-                if requested_gid in anchor_global_ids and requested_gid not in assigned_global_ids:
+                if requested_gid in assigned_global_ids:
+                    chosen_global_id = None
+                elif requested_gid in anchor_global_ids:
+                    chosen_global_id = requested_gid
+                elif heuristic_gid == requested_gid:
                     chosen_global_id = requested_gid
                 else:
-                    temp_key = f"model_{normalized.lower()}"
-                    chosen_global_id = temp_label_to_gid.get(temp_key)
-                    if chosen_global_id is None:
-                        chosen_global_id = int(next_global_id)
-                        next_global_id += 1
-                        temp_label_to_gid[temp_key] = chosen_global_id
+                    chosen_global_id = heuristic_gid
             else:
                 temp_key = normalized.lower()
                 chosen_global_id = temp_label_to_gid.get(temp_key)
+                if chosen_global_id in assigned_global_ids:
+                    chosen_global_id = None
+                if chosen_global_id is None and heuristic_gid is not None:
+                    chosen_global_id = heuristic_gid
+                    temp_label_to_gid[temp_key] = int(chosen_global_id)
                 if chosen_global_id is None:
                     chosen_global_id = int(next_global_id)
                     next_global_id += 1
@@ -2139,16 +2241,6 @@ def apply_window_assignments(
                 chosen_global_id = None
 
             if chosen_global_id is None:
-                heuristic_gid = None
-                for prior_items, prior_mapping in reversed(prior_pairs):
-                    heuristic_gid = heuristic_match_global_id(
-                        current_item=item,
-                        prior_items=prior_items,
-                        prior_assignments=prior_mapping,
-                        disallowed_global_ids=assigned_global_ids,
-                    )
-                    if heuristic_gid is not None:
-                        break
                 if heuristic_gid is not None:
                     chosen_global_id = heuristic_gid
 
@@ -2503,10 +2595,15 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
             ) = apply_window_assignments(
                 window_frame_indices=window_frame_indices,
                 mask_items_by_frame=mask_items_by_frame,
+                working_frame_rows_by_index=working_frame_rows_by_index,
+                frame_h=frame_h,
+                frame_w=frame_w,
                 existing_frame_assignments=frame_assignments,
                 parsed_assignments=sanitized_assignments,
                 next_global_id=next_global_id,
                 allow_drop_assignments=bool(args.allow_drop_assignments),
+                assignment_history_frames=int(args.assignment_history_frames),
+                assignment_heuristic_min_score=float(args.assignment_heuristic_min_score),
             )
 
             for frame_index, mapping in resolved_window_assignments.items():

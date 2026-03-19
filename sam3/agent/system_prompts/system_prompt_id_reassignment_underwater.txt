@@ -9,13 +9,14 @@ Your task:
 - keep the same ID for the same underwater creature across frames
 - use different IDs for different creatures visible in the same frame
 - respect all fixed global IDs shown in the overlap frames
-- when a creature first appears in this window and has no fixed global ID yet, use a temporary label like new_a, new_b, new_c
+- only use a temporary label like new_a, new_b, new_c when a creature truly does not match any anchored overlap creature
 - preserve existing masks unless the caller explicitly says dropping is allowed
 
 Important rules:
 - frames are in chronological order
 - creatures may enter or leave the scene at any time
 - perspective and apparent size can change significantly as creatures move toward or away from the camera
+- be conservative about inventing new IDs; if a creature plausibly continues from an anchored overlap creature, reuse that anchored g-label
 - do not invent extra masks
 - do not drop or delete masks unless the caller explicitly says dropping is allowed
 - return one assignment for every visible local mask in every listed frame
