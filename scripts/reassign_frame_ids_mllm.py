@@ -176,6 +176,14 @@ def default_gap_fill_verify_prompt_path(prompt_profile: str) -> str:
     return str(base / "system_prompt_missing_mask_verify_general.txt")
 
 
+def default_outlier_mask_prompt_path(prompt_profile: str) -> str:
+    base = REPO_ROOT / "sam3" / "agent" / "system_prompts"
+    profile = (prompt_profile or "").strip().lower()
+    if profile == "underwater":
+        return str(base / "system_prompt_outlier_mask_filter_underwater.txt")
+    return str(base / "system_prompt_outlier_mask_filter_general.txt")
+
+
 def resolve_system_prompt(prompt_profile: str, prompt_path: str | None) -> str:
     candidate = prompt_path or default_prompt_path(prompt_profile)
     if candidate and os.path.exists(candidate):
@@ -211,6 +219,21 @@ def resolve_gap_fill_verify_prompt(prompt_profile: str, prompt_path: str | None)
         "Judge whether a SAM3 point-prompt candidate mask correctly fills a missing "
         "creature on the target frame. Return strict JSON only with schema "
         '{"decision":"accept|retry|reject","reason":str,"suggested_point":[x,y]|null}.'
+    )
+
+
+def resolve_outlier_mask_prompt(prompt_profile: str, prompt_path: str | None) -> str:
+    candidate = prompt_path or default_outlier_mask_prompt_path(prompt_profile)
+    if candidate and os.path.exists(candidate):
+        with open(candidate, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    return (
+        "Review a proposed gap-fill mask and decide whether it should stay or be removed. "
+        "Image 1 is the raw target frame, image 2 is the candidate mask overlay, and "
+        "image 3 shows nearby reference masks for the same creature. Remove the mask only "
+        "if it clearly segments empty background, sediment, rocks, noise, or another obvious "
+        "non-creature region instead of the intended animal. Return strict JSON only with schema "
+        '{"decision":"keep|remove","reason":str}.'
     )
 
 
@@ -263,6 +286,11 @@ def parse_args() -> argparse.Namespace:
         "--verify-gap-fill-prompt-path",
         default="",
         help="Optional override system prompt file for gap-fill candidate verification.",
+    )
+    parser.add_argument(
+        "--outlier-mask-prompt-path",
+        default="",
+        help="Optional override system prompt file for gap-fill outlier-mask review.",
     )
     parser.add_argument(
         "--window-size",
@@ -320,6 +348,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=6,
         help="Maximum heuristic point candidates per issue before giving up. Default: 6",
+    )
+    parser.add_argument(
+        "--max-outlier-checks-per-window",
+        type=int,
+        default=12,
+        help=(
+            "Maximum accepted gap-fill masks to re-review per window for one-frame outliers. "
+            "Default: 12"
+        ),
     )
     parser.add_argument(
         "--image-detail",
@@ -404,6 +441,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--filter-outlier-masks",
+        dest="filter_outlier_masks",
+        action="store_true",
+        help=(
+            "Review accepted gap-fill masks for obvious one-frame hallucinations before "
+            "ID reassignment. Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-filter-outlier-masks",
+        dest="filter_outlier_masks",
+        action="store_false",
+        help="Skip the outlier-mask cleanup stage after gap fill.",
+    )
+    parser.add_argument(
         "--codec",
         default=DEFAULT_CODEC,
         help=f"OpenCV fourcc codec. Default: {DEFAULT_CODEC}",
@@ -430,7 +482,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep extra window-level debug JSON files.",
     )
-    parser.set_defaults(fill_missing_masks=True)
+    parser.set_defaults(fill_missing_masks=True, filter_outlier_masks=True)
     return parser.parse_args()
 
 
@@ -765,6 +817,21 @@ def binary_mask_iou(mask_a: Any, mask_b: Any) -> float:
     return inter / union
 
 
+def mask_match_support_score(current_item: dict[str, Any], prior_item: dict[str, Any]) -> float:
+    area = max(1.0, float(current_item.get("area") or 0.0))
+    centroid = current_item.get("centroid")
+    iou = binary_mask_iou(current_item["mask"], prior_item["mask"])
+    area_prior = max(1.0, float(prior_item.get("area") or 0.0))
+    area_ratio = min(area, area_prior) / max(area, area_prior)
+    dist_score = 0.0
+    if centroid is not None and prior_item.get("centroid") is not None:
+        dx = float(centroid[0] - prior_item["centroid"][0])
+        dy = float(centroid[1] - prior_item["centroid"][1])
+        dist = math.sqrt(dx * dx + dy * dy)
+        dist_score = max(0.0, 1.0 - dist / 150.0)
+    return (2.0 * iou) + (0.5 * area_ratio) + (0.5 * dist_score)
+
+
 def heuristic_match_global_id(
     *,
     current_item: dict[str, Any],
@@ -775,24 +842,13 @@ def heuristic_match_global_id(
 ) -> int | None:
     best_global_id: int | None = None
     best_score = 0.0
-    area = max(1.0, float(current_item.get("area") or 0.0))
-    centroid = current_item.get("centroid")
 
     for prior_item in prior_items:
         local_id = int(prior_item["local_id"])
         global_id = prior_assignments.get(local_id)
         if global_id is None or global_id in disallowed_global_ids:
             continue
-        iou = binary_mask_iou(current_item["mask"], prior_item["mask"])
-        area_prior = max(1.0, float(prior_item.get("area") or 0.0))
-        area_ratio = min(area, area_prior) / max(area, area_prior)
-        dist_score = 0.0
-        if centroid is not None and prior_item.get("centroid") is not None:
-            dx = float(centroid[0] - prior_item["centroid"][0])
-            dy = float(centroid[1] - prior_item["centroid"][1])
-            dist = math.sqrt(dx * dx + dy * dy)
-            dist_score = max(0.0, 1.0 - dist / 150.0)
-        score = (2.0 * iou) + (0.5 * area_ratio) + (0.5 * dist_score)
+        score = mask_match_support_score(current_item, prior_item)
         if score > best_score:
             best_score = score
             best_global_id = int(global_id)
@@ -1345,6 +1401,73 @@ def request_gap_fill_verdict(
     return None, last_text
 
 
+def request_outlier_mask_verdict(
+    *,
+    send_generate_request_fn: Any,
+    system_prompt: str,
+    raw_target_frame_path: str,
+    candidate_overlay_path: str,
+    reference_collage_path: str,
+    target_frame_index: int,
+    local_id: int,
+    issue_description: str,
+    max_json_retries: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": raw_target_frame_path},
+                {"type": "image", "image": candidate_overlay_path},
+                {"type": "image", "image": reference_collage_path},
+                {
+                    "type": "text",
+                    "text": (
+                        f"Target frame: {int(target_frame_index)}\n"
+                        f"Candidate local id: l{int(local_id)}\n"
+                        f"Issue description: {issue_description or '(none)'}\n\n"
+                        "Image 1 is the raw target frame. "
+                        "Image 2 highlights the candidate mask that was added automatically. "
+                        "Image 3 shows nearby reference masks for the intended creature. "
+                        "Keep the mask only if it clearly covers a real creature matching the references. "
+                        "Remove it if it is clearly an empty-background or non-creature hallucination. "
+                        "When uncertain, keep. Return strict JSON only."
+                    ),
+                },
+            ],
+        },
+    ]
+
+    last_text: str | None = None
+    for _attempt in range(max(0, int(max_json_retries)) + 1):
+        last_text = send_generate_request_fn(messages)
+        parsed = extract_json_object(last_text or "")
+        if isinstance(parsed, dict):
+            return parsed, last_text
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": str(last_text or "")}],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Your previous response did not contain valid JSON. "
+                            'Return strict JSON only with schema {"decision":"keep|remove","reason":str}.'
+                        ),
+                    }
+                ],
+            }
+        )
+    return None, last_text
+
+
 def find_mask_item(
     mask_items_by_frame: dict[int, list[dict[str, Any]]],
     *,
@@ -1783,6 +1906,44 @@ def append_mask_to_frame_row(
     return int(new_local_id)
 
 
+def remove_local_id_from_frame_row(frame_row: dict[str, Any], *, local_id: int) -> bool:
+    target_local_id = int(local_id)
+    raw_local_ids = frame_row_local_ids(frame_row)
+    raw_masks = list(frame_row.get("out_binary_masks_rle") or [])
+    raw_boxes = list(frame_row.get("out_boxes_xywh") or [])
+    raw_probs = list(frame_row.get("out_probs") or [])
+    raw_tracker_probs = list(frame_row.get("out_tracker_probs") or [])
+
+    kept_obj_ids: list[int] = []
+    kept_masks: list[Any] = []
+    kept_boxes: list[Any] = []
+    kept_probs: list[Any] = []
+    kept_tracker_probs: list[Any] = []
+    removed = False
+
+    for idx, mask_rle in enumerate(raw_masks):
+        existing_local_id = raw_local_ids[idx] if idx < len(raw_local_ids) else idx + 1
+        if int(existing_local_id) == target_local_id:
+            removed = True
+            continue
+        kept_obj_ids.append(int(existing_local_id))
+        kept_masks.append(mask_rle)
+        if idx < len(raw_boxes):
+            kept_boxes.append(raw_boxes[idx])
+        if idx < len(raw_probs):
+            kept_probs.append(raw_probs[idx])
+        if idx < len(raw_tracker_probs):
+            kept_tracker_probs.append(raw_tracker_probs[idx])
+
+    if removed:
+        frame_row["out_obj_ids"] = kept_obj_ids
+        frame_row["out_binary_masks_rle"] = kept_masks
+        frame_row["out_boxes_xywh"] = kept_boxes
+        frame_row["out_probs"] = kept_probs
+        frame_row["out_tracker_probs"] = kept_tracker_probs
+    return removed
+
+
 def repair_missing_masks_in_window(
     *,
     args: argparse.Namespace,
@@ -2137,6 +2298,291 @@ def repair_missing_masks_in_window(
     return report, local_ids_by_frame, mask_items_by_frame
 
 
+def filter_outlier_gap_fill_masks(
+    *,
+    args: argparse.Namespace,
+    send_generate_request_fn: Any,
+    outlier_system_prompt: str,
+    video_path: str,
+    frame_h: int,
+    frame_w: int,
+    window_dir: Path,
+    working_frame_rows_by_index: dict[int, dict[str, Any]],
+    local_ids_by_frame: dict[int, list[int]],
+    mask_items_by_frame: dict[int, list[dict[str, Any]]],
+    gap_fill_report: dict[str, Any] | None,
+    max_json_retries: int,
+) -> tuple[dict[str, Any], dict[int, list[int]], dict[int, list[dict[str, Any]]]]:
+    report: dict[str, Any] = {
+        "enabled": True,
+        "candidate_issue_count": 0,
+        "reviewed_issue_count": 0,
+        "kept_mask_count": 0,
+        "removed_mask_count": 0,
+        "issues": [],
+    }
+    if not gap_fill_report or not (gap_fill_report.get("issues") or []):
+        return report, local_ids_by_frame, mask_items_by_frame
+
+    outlier_dir = window_dir / "outlier_filter"
+    outlier_dir.mkdir(parents=True, exist_ok=True)
+
+    accepted_candidates: list[dict[str, Any]] = []
+    for issue_index, issue in enumerate(gap_fill_report.get("issues") or []):
+        if str(issue.get("status", "")).strip().lower() != "accepted":
+            continue
+        accepted_local_id = issue.get("accepted_local_id")
+        if accepted_local_id is None:
+            continue
+        try:
+            target_frame_index = int(issue.get("target_frame_index"))
+            accepted_local_id = int(accepted_local_id)
+        except Exception:
+            continue
+        current_item = find_mask_item(
+            mask_items_by_frame,
+            frame_index=target_frame_index,
+            local_id=accepted_local_id,
+        )
+        if current_item is None:
+            issue["post_filter_status"] = "skipped_missing_local_id"
+            continue
+        reference_support_scores: list[float] = []
+        for ref in issue.get("reference_masks") or []:
+            try:
+                ref_frame_index = int(ref["frame_index"])
+                ref_local_id = int(ref["local_id"])
+            except Exception:
+                continue
+            ref_item = find_mask_item(
+                mask_items_by_frame,
+                frame_index=ref_frame_index,
+                local_id=ref_local_id,
+            )
+            if ref_item is None:
+                continue
+            reference_support_scores.append(mask_match_support_score(current_item, ref_item))
+        accepted_candidates.append(
+            {
+                "issue_index": int(issue_index),
+                "issue": issue,
+                "target_frame_index": int(target_frame_index),
+                "accepted_local_id": int(accepted_local_id),
+                "current_item": current_item,
+                "best_reference_support_score": float(max(reference_support_scores, default=0.0)),
+                "reference_support_scores": [float(x) for x in reference_support_scores],
+            }
+        )
+
+    accepted_candidates.sort(
+        key=lambda item: (
+            float(item["best_reference_support_score"]),
+            float(item["issue"].get("confidence", 0.0)),
+            int(item["target_frame_index"]),
+            int(item["accepted_local_id"]),
+        )
+    )
+    report["candidate_issue_count"] = len(accepted_candidates)
+
+    max_reviews = max(0, int(args.max_outlier_checks_per_window))
+    selected_candidates = accepted_candidates[:max_reviews]
+    for skipped in accepted_candidates[max_reviews:]:
+        skipped["issue"]["post_filter_status"] = "not_reviewed"
+        skipped["issue"]["post_filter_reason"] = "review_budget_exhausted"
+
+    for candidate in selected_candidates:
+        issue = candidate["issue"]
+        issue_index = int(candidate["issue_index"])
+        target_frame_index = int(candidate["target_frame_index"])
+        accepted_local_id = int(candidate["accepted_local_id"])
+        issue_dir = outlier_dir / f"issue_{issue_index:04d}_frame_{target_frame_index:06d}_l{accepted_local_id:04d}"
+        issue_dir.mkdir(parents=True, exist_ok=True)
+
+        target_frame_path = str(issue_dir / f"target_frame_{target_frame_index:06d}.jpg")
+        target_frame_bgr = read_video_frame(video_path, target_frame_index)
+        if target_frame_bgr is None:
+            issue_report = {
+                "issue_index": int(issue_index),
+                "target_frame_index": int(target_frame_index),
+                "accepted_local_id": int(accepted_local_id),
+                "status": "kept",
+                "failure_reason": "target_frame_unreadable",
+            }
+            report["issues"].append(issue_report)
+            issue["post_filter_status"] = "kept"
+            issue["post_filter_reason"] = "target_frame_unreadable"
+            report["kept_mask_count"] += 1
+            continue
+        cv2.imwrite(target_frame_path, target_frame_bgr)
+
+        current_item = find_mask_item(
+            mask_items_by_frame,
+            frame_index=target_frame_index,
+            local_id=accepted_local_id,
+        )
+        if current_item is None:
+            issue_report = {
+                "issue_index": int(issue_index),
+                "target_frame_index": int(target_frame_index),
+                "accepted_local_id": int(accepted_local_id),
+                "status": "kept",
+                "failure_reason": "accepted_local_id_missing",
+            }
+            report["issues"].append(issue_report)
+            issue["post_filter_status"] = "kept"
+            issue["post_filter_reason"] = "accepted_local_id_missing"
+            report["kept_mask_count"] += 1
+            continue
+
+        reference_collage_path = (
+            str((issue.get("debug_paths") or {}).get("reference_collage_path") or "")
+        )
+        if not reference_collage_path or not os.path.exists(reference_collage_path):
+            reference_collage_path = str(issue_dir / "reference_collage.jpg")
+            reference_tiles: list[tuple[int, Any]] = []
+            for ref in issue.get("reference_masks") or []:
+                try:
+                    ref_frame_index = int(ref["frame_index"])
+                    ref_local_id = int(ref["local_id"])
+                except Exception:
+                    continue
+                ref_frame_bgr = read_video_frame(video_path, ref_frame_index)
+                ref_item = find_mask_item(
+                    mask_items_by_frame,
+                    frame_index=ref_frame_index,
+                    local_id=ref_local_id,
+                )
+                if ref_frame_bgr is None or ref_item is None:
+                    continue
+                reference_tiles.append(
+                    (
+                        ref_frame_index,
+                        draw_mask_focus(
+                            ref_frame_bgr,
+                            focus_items=[ref_item],
+                            existing_items=mask_items_by_frame.get(ref_frame_index, []),
+                            focus_label_prefix="ref ",
+                        ),
+                    )
+                )
+            if reference_tiles:
+                build_collage(
+                    reference_tiles,
+                    reference_collage_path,
+                    cols=min(int(args.collage_cols), max(1, len(reference_tiles))),
+                    tile_max_edge=int(args.collage_tile_max_edge),
+                )
+        if not reference_collage_path or not os.path.exists(reference_collage_path):
+            issue_report = {
+                "issue_index": int(issue_index),
+                "target_frame_index": int(target_frame_index),
+                "accepted_local_id": int(accepted_local_id),
+                "status": "kept",
+                "failure_reason": "reference_collage_missing",
+            }
+            report["issues"].append(issue_report)
+            issue["post_filter_status"] = "kept"
+            issue["post_filter_reason"] = "reference_collage_missing"
+            report["kept_mask_count"] += 1
+            continue
+
+        target_existing_items = [
+            item
+            for item in decode_frame_row_masks(
+                working_frame_rows_by_index[target_frame_index],
+                frame_h=frame_h,
+                frame_w=frame_w,
+            )
+            if int(item["local_id"]) != accepted_local_id
+        ]
+        candidate_overlay_path = str(issue_dir / "candidate_overlay.jpg")
+        rendered_candidate = draw_mask_focus(
+            target_frame_bgr,
+            focus_items=[current_item],
+            existing_items=target_existing_items,
+            focus_label_prefix="candidate ",
+        )
+        cv2.imwrite(candidate_overlay_path, rendered_candidate)
+
+        verdict_parsed, verdict_raw_text = request_outlier_mask_verdict(
+            send_generate_request_fn=send_generate_request_fn,
+            system_prompt=outlier_system_prompt,
+            raw_target_frame_path=target_frame_path,
+            candidate_overlay_path=candidate_overlay_path,
+            reference_collage_path=reference_collage_path,
+            target_frame_index=target_frame_index,
+            local_id=accepted_local_id,
+            issue_description=str(issue.get("description", "")),
+            max_json_retries=max_json_retries,
+        )
+        decision = str((verdict_parsed or {}).get("decision", "keep")).strip().lower()
+        if decision not in {"keep", "remove"}:
+            decision = "keep"
+        reason = str((verdict_parsed or {}).get("reason", "")).strip()
+
+        issue_report = {
+            "issue_index": int(issue_index),
+            "target_frame_index": int(target_frame_index),
+            "accepted_local_id": int(accepted_local_id),
+            "status": "kept",
+            "reason": reason,
+            "raw_verdict_response": verdict_raw_text,
+            "candidate_overlay_path": candidate_overlay_path,
+            "target_frame_path": target_frame_path,
+            "reference_collage_path": reference_collage_path,
+            "best_reference_support_score": float(candidate["best_reference_support_score"]),
+            "reference_support_scores": list(candidate["reference_support_scores"]),
+        }
+
+        if decision == "remove":
+            removed = remove_local_id_from_frame_row(
+                working_frame_rows_by_index[target_frame_index],
+                local_id=accepted_local_id,
+            )
+            if removed:
+                updated_items = decode_frame_row_masks(
+                    working_frame_rows_by_index[target_frame_index],
+                    frame_h=frame_h,
+                    frame_w=frame_w,
+                )
+                mask_items_by_frame[target_frame_index] = updated_items
+                local_ids_by_frame[target_frame_index] = [
+                    int(item["local_id"]) for item in updated_items
+                ]
+                issue_report["status"] = "removed"
+                report["removed_mask_count"] += 1
+                issue["post_filter_status"] = "removed_as_outlier"
+                issue["post_filter_reason"] = reason or "Removed by outlier-mask review."
+            else:
+                issue_report["status"] = "kept"
+                issue_report["failure_reason"] = "remove_local_id_failed"
+                report["kept_mask_count"] += 1
+                issue["post_filter_status"] = "kept"
+                issue["post_filter_reason"] = "remove_local_id_failed"
+        else:
+            report["kept_mask_count"] += 1
+            issue["post_filter_status"] = "kept"
+            issue["post_filter_reason"] = reason
+
+        report["issues"].append(issue_report)
+
+    report["reviewed_issue_count"] = len(report["issues"])
+    report["not_reviewed_issue_count"] = max(0, len(accepted_candidates) - len(report["issues"]))
+    report["verdict_counts"] = dict(
+        Counter(str(issue.get("status")) for issue in report["issues"] if issue.get("status"))
+    )
+    report["failure_reason_counts"] = dict(
+        Counter(
+            str(issue.get("failure_reason"))
+            for issue in report["issues"]
+            if issue.get("failure_reason")
+        )
+    )
+    if args.debug:
+        write_json(outlier_dir / "outlier_filter_report.json", report)
+    return report, local_ids_by_frame, mask_items_by_frame
+
+
 def apply_window_assignments(
     *,
     window_frame_indices: list[int],
@@ -2424,6 +2870,12 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         if args.verify_gap_fill_prompt_path
         else None,
     )
+    outlier_mask_system_prompt = resolve_outlier_mask_prompt(
+        str(args.prompt_profile),
+        str(Path(args.outlier_mask_prompt_path).resolve())
+        if args.outlier_mask_prompt_path
+        else None,
+    )
 
     windows = build_index_windows(
         valid_frame_indices,
@@ -2441,6 +2893,10 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
     gap_fill_detection_failures = 0
     gap_fill_accepted_issue_count = 0
     gap_fill_unresolved_issue_count = 0
+    outlier_candidate_issue_count = 0
+    outlier_reviewed_issue_count = 0
+    outlier_removed_mask_count = 0
+    outlier_kept_mask_count = 0
 
     backend = None
     session_id = None
@@ -2507,6 +2963,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
             )
 
             gap_fill_report: dict[str, Any] | None = None
+            outlier_filter_report: dict[str, Any] | None = None
             if args.fill_missing_masks and backend is not None and session_id is not None:
                 gap_fill_report, local_ids_by_frame, mask_items_by_frame = repair_missing_masks_in_window(
                     args=args,
@@ -2533,6 +2990,25 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
                         gap_fill_detection_failures += 1
                 gap_fill_accepted_issue_count += int(gap_fill_report.get("accepted_issue_count", 0))
                 gap_fill_unresolved_issue_count += int(gap_fill_report.get("unresolved_issue_count", 0))
+                if args.filter_outlier_masks:
+                    outlier_filter_report, local_ids_by_frame, mask_items_by_frame = filter_outlier_gap_fill_masks(
+                        args=args,
+                        send_generate_request_fn=send_req,
+                        outlier_system_prompt=outlier_mask_system_prompt,
+                        video_path=video_path,
+                        frame_h=frame_h,
+                        frame_w=frame_w,
+                        window_dir=window_dir,
+                        working_frame_rows_by_index=working_frame_rows_by_index,
+                        local_ids_by_frame=local_ids_by_frame,
+                        mask_items_by_frame=mask_items_by_frame,
+                        gap_fill_report=gap_fill_report,
+                        max_json_retries=int(args.max_json_retries),
+                    )
+                    outlier_candidate_issue_count += int(outlier_filter_report.get("candidate_issue_count", 0))
+                    outlier_reviewed_issue_count += int(outlier_filter_report.get("reviewed_issue_count", 0))
+                    outlier_removed_mask_count += int(outlier_filter_report.get("removed_mask_count", 0))
+                    outlier_kept_mask_count += int(outlier_filter_report.get("kept_mask_count", 0))
 
             overlay_tiles: list[tuple[int, Any]] = []
             for frame_index in window_frame_indices:
@@ -2628,6 +3104,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
                 "anchor_text": anchor_text,
                 "inventory_text": inventory_text,
                 "gap_fill_report": gap_fill_report,
+                "outlier_filter_report": outlier_filter_report,
                 "raw_response_text": raw_text,
                 "parsed_assignments": sanitized_assignments,
                 "resolved_assignments": {
@@ -2699,6 +3176,9 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
     gap_fill_attempt_failure_reason_counts = Counter()
     gap_fill_verification_status_counts = Counter()
     windows_with_detected_gap_fill_issues = 0
+    outlier_verdict_counts = Counter()
+    outlier_failure_reason_counts = Counter()
+    windows_with_outlier_reviews = 0
     for window_report in window_reports:
         gap_fill_report = window_report.get("gap_fill_report") or {}
         issues = gap_fill_report.get("issues") or []
@@ -2711,6 +3191,13 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         gap_fill_verification_status_counts.update(
             gap_fill_report.get("verification_status_counts") or {}
         )
+        outlier_filter_report = window_report.get("outlier_filter_report") or {}
+        if outlier_filter_report.get("reviewed_issue_count"):
+            windows_with_outlier_reviews += 1
+        outlier_verdict_counts.update(outlier_filter_report.get("verdict_counts") or {})
+        outlier_failure_reason_counts.update(outlier_filter_report.get("failure_reason_counts") or {})
+
+    gap_fill_retained_issue_count = max(0, int(gap_fill_accepted_issue_count) - int(outlier_removed_mask_count))
 
     consistent_payload = {
         "format_version": int(frame_outputs_payload.get("format_version", 2)),
@@ -2766,6 +3253,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         "overlay_output_path": str(overlay_output_path) if args.render_video else "",
         "prompt_profile": str(args.prompt_profile),
         "fill_missing_masks": bool(args.fill_missing_masks),
+        "filter_outlier_masks": bool(args.filter_outlier_masks),
         "allow_drop_assignments": bool(args.allow_drop_assignments),
         "window_size": int(args.window_size),
         "window_stride": int(args.window_stride),
@@ -2773,12 +3261,20 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         "raw_response_failure_count": int(raw_response_failures),
         "gap_fill_detection_failure_count": int(gap_fill_detection_failures),
         "gap_fill_accepted_issue_count": int(gap_fill_accepted_issue_count),
+        "gap_fill_retained_issue_count": int(gap_fill_retained_issue_count),
         "gap_fill_unresolved_issue_count": int(gap_fill_unresolved_issue_count),
         "gap_filled_frame_count": int(gap_filled_frame_count),
         "windows_with_detected_gap_fill_issues": int(windows_with_detected_gap_fill_issues),
         "gap_fill_failure_reason_counts": dict(gap_fill_failure_reason_counts),
         "gap_fill_attempt_failure_reason_counts": dict(gap_fill_attempt_failure_reason_counts),
         "gap_fill_verification_status_counts": dict(gap_fill_verification_status_counts),
+        "outlier_candidate_issue_count": int(outlier_candidate_issue_count),
+        "outlier_reviewed_issue_count": int(outlier_reviewed_issue_count),
+        "outlier_removed_mask_count": int(outlier_removed_mask_count),
+        "outlier_kept_mask_count": int(outlier_kept_mask_count),
+        "windows_with_outlier_reviews": int(windows_with_outlier_reviews),
+        "outlier_verdict_counts": dict(outlier_verdict_counts),
+        "outlier_failure_reason_counts": dict(outlier_failure_reason_counts),
         "ignored_drop_label_count": int(sum(len(v) for v in ignored_drop_labels_by_frame.values())),
         "total_video_frames": int(total_video_frames),
         "valid_window_frames": len(valid_frame_indices),
@@ -2801,15 +3297,24 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         "window_count": int(len(windows)),
         "valid_frame_count": int(len(valid_frame_indices)),
         "fill_missing_masks": bool(args.fill_missing_masks),
+        "filter_outlier_masks": bool(args.filter_outlier_masks),
         "allow_drop_assignments": bool(args.allow_drop_assignments),
         "gap_fill_detection_failure_count": int(gap_fill_detection_failures),
         "gap_fill_accepted_issue_count": int(gap_fill_accepted_issue_count),
+        "gap_fill_retained_issue_count": int(gap_fill_retained_issue_count),
         "gap_fill_unresolved_issue_count": int(gap_fill_unresolved_issue_count),
         "gap_filled_frame_count": int(gap_filled_frame_count),
         "windows_with_detected_gap_fill_issues": int(windows_with_detected_gap_fill_issues),
         "gap_fill_failure_reason_counts": dict(gap_fill_failure_reason_counts),
         "gap_fill_attempt_failure_reason_counts": dict(gap_fill_attempt_failure_reason_counts),
         "gap_fill_verification_status_counts": dict(gap_fill_verification_status_counts),
+        "outlier_candidate_issue_count": int(outlier_candidate_issue_count),
+        "outlier_reviewed_issue_count": int(outlier_reviewed_issue_count),
+        "outlier_removed_mask_count": int(outlier_removed_mask_count),
+        "outlier_kept_mask_count": int(outlier_kept_mask_count),
+        "windows_with_outlier_reviews": int(windows_with_outlier_reviews),
+        "outlier_verdict_counts": dict(outlier_verdict_counts),
+        "outlier_failure_reason_counts": dict(outlier_failure_reason_counts),
         "ignored_drop_label_count": int(sum(len(v) for v in ignored_drop_labels_by_frame.values())),
         "changed_frame_count": int(changed_frames),
         "relabeled_mask_count": int(relabeled_mask_count),
@@ -2860,7 +3365,7 @@ def main() -> int:
                 f"Finished {run_dir.name}: "
                 f"{summary['num_global_ids']} global ids, "
                 f"{summary['changed_frame_count']} changed frames, "
-                f"{summary.get('gap_fill_accepted_issue_count', 0)} gap fills accepted."
+                f"{summary.get('gap_fill_retained_issue_count', summary.get('gap_fill_accepted_issue_count', 0))} gap fills retained."
             )
         except Exception as exc:
             failure = {

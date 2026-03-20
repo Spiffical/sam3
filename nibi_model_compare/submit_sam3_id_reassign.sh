@@ -23,6 +23,7 @@ Common options:
   --prompt-path <path>                Optional override system prompt for reassignment
   --missing-mask-prompt-path <path>   Optional override system prompt for missing-mask detection
   --verify-gap-fill-prompt-path <path> Optional override system prompt for gap-fill verification
+  --outlier-mask-prompt-path <path>   Optional override system prompt for outlier-mask review
   --output-subdir <name>              Default: consistent_ids_mllm
   --output-video-name <name>          Default: overlay_consistent_ids.mp4
   --venv-path <path>                  Default: <repo>/.venv
@@ -55,6 +56,7 @@ Reassignment options:
   --max-gap-issues-per-window <n>     Default: 8
   --gap-fill-max-attempts <n>         Default: 4
   --gap-fill-point-candidates <n>     Default: 6
+  --max-outlier-checks-per-window <n> Default: 12
   --image-detail <low|high>           Default: high
   --max-images-per-request <n>        Default: 3
   --image-max-edge <n>                Default: 768
@@ -65,6 +67,7 @@ Reassignment options:
   --sam3-image-size <n>               Default: 1008
   --sam3-offload-video-to-cpu         Offload SAM3 frames to CPU memory during gap fill
   --no-fill-missing-masks             Disable the gap-fill stage
+  --no-filter-outlier-masks           Disable the gap-fill outlier cleanup stage
   --debug                             Keep extra window-level debug artifacts
   --continue-on-error                 Continue to later input dirs if one fails
   --no-render-video                   Skip writing the relabeled overlay video
@@ -87,6 +90,7 @@ prompt_profile="underwater"
 prompt_path=""
 missing_mask_prompt_path=""
 verify_gap_fill_prompt_path=""
+outlier_mask_prompt_path=""
 output_subdir="consistent_ids_mllm"
 output_video_name="overlay_consistent_ids.mp4"
 venv_path="${REPO_ROOT}/.venv"
@@ -116,6 +120,7 @@ assignment_heuristic_min_score="0.85"
 max_gap_issues_per_window="8"
 gap_fill_max_attempts="4"
 gap_fill_point_candidates="6"
+max_outlier_checks_per_window="12"
 image_detail="high"
 max_images_per_request="3"
 image_max_edge="768"
@@ -126,6 +131,7 @@ sam3_gpu_ids="0"
 sam3_image_size="1008"
 sam3_offload_video_to_cpu=0
 fill_missing_masks=1
+filter_outlier_masks=1
 render_video=1
 debug=0
 continue_on_error=0
@@ -149,6 +155,7 @@ while [[ $# -gt 0 ]]; do
     --prompt-path) prompt_path="$2"; shift 2 ;;
     --missing-mask-prompt-path) missing_mask_prompt_path="$2"; shift 2 ;;
     --verify-gap-fill-prompt-path) verify_gap_fill_prompt_path="$2"; shift 2 ;;
+    --outlier-mask-prompt-path) outlier_mask_prompt_path="$2"; shift 2 ;;
     --output-subdir) output_subdir="$2"; shift 2 ;;
     --output-video-name) output_video_name="$2"; shift 2 ;;
     --venv-path) venv_path="$2"; shift 2 ;;
@@ -178,6 +185,7 @@ while [[ $# -gt 0 ]]; do
     --max-gap-issues-per-window) max_gap_issues_per_window="$2"; shift 2 ;;
     --gap-fill-max-attempts) gap_fill_max_attempts="$2"; shift 2 ;;
     --gap-fill-point-candidates) gap_fill_point_candidates="$2"; shift 2 ;;
+    --max-outlier-checks-per-window) max_outlier_checks_per_window="$2"; shift 2 ;;
     --image-detail) image_detail="$2"; shift 2 ;;
     --max-images-per-request) max_images_per_request="$2"; shift 2 ;;
     --image-max-edge) image_max_edge="$2"; shift 2 ;;
@@ -188,6 +196,7 @@ while [[ $# -gt 0 ]]; do
     --sam3-image-size) sam3_image_size="$2"; shift 2 ;;
     --sam3-offload-video-to-cpu) sam3_offload_video_to_cpu=1; shift ;;
     --no-fill-missing-masks) fill_missing_masks=0; shift ;;
+    --no-filter-outlier-masks) filter_outlier_masks=0; shift ;;
     --debug) debug=1; shift ;;
     --continue-on-error) continue_on_error=1; shift ;;
     --no-render-video) render_video=0; shift ;;
@@ -326,6 +335,7 @@ env_vars=(
   "PROMPT_PATH=$prompt_path"
   "MISSING_MASK_PROMPT_PATH=$missing_mask_prompt_path"
   "VERIFY_GAP_FILL_PROMPT_PATH=$verify_gap_fill_prompt_path"
+  "OUTLIER_MASK_PROMPT_PATH=$outlier_mask_prompt_path"
   "OUTPUT_SUBDIR=$output_subdir"
   "OUTPUT_VIDEO_NAME=$output_video_name"
   "MODEL_ID=$model_id"
@@ -350,6 +360,7 @@ env_vars=(
   "MAX_GAP_ISSUES_PER_WINDOW=$max_gap_issues_per_window"
   "GAP_FILL_MAX_ATTEMPTS=$gap_fill_max_attempts"
   "GAP_FILL_POINT_CANDIDATES=$gap_fill_point_candidates"
+  "MAX_OUTLIER_CHECKS_PER_WINDOW=$max_outlier_checks_per_window"
   "IMAGE_DETAIL=$image_detail"
   "MAX_IMAGES_PER_REQUEST=$max_images_per_request"
   "IMAGE_MAX_EDGE=$image_max_edge"
@@ -360,6 +371,7 @@ env_vars=(
   "SAM3_IMAGE_SIZE=$sam3_image_size"
   "SAM3_OFFLOAD_VIDEO_TO_CPU=$sam3_offload_video_to_cpu"
   "FILL_MISSING_MASKS=$fill_missing_masks"
+  "FILTER_OUTLIER_MASKS=$filter_outlier_masks"
   "RENDER_VIDEO=$render_video"
   "DEBUG=$debug"
   "CONTINUE_ON_ERROR=$continue_on_error"

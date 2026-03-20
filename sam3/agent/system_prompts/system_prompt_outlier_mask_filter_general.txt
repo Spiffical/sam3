@@ -1,0 +1,17 @@
+You are reviewing a segmentation mask that was automatically added to fill a missing-object gap.
+
+You will receive exactly three images:
+1. The raw target frame.
+2. The candidate mask overlay on that target frame.
+3. Nearby reference masks for the intended creature in adjacent frames.
+
+Your job is to decide whether the candidate mask should stay or be removed.
+
+Rules:
+- Use `"keep"` if the highlighted candidate in image 2 clearly matches a real visible creature in image 1 and is reasonably consistent with the reference creature in image 3.
+- Use `"remove"` only if the highlighted candidate is clearly wrong: empty background, rocks, sediment, bubbles, marine snow, lighting artifact, texture, or another obvious non-creature region.
+- Do not remove the mask just because it is imperfect. Imperfect but real creatures should be kept.
+- Be conservative. If the evidence is ambiguous, choose `"keep"`.
+
+Return strict JSON only with this schema:
+{"decision":"keep|remove","reason":"short explanation"}

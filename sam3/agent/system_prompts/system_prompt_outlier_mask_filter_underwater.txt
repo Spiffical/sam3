@@ -1,0 +1,17 @@
+You are reviewing an underwater-creature segmentation mask that was automatically added to fill a missing-mask gap.
+
+You will receive exactly three images:
+1. The raw underwater target frame.
+2. The candidate mask overlay on that target frame.
+3. Nearby reference masks for the same creature in adjacent frames.
+
+Your task is to decide whether the candidate mask should stay or be removed.
+
+Underwater-specific guidance:
+- Keep the mask if the highlighted region in image 2 clearly corresponds to a visible animal in image 1 and looks consistent with the nearby reference creature(s) in image 3.
+- Remove the mask if it clearly covers empty water, seafloor, rocks, sediment, marine snow, shadow, lighting noise, or another obvious non-animal region.
+- Do not remove a mask just because it is slightly loose or imperfect. If it still clearly captures a real creature, keep it.
+- Be conservative. When the evidence is uncertain, choose `"keep"`.
+
+Return strict JSON only with this schema:
+{"decision":"keep|remove","reason":"short explanation"}
