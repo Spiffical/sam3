@@ -63,6 +63,28 @@ def _load_system_prompts(current_dir):
                 + "\n\n"
                 + iterative_checking_system_prompt
             )
+    elif profile in {"fathomnet", "fathomnet_2026", "fathomnet2026"}:
+        fathomnet_system_addendum_path = os.path.join(
+            current_dir, "system_prompts/system_prompt_fathomnet_addendum.txt"
+        )
+        fathomnet_iterative_addendum_path = os.path.join(
+            current_dir,
+            "system_prompts/system_prompt_iterative_checking_fathomnet_addendum.txt",
+        )
+        if not system_prompt_override and os.path.exists(fathomnet_system_addendum_path):
+            system_prompt = (
+                _read_prompt_file(fathomnet_system_addendum_path)
+                + "\n\n"
+                + system_prompt
+            )
+        if not iterative_prompt_override and os.path.exists(
+            fathomnet_iterative_addendum_path
+        ):
+            iterative_checking_system_prompt = (
+                _read_prompt_file(fathomnet_iterative_addendum_path)
+                + "\n\n"
+                + iterative_checking_system_prompt
+            )
     elif profile not in {"", "general", "default", "base"}:
         print(
             f"[Warn] Unknown SAM3_AGENT_PROMPT_PROFILE='{profile}'. "

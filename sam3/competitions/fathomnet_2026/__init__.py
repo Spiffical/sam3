@@ -1,0 +1,78 @@
+"""Helpers for the FathomNet 2026 Kaggle competition."""
+
+from .bundle import (
+    DEFAULT_BUNDLE_FILENAME,
+    DEFAULT_COMPETITION_NAME,
+    DEFAULT_DATASET_SUBDIR,
+    DEFAULT_METADATA_FILENAME,
+    DEFAULT_PROJECT_DATA_ROOT,
+    DiscoveredDatasetLayout,
+    ProjectDataLayout,
+    build_project_data_layout,
+    create_tar_zstd_bundle,
+    discover_dataset_layout,
+    download_competition_with_kaggle,
+    ensure_project_data_layout,
+    extract_bundle,
+    extract_download_archives,
+    resolve_split_paths_from_metadata,
+    write_bundle_metadata,
+    write_manifests_for_discovered_layout,
+)
+from .categories import (
+    EXPECTED_CATEGORY_NAMES,
+    CompetitionCategory,
+    build_category_id_to_name,
+    build_category_name_to_id,
+    load_categories_from_coco_payload,
+)
+from .dataset import (
+    CompetitionDataset,
+    CompetitionImage,
+    build_image_manifest,
+    load_competition_dataset,
+    write_image_manifest,
+)
+from .submission import (
+    DetectionPrediction,
+    load_predictions_file,
+    validate_prediction_ids,
+    write_submission_csv,
+)
+from .zero_shot import ZeroShotRunConfig, run_zero_shot_submission
+
+__all__ = [
+    "DEFAULT_BUNDLE_FILENAME",
+    "DEFAULT_COMPETITION_NAME",
+    "DEFAULT_DATASET_SUBDIR",
+    "DEFAULT_METADATA_FILENAME",
+    "DEFAULT_PROJECT_DATA_ROOT",
+    "CompetitionCategory",
+    "CompetitionDataset",
+    "CompetitionImage",
+    "DetectionPrediction",
+    "DiscoveredDatasetLayout",
+    "EXPECTED_CATEGORY_NAMES",
+    "ProjectDataLayout",
+    "ZeroShotRunConfig",
+    "build_category_id_to_name",
+    "build_category_name_to_id",
+    "build_image_manifest",
+    "build_project_data_layout",
+    "create_tar_zstd_bundle",
+    "discover_dataset_layout",
+    "download_competition_with_kaggle",
+    "ensure_project_data_layout",
+    "extract_bundle",
+    "extract_download_archives",
+    "load_categories_from_coco_payload",
+    "load_competition_dataset",
+    "load_predictions_file",
+    "resolve_split_paths_from_metadata",
+    "run_zero_shot_submission",
+    "validate_prediction_ids",
+    "write_bundle_metadata",
+    "write_image_manifest",
+    "write_manifests_for_discovered_layout",
+    "write_submission_csv",
+]

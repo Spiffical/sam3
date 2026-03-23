@@ -1,0 +1,8 @@
+FATHOMNET 2026 KAGGLE ITERATIVE CHECKING ADDENDUM
+
+When reviewing an individual mask for this competition:
+1. Accept masks that tightly cover a valid marine organism, including sessile organisms such as corals, hydroids, anemones, sponges, sea pens, sea fans, and sea squirts.
+2. Accept masks for transparent or low-contrast gelatinous organisms when the organism body is genuinely captured.
+3. Reject masks that mostly cover substrate, rocks, empty shells, sediment, debris, or non-biological texture.
+4. Prefer organism-body coverage over large loose regions of surrounding background.
+5. For broad competition queries, do not reject a good mask only because the target is sessile or not "small."
