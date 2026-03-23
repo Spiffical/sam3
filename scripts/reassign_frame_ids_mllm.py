@@ -1174,6 +1174,49 @@ def bbox_xywh_from_xyxy(
     ]
 
 
+def bbox_dims_xyxy(bbox_xyxy: tuple[int, int, int, int] | None) -> tuple[int, int]:
+    if bbox_xyxy is None:
+        return (0, 0)
+    return (
+        max(0, int(bbox_xyxy[2]) - int(bbox_xyxy[0])),
+        max(0, int(bbox_xyxy[3]) - int(bbox_xyxy[1])),
+    )
+
+
+def bbox_center_xyxy(bbox_xyxy: tuple[int, int, int, int] | None) -> tuple[float, float] | None:
+    if bbox_xyxy is None:
+        return None
+    return (
+        (float(bbox_xyxy[0]) + float(bbox_xyxy[2])) / 2.0,
+        (float(bbox_xyxy[1]) + float(bbox_xyxy[3])) / 2.0,
+    )
+
+
+def bbox_iou_xyxy(
+    bbox_a: tuple[int, int, int, int] | None,
+    bbox_b: tuple[int, int, int, int] | None,
+) -> float:
+    if bbox_a is None or bbox_b is None:
+        return 0.0
+    ax1, ay1, ax2, ay2 = bbox_a
+    bx1, by1, bx2, by2 = bbox_b
+    inter_x1 = max(int(ax1), int(bx1))
+    inter_y1 = max(int(ay1), int(by1))
+    inter_x2 = min(int(ax2), int(bx2))
+    inter_y2 = min(int(ay2), int(by2))
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter = float(inter_w * inter_h)
+    if inter <= 0.0:
+        return 0.0
+    area_a = float(max(0, int(ax2) - int(ax1)) * max(0, int(ay2) - int(ay1)))
+    area_b = float(max(0, int(bx2) - int(bx1)) * max(0, int(by2) - int(by1)))
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
 def sanitize_missing_issue_response(
     parsed: dict[str, Any] | None,
     *,
@@ -1341,7 +1384,7 @@ def request_gap_fill_verdict(
     target_frame_index: int,
     issue_description: str,
     attempt_index: int,
-    point_xy: tuple[int, int],
+    positive_points: list[tuple[int, int]],
     max_json_retries: int,
 ) -> tuple[dict[str, Any] | None, str | None]:
     messages = [
@@ -1357,13 +1400,13 @@ def request_gap_fill_verdict(
                     "text": (
                         f"Target frame: {int(target_frame_index)}\n"
                         f"Attempt: {int(attempt_index)}\n"
-                        f"Click point used: {list(point_xy)}\n"
+                        f"Positive clicks used: {[list(point) for point in positive_points]}\n"
                         f"Issue description: {issue_description or '(none)'}\n\n"
                         "Image 1 is the raw target frame. "
                         "Image 2 is the candidate mask overlay on the target frame. "
                         "Image 3 shows nearby reference masks for the same creature. "
                         "Accept only if the candidate clearly segments the same missing creature and does not just duplicate an existing mask. "
-                        "If the creature is visible but this click is wrong, return retry and suggest one improved click point [x,y]. "
+                        "If the creature is visible but the candidate is incomplete or wrong, return retry and suggest one additional click point [x,y] on an uncovered part of the same creature. "
                         "If the issue is not repairable from this frame, return reject. "
                         "Return strict JSON only."
                     ),
@@ -1638,9 +1681,161 @@ def build_point_candidates(
     return deduped[: max(1, int(max_candidates))]
 
 
+def propose_refinement_point(
+    *,
+    candidate_item: dict[str, Any],
+    hint_bbox_xyxy: tuple[int, int, int, int] | None,
+    reference_item: dict[str, Any] | None,
+    positive_points: list[tuple[int, int]],
+    frame_w: int,
+    frame_h: int,
+) -> tuple[int, int] | None:
+    candidate_mask = candidate_item.get("mask")
+    candidate_bbox = candidate_item.get("bbox_xyxy")
+    anchor_bbox = hint_bbox_xyxy or (reference_item.get("bbox_xyxy") if reference_item else None)
+    if candidate_mask is None or candidate_bbox is None or anchor_bbox is None:
+        return None
+
+    ax1, ay1, ax2, ay2 = anchor_bbox
+    cx1, cy1, cx2, cy2 = candidate_bbox
+    anchor_w, anchor_h = bbox_dims_xyxy(anchor_bbox)
+    if anchor_w <= 0 or anchor_h <= 0:
+        return None
+
+    orientation = "horizontal" if anchor_w >= anchor_h else "vertical"
+    positive_set = {
+        normalize_point_xy(point, frame_w=frame_w, frame_h=frame_h)
+        for point in positive_points
+    }
+
+    candidates: list[tuple[int, int]] = []
+    if orientation == "horizontal":
+        anchor_mid_y = int(round((ay1 + ay2) / 2.0))
+        left_gap = max(0, int(cx1) - int(ax1))
+        right_gap = max(0, int(ax2) - int(cx2))
+        if left_gap >= right_gap and left_gap > max(6, int(round(anchor_w * 0.08))):
+            candidates.append((int(round((ax1 + cx1) / 2.0)), anchor_mid_y))
+        if right_gap > 0:
+            candidates.append((int(round((cx2 + ax2) / 2.0)), anchor_mid_y))
+        for frac in (0.2, 0.35, 0.65, 0.8):
+            candidates.append((int(round(ax1 + frac * anchor_w)), anchor_mid_y))
+    else:
+        anchor_mid_x = int(round((ax1 + ax2) / 2.0))
+        top_gap = max(0, int(cy1) - int(ay1))
+        bottom_gap = max(0, int(ay2) - int(cy2))
+        if top_gap >= bottom_gap and top_gap > max(6, int(round(anchor_h * 0.08))):
+            candidates.append((anchor_mid_x, int(round((ay1 + cy1) / 2.0))))
+        if bottom_gap > 0:
+            candidates.append((anchor_mid_x, int(round((cy2 + ay2) / 2.0))))
+        for frac in (0.2, 0.35, 0.65, 0.8):
+            candidates.append((anchor_mid_x, int(round(ay1 + frac * anchor_h))))
+
+    reference_centroid = reference_item.get("centroid") if reference_item else None
+    if reference_centroid is not None:
+        candidates.insert(0, (int(reference_centroid[0]), int(reference_centroid[1])))
+
+    for point in candidates:
+        normalized = normalize_point_xy(point, frame_w=frame_w, frame_h=frame_h)
+        if normalized is None or normalized in positive_set:
+            continue
+        px, py = normalized
+        if 0 <= py < candidate_mask.shape[0] and 0 <= px < candidate_mask.shape[1]:
+            if bool(candidate_mask[py, px]):
+                continue
+        return normalized
+    return None
+
+
+def assess_gap_fill_candidate_geometry(
+    *,
+    candidate_item: dict[str, Any],
+    reference_item: dict[str, Any] | None,
+    hint_bbox_xyxy: tuple[int, int, int, int] | None,
+) -> dict[str, Any]:
+    candidate_bbox = candidate_item.get("bbox_xyxy")
+    candidate_area = float(candidate_item.get("area") or 0.0)
+    anchor_bbox = hint_bbox_xyxy or (reference_item.get("bbox_xyxy") if reference_item else None)
+    reference_bbox = reference_item.get("bbox_xyxy") if reference_item else None
+    reference_area = float(reference_item.get("area") or 0.0) if reference_item else 0.0
+
+    cand_w, cand_h = bbox_dims_xyxy(candidate_bbox)
+    ref_w, ref_h = bbox_dims_xyxy(reference_bbox)
+    anchor_w, anchor_h = bbox_dims_xyxy(anchor_bbox)
+    cand_center = bbox_center_xyxy(candidate_bbox)
+    ref_center = bbox_center_xyxy(reference_bbox)
+
+    area_ratio = (candidate_area / reference_area) if reference_area > 0 else None
+    width_ratio = (float(cand_w) / float(ref_w)) if ref_w > 0 else None
+    height_ratio = (float(cand_h) / float(ref_h)) if ref_h > 0 else None
+    bbox_iou = bbox_iou_xyxy(candidate_bbox, anchor_bbox)
+    center_dist = None
+    if cand_center is not None and ref_center is not None:
+        center_dist = math.hypot(cand_center[0] - ref_center[0], cand_center[1] - ref_center[1])
+
+    status = "ok"
+    reason = ""
+
+    if area_ratio is not None and reference_bbox is not None:
+        aspect_ref = float(ref_w + 1) / float(ref_h + 1)
+        aspect_cand = float(cand_w + 1) / float(cand_h + 1)
+        aspect_ratio_delta = max(aspect_cand / aspect_ref, aspect_ref / aspect_cand)
+        major_axis_ratio = max(
+            (float(cand_w) / float(ref_w)) if ref_w > 0 else 0.0,
+            (float(cand_h) / float(ref_h)) if ref_h > 0 else 0.0,
+        )
+        minor_axis_ratio = min(
+            (float(cand_w) / float(ref_w)) if ref_w > 0 else 0.0,
+            (float(cand_h) / float(ref_h)) if ref_h > 0 else 0.0,
+        )
+
+        if (
+            area_ratio >= 1.75
+            and (bbox_iou <= 0.35 or aspect_ratio_delta >= 2.5)
+        ):
+            status = "reject"
+            reason = "candidate_geometry_wildly_larger_than_reference"
+        elif center_dist is not None and max(ref_w, ref_h) > 0 and center_dist > (0.85 * max(ref_w, ref_h)) and bbox_iou <= 0.2:
+            status = "reject"
+            reason = "candidate_geometry_far_from_reference"
+        elif area_ratio <= 0.35 or minor_axis_ratio <= 0.4 or (major_axis_ratio <= 0.6 and bbox_iou <= 0.55):
+            status = "partial"
+            reason = "candidate_geometry_partial_coverage"
+        return {
+            "status": status,
+            "reason": reason,
+            "area_ratio": area_ratio,
+            "width_ratio": width_ratio,
+            "height_ratio": height_ratio,
+            "bbox_iou": bbox_iou,
+            "center_distance": center_dist,
+            "reference_bbox_xyxy": list(reference_bbox) if reference_bbox is not None else None,
+            "anchor_bbox_xyxy": list(anchor_bbox) if anchor_bbox is not None else None,
+            "candidate_bbox_xyxy": list(candidate_bbox) if candidate_bbox is not None else None,
+        }
+
+    if anchor_bbox is not None and anchor_w > 0 and anchor_h > 0:
+        anchor_iou = bbox_iou_xyxy(candidate_bbox, anchor_bbox)
+        if anchor_iou <= 0.1 and candidate_area > float(anchor_w * anchor_h) * 0.75:
+            status = "reject"
+            reason = "candidate_geometry_outside_anchor"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "area_ratio": area_ratio,
+        "width_ratio": width_ratio,
+        "height_ratio": height_ratio,
+        "bbox_iou": bbox_iou,
+        "center_distance": center_dist,
+        "reference_bbox_xyxy": list(reference_bbox) if reference_bbox is not None else None,
+        "anchor_bbox_xyxy": list(anchor_bbox) if anchor_bbox is not None else None,
+        "candidate_bbox_xyxy": list(candidate_bbox) if candidate_bbox is not None else None,
+    }
+
+
 def build_point_prompt_points(
     *,
-    point_xy: tuple[int, int],
+    positive_points: list[tuple[int, int]],
     hint_bbox_xyxy: tuple[int, int, int, int] | None,
     frame_w: int,
     frame_h: int,
@@ -1657,10 +1852,16 @@ def build_point_prompt_points(
         if entry not in points:
             points.append(entry)
 
-    center = normalize_point_xy(point_xy, frame_w=frame_w, frame_h=frame_h)
-    if center is None:
+    normalized_positive = [
+        normalize_point_xy(point, frame_w=frame_w, frame_h=frame_h)
+        for point in positive_points
+    ]
+    normalized_positive = [point for point in normalized_positive if point is not None]
+    if not normalized_positive:
         return []
-    _append(center, 1)
+    deduped_positive = dedupe_points([(int(x), int(y)) for x, y in normalized_positive], min_distance=4.0)
+    for point in deduped_positive:
+        _append(point, 1)
 
     if hint_bbox_xyxy is not None:
         x1, y1, x2, y2 = hint_bbox_xyxy
@@ -1668,15 +1869,18 @@ def build_point_prompt_points(
         height = max(4, int(y2 - y1))
         dx = max(2, int(round(width * 0.12)))
         dy = max(2, int(round(height * 0.12)))
-        cx, cy = center
-        for offset in ((dx, 0), (-dx, 0), (0, dy), (0, -dy)):
-            _append((cx + offset[0], cy + offset[1]), 1)
+        for cx, cy in deduped_positive:
+            for offset in ((dx, 0), (-dx, 0), (0, dy), (0, -dy)):
+                _append((cx + offset[0], cy + offset[1]), 1)
+        center_x = int(round((x1 + x2) / 2.0))
+        center_y = int(round((y1 + y2) / 2.0))
+        _append((center_x, center_y), 1)
         border = max(3, int(round(min(width, height) * 0.08)))
         for negative in (
-            (x1 - border, cy),
-            (x2 + border, cy),
-            (cx, y1 - border),
-            (cx, y2 + border),
+            (x1 - border, center_y),
+            (x2 + border, center_y),
+            (center_x, y1 - border),
+            (center_x, y2 + border),
         ):
             _append(negative, 0)
 
@@ -2090,26 +2294,50 @@ def repair_missing_masks_in_window(
             report["issues"].append(issue_report)
             continue
 
+        reference_item = None
+        for ref in issue["reference_masks"]:
+            try:
+                ref_frame_index = int(ref["frame_index"])
+                ref_local_id = int(ref["local_id"])
+            except Exception:
+                continue
+            reference_item = find_mask_item(
+                mask_items_by_frame,
+                frame_index=ref_frame_index,
+                local_id=ref_local_id,
+            )
+            if reference_item is not None:
+                break
+
         pending_points: deque[tuple[int, int]] = deque(initial_candidates)
         seen_points = set(initial_candidates)
+        active_positive_points: list[tuple[int, int]] = []
         accepted = False
         for attempt_index in range(1, max(1, int(args.gap_fill_max_attempts)) + 1):
-            if not pending_points:
-                break
-            point_xy = pending_points.popleft()
+            if not active_positive_points:
+                if not pending_points:
+                    break
+                active_positive_points = [pending_points.popleft()]
+
             attempt_dir = issue_dir / f"attempt_{attempt_index:02d}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
             candidate_overlay_path = attempt_dir / "candidate_overlay.jpg"
             prompt_overlay_path = attempt_dir / "point_prompt_overlay.jpg"
             prompt_points = build_point_prompt_points(
-                point_xy=point_xy,
+                positive_points=active_positive_points,
                 hint_bbox_xyxy=target_hint_bbox_xyxy,
                 frame_w=frame_w,
                 frame_h=frame_h,
             )
             attempt_report: dict[str, Any] = {
                 "attempt_index": int(attempt_index),
-                "point_xy": [int(point_xy[0]), int(point_xy[1])],
+                "point_xy": [
+                    int(active_positive_points[-1][0]),
+                    int(active_positive_points[-1][1]),
+                ],
+                "positive_points": [
+                    [int(point[0]), int(point[1])] for point in active_positive_points
+                ],
                 "prompt_points": [
                     {"x": int(x), "y": int(y), "label": int(label)}
                     for x, y, label in prompt_points
@@ -2184,7 +2412,7 @@ def repair_missing_masks_in_window(
             )
             cv2.putText(
                 rendered_candidate,
-                f"click={list(point_xy)}",
+                f"clicks={[list(point) for point in active_positive_points]}",
                 (12, max(32, rendered_candidate.shape[0] - 18)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -2194,7 +2422,7 @@ def repair_missing_masks_in_window(
             )
             cv2.putText(
                 rendered_candidate,
-                f"click={list(point_xy)}",
+                f"clicks={[list(point) for point in active_positive_points]}",
                 (12, max(32, rendered_candidate.shape[0] - 18)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -2203,6 +2431,57 @@ def repair_missing_masks_in_window(
                 cv2.LINE_AA,
             )
             cv2.imwrite(str(candidate_overlay_path), rendered_candidate)
+
+            geometry_assessment = assess_gap_fill_candidate_geometry(
+                candidate_item=candidate_item,
+                reference_item=reference_item,
+                hint_bbox_xyxy=target_hint_bbox_xyxy,
+            )
+            attempt_report["geometry_assessment"] = geometry_assessment
+
+            if geometry_assessment["status"] == "reject":
+                attempt_report["decision"] = "retry"
+                attempt_report["verification_status"] = "geometry_reject"
+                attempt_report["failure_reason"] = str(
+                    geometry_assessment["reason"] or "geometry_reject"
+                )
+                attempt_report["reason"] = (
+                    "Automatically rejected before MLLM verification because the "
+                    "candidate geometry is wildly inconsistent with the reference."
+                )
+                issue_report["attempts"].append(attempt_report)
+                active_positive_points = []
+                continue
+
+            if geometry_assessment["status"] == "partial":
+                refinement_point = propose_refinement_point(
+                    candidate_item=candidate_item,
+                    hint_bbox_xyxy=target_hint_bbox_xyxy,
+                    reference_item=reference_item,
+                    positive_points=active_positive_points,
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                )
+                attempt_report["auto_refinement_point"] = (
+                    list(refinement_point) if refinement_point is not None else None
+                )
+                if refinement_point is not None:
+                    active_positive_points = dedupe_points(
+                        active_positive_points + [refinement_point],
+                        min_distance=4.0,
+                    )
+                    seen_points.add(refinement_point)
+                    attempt_report["decision"] = "retry"
+                    attempt_report["verification_status"] = "geometry_partial"
+                    attempt_report["failure_reason"] = str(
+                        geometry_assessment["reason"] or "geometry_partial"
+                    )
+                    attempt_report["reason"] = (
+                        "Automatically retrying with an extra positive click because the "
+                        "candidate appears to cover only part of the creature."
+                    )
+                    issue_report["attempts"].append(attempt_report)
+                    continue
 
             verdict_parsed, verdict_raw_text = request_gap_fill_verdict(
                 send_generate_request_fn=send_generate_request_fn,
@@ -2213,7 +2492,7 @@ def repair_missing_masks_in_window(
                 target_frame_index=target_frame_index,
                 issue_description=str(issue.get("description", "")),
                 attempt_index=attempt_index,
-                point_xy=point_xy,
+                positive_points=active_positive_points,
                 max_json_retries=max_json_retries,
             )
             attempt_report["raw_verdict_response"] = verdict_raw_text
@@ -2260,13 +2539,21 @@ def repair_missing_masks_in_window(
                 issue_report["attempts"].append(attempt_report)
                 break
 
-            if decision == "retry" and suggested_point is not None and suggested_point not in seen_points:
-                pending_points.appendleft(suggested_point)
-                seen_points.add(suggested_point)
+            if decision == "retry" and suggested_point is not None:
+                if suggested_point not in seen_points:
+                    active_positive_points = dedupe_points(
+                        active_positive_points + [suggested_point],
+                        min_distance=4.0,
+                    )
+                    seen_points.add(suggested_point)
+                else:
+                    active_positive_points = []
+            elif decision == "retry":
+                active_positive_points = []
             issue_report["attempts"].append(attempt_report)
 
             if decision == "reject":
-                break
+                active_positive_points = []
 
         if not accepted and "failure_reason" not in issue_report:
             issue_report["failure_reason"] = "max_attempts_exhausted"
