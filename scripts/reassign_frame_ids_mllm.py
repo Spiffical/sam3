@@ -1523,6 +1523,75 @@ def find_mask_item(
     return None
 
 
+def find_existing_issue_match(
+    *,
+    target_frame_index: int,
+    reference_masks: list[dict[str, int]],
+    mask_items_by_frame: dict[int, list[dict[str, Any]]],
+    hint_bbox_xyxy: tuple[int, int, int, int] | None,
+    candidate_item: dict[str, Any] | None = None,
+    min_support_score: float = 0.9,
+    min_hint_iou: float = 0.55,
+) -> dict[str, Any] | None:
+    existing_items = list(mask_items_by_frame.get(int(target_frame_index), []) or [])
+    if not existing_items:
+        return None
+
+    reference_items: list[dict[str, Any]] = []
+    for ref in reference_masks:
+        try:
+            ref_frame_index = int(ref["frame_index"])
+            ref_local_id = int(ref["local_id"])
+        except Exception:
+            continue
+        ref_item = find_mask_item(
+            mask_items_by_frame,
+            frame_index=ref_frame_index,
+            local_id=ref_local_id,
+        )
+        if ref_item is not None:
+            reference_items.append(ref_item)
+    if not reference_items:
+        return None
+
+    best_match: dict[str, Any] | None = None
+    best_score = float("-inf")
+    for existing_item in existing_items:
+        support_scores = [mask_match_support_score(existing_item, ref_item) for ref_item in reference_items]
+        support_score = float(max(support_scores, default=0.0))
+        hint_iou = float(bbox_iou_xyxy(existing_item.get("bbox_xyxy"), hint_bbox_xyxy))
+        duplicate_iou = 0.0
+        if candidate_item is not None:
+            duplicate_iou = float(binary_mask_iou(existing_item["mask"], candidate_item["mask"]))
+        combined_score = support_score + (0.75 * hint_iou) + (1.25 * duplicate_iou)
+        if combined_score <= best_score:
+            continue
+        best_score = combined_score
+        best_match = {
+            "local_id": int(existing_item["local_id"]),
+            "support_score": support_score,
+            "hint_iou": hint_iou,
+            "duplicate_iou": duplicate_iou,
+            "combined_score": combined_score,
+            "bbox_xyxy": (
+                list(existing_item["bbox_xyxy"]) if existing_item.get("bbox_xyxy") is not None else None
+            ),
+            "reference_support_scores": [float(score) for score in support_scores],
+        }
+
+    if best_match is None:
+        return None
+
+    support_ok = float(best_match["support_score"]) >= float(min_support_score)
+    hint_ok = float(best_match["hint_iou"]) >= float(min_hint_iou)
+    duplicate_ok = candidate_item is not None and float(best_match["duplicate_iou"]) >= 0.80
+    if duplicate_ok and float(best_match["support_score"]) >= 0.60:
+        return best_match
+    if support_ok and (hint_ok or candidate_item is None):
+        return best_match
+    return None
+
+
 def estimate_target_hint_bbox_xyxy(
     *,
     target_frame_index: int,
@@ -2173,6 +2242,7 @@ def repair_missing_masks_in_window(
         "raw_detection_response": None,
         "issues": [],
         "accepted_issue_count": 0,
+        "already_present_issue_count": 0,
         "unresolved_issue_count": 0,
     }
     gap_dir = window_dir / "gap_fill"
@@ -2277,6 +2347,24 @@ def repair_missing_masks_in_window(
         issue_report["target_hint_bbox_xyxy"] = (
             list(target_hint_bbox_xyxy) if target_hint_bbox_xyxy is not None else None
         )
+
+        preexisting_match = find_existing_issue_match(
+            target_frame_index=target_frame_index,
+            reference_masks=list(issue["reference_masks"]),
+            mask_items_by_frame=mask_items_by_frame,
+            hint_bbox_xyxy=target_hint_bbox_xyxy,
+            min_support_score=float(args.assignment_heuristic_min_score),
+        )
+        if preexisting_match is not None:
+            issue_report["status"] = "already_present"
+            issue_report["resolved_local_id"] = int(preexisting_match["local_id"])
+            issue_report["resolution_reason"] = (
+                "Skipped gap fill because the current working state already contains "
+                "a strong matching mask for this creature on the target frame."
+            )
+            issue_report["existing_match"] = preexisting_match
+            report["issues"].append(issue_report)
+            continue
 
         initial_candidates = build_point_candidates(
             target_frame_index=target_frame_index,
@@ -2508,8 +2596,38 @@ def repair_missing_masks_in_window(
             attempt_report["suggested_point"] = list(suggested_point) if suggested_point else None
 
             if max_existing_iou >= 0.80 and decision == "accept":
+                duplicate_match = find_existing_issue_match(
+                    target_frame_index=target_frame_index,
+                    reference_masks=list(issue["reference_masks"]),
+                    mask_items_by_frame=mask_items_by_frame,
+                    hint_bbox_xyxy=target_hint_bbox_xyxy,
+                    candidate_item=candidate_item,
+                    min_support_score=float(args.assignment_heuristic_min_score),
+                )
+                if duplicate_match is not None:
+                    decision = "already_present"
+                    attempt_report["decision"] = "already_present"
+                    attempt_report["verification_status"] = "already_present"
+                    attempt_report["reason"] = (
+                        attempt_report["reason"] + " "
+                        if attempt_report["reason"]
+                        else ""
+                    ) + (
+                        "Resolved as already present because the accepted candidate nearly "
+                        "duplicates an existing matching mask on the target frame."
+                    )
+                    attempt_report["resolved_local_id"] = int(duplicate_match["local_id"])
+                    attempt_report["existing_match"] = duplicate_match
+                    issue_report["status"] = "already_present"
+                    issue_report["resolved_local_id"] = int(duplicate_match["local_id"])
+                    issue_report["resolution_reason"] = attempt_report["reason"]
+                    issue_report["existing_match"] = duplicate_match
+                    issue_report["attempts"].append(attempt_report)
+                    accepted = True
+                    break
                 decision = "retry"
                 attempt_report["decision"] = "retry"
+                attempt_report["verification_status"] = "retry_duplicate"
                 attempt_report["reason"] = (
                     attempt_report["reason"] + " "
                     if attempt_report["reason"]
@@ -2560,7 +2678,12 @@ def repair_missing_masks_in_window(
         report["issues"].append(issue_report)
 
     report["accepted_issue_count"] = sum(1 for issue in report["issues"] if issue.get("status") == "accepted")
-    report["unresolved_issue_count"] = sum(1 for issue in report["issues"] if issue.get("status") != "accepted")
+    report["already_present_issue_count"] = sum(
+        1 for issue in report["issues"] if issue.get("status") == "already_present"
+    )
+    report["unresolved_issue_count"] = sum(
+        1 for issue in report["issues"] if issue.get("status") not in {"accepted", "already_present"}
+    )
     report["failure_reason_counts"] = dict(
         Counter(str(issue.get("failure_reason")) for issue in report["issues"] if issue.get("failure_reason"))
     )
@@ -3179,6 +3302,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
     raw_response_failures = 0
     gap_fill_detection_failures = 0
     gap_fill_accepted_issue_count = 0
+    gap_fill_already_present_issue_count = 0
     gap_fill_unresolved_issue_count = 0
     outlier_candidate_issue_count = 0
     outlier_reviewed_issue_count = 0
@@ -3276,6 +3400,9 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
                     if detection_parsed is None:
                         gap_fill_detection_failures += 1
                 gap_fill_accepted_issue_count += int(gap_fill_report.get("accepted_issue_count", 0))
+                gap_fill_already_present_issue_count += int(
+                    gap_fill_report.get("already_present_issue_count", 0)
+                )
                 gap_fill_unresolved_issue_count += int(gap_fill_report.get("unresolved_issue_count", 0))
                 if args.filter_outlier_masks:
                     outlier_filter_report, local_ids_by_frame, mask_items_by_frame = filter_outlier_gap_fill_masks(
@@ -3548,6 +3675,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         "raw_response_failure_count": int(raw_response_failures),
         "gap_fill_detection_failure_count": int(gap_fill_detection_failures),
         "gap_fill_accepted_issue_count": int(gap_fill_accepted_issue_count),
+        "gap_fill_already_present_issue_count": int(gap_fill_already_present_issue_count),
         "gap_fill_retained_issue_count": int(gap_fill_retained_issue_count),
         "gap_fill_unresolved_issue_count": int(gap_fill_unresolved_issue_count),
         "gap_filled_frame_count": int(gap_filled_frame_count),
@@ -3588,6 +3716,7 @@ def process_run_dir(args: argparse.Namespace, run_dir: Path, send_req: Any) -> d
         "allow_drop_assignments": bool(args.allow_drop_assignments),
         "gap_fill_detection_failure_count": int(gap_fill_detection_failures),
         "gap_fill_accepted_issue_count": int(gap_fill_accepted_issue_count),
+        "gap_fill_already_present_issue_count": int(gap_fill_already_present_issue_count),
         "gap_fill_retained_issue_count": int(gap_fill_retained_issue_count),
         "gap_fill_unresolved_issue_count": int(gap_fill_unresolved_issue_count),
         "gap_filled_frame_count": int(gap_filled_frame_count),

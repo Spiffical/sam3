@@ -84,6 +84,72 @@ class OutlierCleanupHelpersTests(unittest.TestCase):
         self.assertIn((2, 2), positives)
         self.assertIn((5, 5), positives)
 
+    def test_find_existing_issue_match_detects_already_present_mask(self) -> None:
+        import numpy as np
+
+        existing_mask = np.zeros((self.frame_h, self.frame_w), dtype=np.uint8)
+        ref_mask = np.zeros((self.frame_h, self.frame_w), dtype=np.uint8)
+        existing_mask[1:6, 3:5] = 1
+        ref_mask[1:6, 3:5] = 1
+
+        target_row = self._frame_row_from_masks([existing_mask])
+        target_row["frame_index"] = 10
+        ref_row = self._frame_row_from_masks([ref_mask])
+        ref_row["frame_index"] = 9
+
+        target_items = mod.decode_frame_row_masks(target_row, self.frame_h, self.frame_w)
+        ref_items = mod.decode_frame_row_masks(ref_row, self.frame_h, self.frame_w)
+        mask_items_by_frame = {
+            10: target_items,
+            9: ref_items,
+        }
+
+        match = mod.find_existing_issue_match(
+            target_frame_index=10,
+            reference_masks=[{"frame_index": 9, "local_id": 1}],
+            mask_items_by_frame=mask_items_by_frame,
+            hint_bbox_xyxy=target_items[0]["bbox_xyxy"],
+            min_support_score=0.9,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["local_id"], 1)
+        self.assertGreaterEqual(match["support_score"], 0.9)
+
+    def test_find_existing_issue_match_uses_candidate_duplicate_overlap(self) -> None:
+        import numpy as np
+
+        existing_mask = np.zeros((self.frame_h, self.frame_w), dtype=np.uint8)
+        ref_mask = np.zeros((self.frame_h, self.frame_w), dtype=np.uint8)
+        existing_mask[1:6, 3:5] = 1
+        ref_mask[1:6, 3:5] = 1
+
+        target_row = self._frame_row_from_masks([existing_mask])
+        target_row["frame_index"] = 10
+        ref_row = self._frame_row_from_masks([ref_mask])
+        ref_row["frame_index"] = 9
+
+        target_items = mod.decode_frame_row_masks(target_row, self.frame_h, self.frame_w)
+        ref_items = mod.decode_frame_row_masks(ref_row, self.frame_h, self.frame_w)
+        candidate_item = dict(target_items[0])
+        mask_items_by_frame = {
+            10: target_items,
+            9: ref_items,
+        }
+
+        match = mod.find_existing_issue_match(
+            target_frame_index=10,
+            reference_masks=[{"frame_index": 9, "local_id": 1}],
+            mask_items_by_frame=mask_items_by_frame,
+            hint_bbox_xyxy=target_items[0]["bbox_xyxy"],
+            candidate_item=candidate_item,
+            min_support_score=0.9,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["local_id"], 1)
+        self.assertGreaterEqual(match["duplicate_iou"], 0.99)
+
 
 if __name__ == "__main__":
     unittest.main()
