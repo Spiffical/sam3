@@ -38,6 +38,12 @@ try:
 except ImportError:
     torch = None
 
+DEPRECATED_POSTPROP_MISSED_CREATURES_MESSAGE = (
+    "The MLLM post-propagation missed-creature sweep is deprecated because it "
+    "proved unreliable in practice. The code remains in-tree for reference, "
+    "but '--postprop_missed_creatures' is intentionally disabled."
+)
+
 try:
     from PIL import Image
 except ImportError:
@@ -1105,8 +1111,8 @@ def parse_args() -> argparse.Namespace:
         "--postprop_missed_creatures",
         action="store_true",
         help=(
-            "Run an MLLM post-propagation discovery sweep for creatures missed by the "
-            "main SAM3 agent loop, using click proposals and iterative refinement."
+            "Deprecated and disabled: the MLLM post-propagation missed-creature "
+            "sweep proved unreliable."
         ),
     )
     parser.add_argument(
@@ -1336,6 +1342,8 @@ def parse_args() -> argparse.Namespace:
 
 def run() -> int:
     args = parse_args()
+    if args.postprop_missed_creatures:
+        raise SystemExit(DEPRECATED_POSTPROP_MISSED_CREATURES_MESSAGE)
     os.environ["SAM3_AGENT_PROMPT_PROFILE"] = args.prompt_profile
     os.makedirs(args.output_dir, exist_ok=True)
     start_ts = time.time()
@@ -1363,9 +1371,6 @@ def run() -> int:
         from frame_quality_mllm import discover_invalid_frames_with_mllm
         from keyframe_discovery import discover_keyframes_from_motion
         from keyframe_discovery_mllm import discover_keyframes_with_mllm
-        from postprop_missed_creatures import (
-            discover_postprop_missed_creatures_with_mllm,
-        )
         from postprop_qa_mllm import discover_postprop_qa_with_mllm
         from postprop_repair import repair_postprop_failures
         from track_id_matching import assign_object_ids_by_iou

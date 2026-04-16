@@ -25,6 +25,11 @@ except ImportError:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROMPT_PROFILE = "underwater"
 DEFAULT_CODEC = "mp4v"
+DEPRECATED_MISSED_CREATURES_MESSAGE = (
+    "The MLLM missed-creature discovery stage is deprecated because it proved "
+    "unreliable in practice. Keep the code for reference, but do not enable "
+    "'missed_creatures' or '--find-missed-creatures' in production runs."
+)
 
 cv2 = None
 np = None
@@ -331,12 +336,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--missed-creatures-prompt-path",
         default="",
-        help="Optional override system prompt file for missed-creature discovery.",
+        help="Deprecated compatibility option for the disabled missed-creature stage.",
     )
     parser.add_argument(
         "--verify-missed-creatures-prompt-path",
         default="",
-        help="Optional override system prompt file for missed-creature verification.",
+        help="Deprecated compatibility option for the disabled missed-creature stage.",
     )
     parser.add_argument(
         "--outlier-mask-prompt-path",
@@ -350,7 +355,8 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Ordered post-processing stage to run. May be repeated, and order matters. "
-            "If omitted, legacy stage flags determine the default pipeline."
+            "If omitted, legacy stage flags determine the default pipeline. "
+            "'missed_creatures' is deprecated and will exit immediately if requested."
         ),
     )
     parser.add_argument(
@@ -540,15 +546,15 @@ def parse_args() -> argparse.Namespace:
         dest="find_missed_creatures",
         action="store_true",
         help=(
-            "Run an MLLM-guided missed-creature discovery pass that proposes click points "
-            "for entirely unsegmented animals before ID reassignment."
+            "Deprecated and disabled: the MLLM-guided missed-creature discovery pass "
+            "proved unreliable."
         ),
     )
     parser.add_argument(
         "--no-find-missed-creatures",
         dest="find_missed_creatures",
         action="store_false",
-        help="Skip the missed-creature discovery stage.",
+        help="Leave the deprecated missed-creature discovery stage disabled.",
     )
     parser.add_argument(
         "--allow-drop-assignments",
@@ -2378,12 +2384,14 @@ def build_stage_helpers() -> SimpleNamespace:
 
 def resolve_enabled_stages(args: argparse.Namespace) -> list[str]:
     explicit = [str(stage).strip() for stage in (args.stage or []) if str(stage).strip()]
+    if "missed_creatures" in explicit:
+        raise SystemExit(DEPRECATED_MISSED_CREATURES_MESSAGE)
     if explicit:
         return explicit
 
     stages: list[str] = []
     if bool(args.find_missed_creatures):
-        stages.append("missed_creatures")
+        raise SystemExit(DEPRECATED_MISSED_CREATURES_MESSAGE)
     if bool(args.fill_missing_masks):
         stages.append("gap_fill")
     if bool(args.filter_outlier_masks) and bool(args.fill_missing_masks):

@@ -210,6 +210,11 @@ COLLAGE_COLS="${COLLAGE_COLS:-2}"
 COLLAGE_TILE_MAX_EDGE="${COLLAGE_TILE_MAX_EDGE:-320}"
 SAM3_GPU_IDS="${SAM3_GPU_IDS:-0}"
 SAM3_IMAGE_SIZE="${SAM3_IMAGE_SIZE:-1008}"
+
+if [[ "$FIND_MISSED_CREATURES" == "1" ]]; then
+  echo "The MLLM missed-creature discovery stage is deprecated because it proved unreliable in practice." >&2
+  exit 2
+fi
 SAM3_OFFLOAD_VIDEO_TO_CPU="${SAM3_OFFLOAD_VIDEO_TO_CPU:-0}"
 FILL_MISSING_MASKS="${FILL_MISSING_MASKS:-1}"
 FILTER_OUTLIER_MASKS="${FILTER_OUTLIER_MASKS:-1}"
@@ -394,9 +399,6 @@ if [[ -n "$STAGES_CSV" ]]; then
 fi
 if [[ "$SAM3_OFFLOAD_VIDEO_TO_CPU" == "1" ]]; then
   RUN_CMD+=(--sam3-offload-video-to-cpu)
-fi
-if [[ "$FIND_MISSED_CREATURES" == "1" ]]; then
-  RUN_CMD+=(--find-missed-creatures)
 fi
 if [[ "$FILL_MISSING_MASKS" != "1" ]]; then
   RUN_CMD+=(--no-fill-missing-masks)

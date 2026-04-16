@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SUBMIT_WRAPPER="${REPO_ROOT}/nibi_model_compare/slurm/submit_nibi_job.sh"
 RUNNER_PY="${REPO_ROOT}/nibi_model_compare/run_video_agent_openai.py"
+DEPRECATED_POSTPROP_MISSED_CREATURES_MESSAGE="The MLLM post-propagation missed-creature sweep is deprecated because it proved unreliable in practice. The code is kept for reference, but '--postprop-missed-creatures' is disabled."
 
 usage() {
   cat <<'EOF'
@@ -58,16 +59,16 @@ Runner options:
   --mllm-discovery-window-size <n>     Default: 4
   --mllm-discovery-window-stride <n>   Default: 24
   --mllm-discovery-max-json-retries <n> Default: 2
-  --postprop-missed-creatures          Enable post-prop missed-creature discovery pass
-  --postprop-missed-window-size <n>    Default: 20
-  --postprop-missed-window-stride <n>  Default: 10
-  --postprop-missed-max-issues-per-window <n> Default: 4
-  --postprop-missed-max-rounds <n>     Default: 10
-  --postprop-missed-max-attempts-per-issue <n> Default: 10
-  --postprop-missed-max-images-per-request <n> Default: 20
-  --postprop-missed-max-json-retries <n> Default: 2
-  --postprop-missed-prompt-path <path> Optional discovery system prompt template
-  --postprop-missed-verify-prompt-path <path> Optional verification system prompt template
+  --postprop-missed-creatures          Deprecated and disabled
+  --postprop-missed-window-size <n>    Deprecated compatibility option
+  --postprop-missed-window-stride <n>  Deprecated compatibility option
+  --postprop-missed-max-issues-per-window <n> Deprecated compatibility option
+  --postprop-missed-max-rounds <n>     Deprecated compatibility option
+  --postprop-missed-max-attempts-per-issue <n> Deprecated compatibility option
+  --postprop-missed-max-images-per-request <n> Deprecated compatibility option
+  --postprop-missed-max-json-retries <n> Deprecated compatibility option
+  --postprop-missed-prompt-path <path> Deprecated compatibility option
+  --postprop-missed-verify-prompt-path <path> Deprecated compatibility option
   --postprop-qa-mllm                   Enable post-propagation MLLM QA pass
   --postprop-qa-window-size <n>        Default: 10
   --postprop-qa-window-stride <n>      Default: 1
@@ -337,6 +338,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$postprop_missed_creatures" == "1" ]]; then
+  echo "$DEPRECATED_POSTPROP_MISSED_CREATURES_MESSAGE" >&2
+  exit 1
+fi
 
 # Accept repo:revision shorthand and normalize to separate flags.
 if [[ -z "$model_revision" && "$model_id" == *:* ]]; then

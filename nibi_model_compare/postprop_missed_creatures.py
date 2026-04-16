@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Deprecated experiment kept for reference; do not enable in production."""
+
 import json
 import math
 import os

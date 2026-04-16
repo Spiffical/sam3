@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SBATCH_TEMPLATE="${REPO_ROOT}/nibi_model_compare/slurm/sam3_id_reassign.sbatch"
+DEPRECATED_MISSED_CREATURES_MESSAGE="The MLLM missed-creature discovery stage is deprecated because it proved unreliable in practice. The code is kept for reference, but '--find-missed-creatures' and stage 'missed_creatures' are disabled."
 
 usage() {
   cat <<'EOF'
@@ -23,8 +24,8 @@ Common options:
   --prompt-path <path>                Optional override system prompt for reassignment
   --missing-mask-prompt-path <path>   Optional override system prompt for missing-mask detection
   --verify-gap-fill-prompt-path <path> Optional override system prompt for gap-fill verification
-  --missed-creatures-prompt-path <path> Optional override system prompt for missed-creature discovery
-  --verify-missed-creatures-prompt-path <path> Optional override system prompt for missed-creature verification
+  --missed-creatures-prompt-path <path> Deprecated compatibility option; do not use
+  --verify-missed-creatures-prompt-path <path> Deprecated compatibility option; do not use
   --outlier-mask-prompt-path <path>   Optional override system prompt for outlier-mask review
   --output-subdir <name>              Default: consistent_ids_mllm
   --output-video-name <name>          Default: overlay_consistent_ids.mp4
@@ -49,21 +50,21 @@ LLM/vLLM options:
   --runner-cuda-visible-devices <ids> Default: 1
 
 Post-process options:
-  --stage <name>                      Ordered stage; repeat as needed. Choices: missed_creatures, gap_fill, outlier_filter, id_reassign
+  --stage <name>                      Ordered stage; repeat as needed. Choices: gap_fill, outlier_filter, id_reassign
   --max-completion-tokens <n>         Default: 1024
   --max-json-retries <n>              Default: 2
   --window-size <n>                   Default: 10
   --window-stride <n>                 Default: 8
   --assignment-history-frames <n>     Default: 8
   --assignment-heuristic-min-score <f> Default: 0.85
-  --find-missed-creatures             Enable the missed-creature discovery stage
-  --missed-creatures-window-size <n>  Default: 20
-  --missed-creatures-window-stride <n> Default: 10
-  --max-missed-creature-issues-per-window <n> Default: 4
-  --missed-creatures-max-rounds <n>   Default: 10
-  --missed-creatures-max-attempts <n> Default: 10
-  --missed-creatures-max-images-per-request <n> Default: 20
-  --missed-creatures-duplicate-iou-threshold <f> Default: 0.80
+  --find-missed-creatures             Deprecated and disabled
+  --missed-creatures-window-size <n>  Deprecated compatibility option
+  --missed-creatures-window-stride <n> Deprecated compatibility option
+  --max-missed-creature-issues-per-window <n> Deprecated compatibility option
+  --missed-creatures-max-rounds <n>   Deprecated compatibility option
+  --missed-creatures-max-attempts <n> Deprecated compatibility option
+  --missed-creatures-max-images-per-request <n> Deprecated compatibility option
+  --missed-creatures-duplicate-iou-threshold <f> Deprecated compatibility option
   --max-gap-issues-per-window <n>     Default: 8
   --gap-fill-max-attempts <n>         Default: 4
   --gap-fill-point-candidates <n>     Default: 6
@@ -247,6 +248,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$find_missed_creatures" == "1" ]]; then
+  echo "$DEPRECATED_MISSED_CREATURES_MESSAGE" >&2
+  exit 1
+fi
+
+for stage_name in "${stages[@]}"; do
+  if [[ "$stage_name" == "missed_creatures" ]]; then
+    echo "$DEPRECATED_MISSED_CREATURES_MESSAGE" >&2
+    exit 1
+  fi
+done
+
 if [[ ${#input_dirs[@]} -eq 0 ]]; then
   echo "At least one --input-dir is required." >&2
   usage
@@ -307,17 +320,13 @@ fi
 if ! limit_mm_per_prompt="$(python3 - \
   "$limit_mm_per_prompt" \
   "$max_images_per_request" \
-  "$missed_creatures_max_images_per_request" \
-  "$fill_missing_masks" \
-  "$find_missed_creatures" <<'PY'
+  "$fill_missing_masks" <<'PY'
 import json
 import sys
 
 value = sys.argv[1]
 max_images_per_request = int(sys.argv[2])
-missed_creatures_max_images_per_request = int(sys.argv[3])
-fill_missing_masks = sys.argv[4] == "1"
-find_missed_creatures = sys.argv[5] == "1"
+fill_missing_masks = sys.argv[3] == "1"
 try:
     parsed = json.loads(value)
 except Exception as exc:
@@ -331,10 +340,6 @@ if not isinstance(parsed, dict):
 requested_image_budget = max(1, max_images_per_request)
 if fill_missing_masks:
     requested_image_budget = max(requested_image_budget, 3)
-if find_missed_creatures:
-    requested_image_budget = max(
-        requested_image_budget, missed_creatures_max_images_per_request
-    )
 
 current_image_limit = parsed.get("image", 0)
 try:

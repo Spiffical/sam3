@@ -378,6 +378,11 @@ POSTPROP_QA_MAX_OBJECT_CROPS="${POSTPROP_QA_MAX_OBJECT_CROPS:-8}"
 POSTPROP_QA_CROP_CONTEXT_RATIO="${POSTPROP_QA_CROP_CONTEXT_RATIO:-0.25}"
 POSTPROP_QA_MAX_JSON_RETRIES="${POSTPROP_QA_MAX_JSON_RETRIES:-2}"
 POSTPROP_QA_MERGE_BAD_INTO_INVALID="${POSTPROP_QA_MERGE_BAD_INTO_INVALID:-1}"
+
+if [[ "$POSTPROP_MISSED_CREATURES" == "1" ]]; then
+  echo "The MLLM post-propagation missed-creature sweep is deprecated because it proved unreliable in practice." >&2
+  exit 2
+fi
 POSTPROP_REPAIR="${POSTPROP_REPAIR:-0}"
 POSTPROP_REPAIR_WINDOW="${POSTPROP_REPAIR_WINDOW:-8}"
 POSTPROP_REPAIR_MAX_ATTEMPTS="${POSTPROP_REPAIR_MAX_ATTEMPTS:-2}"
@@ -414,22 +419,6 @@ if [[ "$TEMPORAL_KEYFRAME_PIPELINE" == "1" || "$DROP_INVALID_FRAMES" == "1" ]]; 
   RUN_CMD+=(--mllm_invalid_window_size "$MLLM_INVALID_WINDOW_SIZE")
   RUN_CMD+=(--mllm_invalid_window_stride "$MLLM_INVALID_WINDOW_STRIDE")
   RUN_CMD+=(--mllm_invalid_max_json_retries "$MLLM_INVALID_MAX_JSON_RETRIES")
-fi
-if [[ "$POSTPROP_MISSED_CREATURES" == "1" ]]; then
-  RUN_CMD+=(--postprop_missed_creatures)
-  RUN_CMD+=(--postprop_missed_window_size "$POSTPROP_MISSED_WINDOW_SIZE")
-  RUN_CMD+=(--postprop_missed_window_stride "$POSTPROP_MISSED_WINDOW_STRIDE")
-  RUN_CMD+=(--postprop_missed_max_issues_per_window "$POSTPROP_MISSED_MAX_ISSUES_PER_WINDOW")
-  RUN_CMD+=(--postprop_missed_max_rounds "$POSTPROP_MISSED_MAX_ROUNDS")
-  RUN_CMD+=(--postprop_missed_max_attempts_per_issue "$POSTPROP_MISSED_MAX_ATTEMPTS_PER_ISSUE")
-  RUN_CMD+=(--postprop_missed_max_images_per_request "$POSTPROP_MISSED_MAX_IMAGES_PER_REQUEST")
-  RUN_CMD+=(--postprop_missed_max_json_retries "$POSTPROP_MISSED_MAX_JSON_RETRIES")
-  if [[ -n "$POSTPROP_MISSED_PROMPT_PATH" ]]; then
-    RUN_CMD+=(--postprop_missed_prompt_path "$POSTPROP_MISSED_PROMPT_PATH")
-  fi
-  if [[ -n "$POSTPROP_MISSED_VERIFY_PROMPT_PATH" ]]; then
-    RUN_CMD+=(--postprop_missed_verify_prompt_path "$POSTPROP_MISSED_VERIFY_PROMPT_PATH")
-  fi
 fi
 if [[ "$POSTPROP_QA_MLLM" == "1" ]]; then
   RUN_CMD+=(--postprop_qa_mllm)
