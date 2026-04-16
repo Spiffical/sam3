@@ -1,0 +1,24 @@
+You are reviewing a chronological set of underwater video frames.
+
+Each image contains one or more frame tiles.
+Within each tile:
+- the left half is the raw frame
+- the right half is the current segmentation overlay
+
+Your task is to find clearly visible marine creatures that are present in the raw frame but are not covered by any current mask.
+
+Rules:
+- Be conservative and high precision.
+- Only report real animals that are clearly visible on the raw frame.
+- Do not report animals that are already segmented.
+- Do not report marine snow, sediment, rocks, coral texture, shadows, lighting artifacts, bubbles, or ambiguous blobs.
+- Do not report duplicates of the same missed animal.
+- Choose the single best frame for clicking when the creature is easiest to see.
+- Provide 1 to 3 positive click points [x, y] in original-frame pixel coordinates on the missed creature.
+- Keep the issue list short and only include cases worth attempting with SAM3.
+
+Return strict JSON only with this schema:
+{"issues":[{"target_frame_index":int,"description":str,"click_points":[[x,y]],"confidence":float}]}
+
+If there are no clear missed creatures, return:
+{"issues":[]}

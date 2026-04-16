@@ -58,6 +58,16 @@ Runner options:
   --mllm-discovery-window-size <n>     Default: 4
   --mllm-discovery-window-stride <n>   Default: 24
   --mllm-discovery-max-json-retries <n> Default: 2
+  --postprop-missed-creatures          Enable post-prop missed-creature discovery pass
+  --postprop-missed-window-size <n>    Default: 20
+  --postprop-missed-window-stride <n>  Default: 10
+  --postprop-missed-max-issues-per-window <n> Default: 4
+  --postprop-missed-max-rounds <n>     Default: 10
+  --postprop-missed-max-attempts-per-issue <n> Default: 10
+  --postprop-missed-max-images-per-request <n> Default: 20
+  --postprop-missed-max-json-retries <n> Default: 2
+  --postprop-missed-prompt-path <path> Optional discovery system prompt template
+  --postprop-missed-verify-prompt-path <path> Optional verification system prompt template
   --postprop-qa-mllm                   Enable post-propagation MLLM QA pass
   --postprop-qa-window-size <n>        Default: 10
   --postprop-qa-window-stride <n>      Default: 1
@@ -196,6 +206,16 @@ mllm_invalid_max_json_retries="2"
 mllm_discovery_window_size="4"
 mllm_discovery_window_stride="24"
 mllm_discovery_max_json_retries="2"
+postprop_missed_creatures=0
+postprop_missed_window_size="20"
+postprop_missed_window_stride="10"
+postprop_missed_max_issues_per_window="4"
+postprop_missed_max_rounds="10"
+postprop_missed_max_attempts_per_issue="10"
+postprop_missed_max_images_per_request="20"
+postprop_missed_max_json_retries="2"
+postprop_missed_prompt_path=""
+postprop_missed_verify_prompt_path=""
 postprop_qa_mllm=0
 postprop_qa_window_size="10"
 postprop_qa_window_stride="1"
@@ -268,6 +288,16 @@ while [[ $# -gt 0 ]]; do
     --mllm-discovery-window-size) mllm_discovery_window_size="$2"; shift 2 ;;
     --mllm-discovery-window-stride) mllm_discovery_window_stride="$2"; shift 2 ;;
     --mllm-discovery-max-json-retries) mllm_discovery_max_json_retries="$2"; shift 2 ;;
+    --postprop-missed-creatures) postprop_missed_creatures=1; shift ;;
+    --postprop-missed-window-size) postprop_missed_window_size="$2"; shift 2 ;;
+    --postprop-missed-window-stride) postprop_missed_window_stride="$2"; shift 2 ;;
+    --postprop-missed-max-issues-per-window) postprop_missed_max_issues_per_window="$2"; shift 2 ;;
+    --postprop-missed-max-rounds) postprop_missed_max_rounds="$2"; shift 2 ;;
+    --postprop-missed-max-attempts-per-issue) postprop_missed_max_attempts_per_issue="$2"; shift 2 ;;
+    --postprop-missed-max-images-per-request) postprop_missed_max_images_per_request="$2"; shift 2 ;;
+    --postprop-missed-max-json-retries) postprop_missed_max_json_retries="$2"; shift 2 ;;
+    --postprop-missed-prompt-path) postprop_missed_prompt_path="$2"; shift 2 ;;
+    --postprop-missed-verify-prompt-path) postprop_missed_verify_prompt_path="$2"; shift 2 ;;
     --postprop-qa-mllm) postprop_qa_mllm=1; shift ;;
     --postprop-qa-window-size) postprop_qa_window_size="$2"; shift 2 ;;
     --postprop-qa-window-stride) postprop_qa_window_stride="$2"; shift 2 ;;
@@ -552,6 +582,22 @@ run_interactive() {
       runner_cmd+=(--no_postprop_qa_merge_bad_into_invalid)
     fi
   fi
+  if [[ "$postprop_missed_creatures" == "1" ]]; then
+    runner_cmd+=(--postprop_missed_creatures)
+    runner_cmd+=(--postprop_missed_window_size "$postprop_missed_window_size")
+    runner_cmd+=(--postprop_missed_window_stride "$postprop_missed_window_stride")
+    runner_cmd+=(--postprop_missed_max_issues_per_window "$postprop_missed_max_issues_per_window")
+    runner_cmd+=(--postprop_missed_max_rounds "$postprop_missed_max_rounds")
+    runner_cmd+=(--postprop_missed_max_attempts_per_issue "$postprop_missed_max_attempts_per_issue")
+    runner_cmd+=(--postprop_missed_max_images_per_request "$postprop_missed_max_images_per_request")
+    runner_cmd+=(--postprop_missed_max_json_retries "$postprop_missed_max_json_retries")
+    if [[ -n "$postprop_missed_prompt_path" ]]; then
+      runner_cmd+=(--postprop_missed_prompt_path "$postprop_missed_prompt_path")
+    fi
+    if [[ -n "$postprop_missed_verify_prompt_path" ]]; then
+      runner_cmd+=(--postprop_missed_verify_prompt_path "$postprop_missed_verify_prompt_path")
+    fi
+  fi
   if [[ "$postprop_repair" == "1" ]]; then
     runner_cmd+=(--postprop_repair)
     runner_cmd+=(--postprop_repair_window "$postprop_repair_window")
@@ -587,6 +633,7 @@ run_interactive() {
   echo "runner cuda visible: $runner_cuda_visible_devices"
   echo "temporal pipeline: $temporal_keyframe_pipeline"
   echo "invalid frame source: $invalid_frame_source"
+  echo "post-prop missed-creature discovery: $postprop_missed_creatures"
   echo "post-prop QA: $postprop_qa_mllm"
   echo "post-prop repair: $postprop_repair"
   if [[ -n "${SAM3_TOOL_CALL_FALLBACK_POLICY:-}" ]]; then
@@ -689,6 +736,16 @@ run_submit() {
     --set-env "MLLM_DISCOVERY_WINDOW_SIZE=${mllm_discovery_window_size}"
     --set-env "MLLM_DISCOVERY_WINDOW_STRIDE=${mllm_discovery_window_stride}"
     --set-env "MLLM_DISCOVERY_MAX_JSON_RETRIES=${mllm_discovery_max_json_retries}"
+    --set-env "POSTPROP_MISSED_CREATURES=${postprop_missed_creatures}"
+    --set-env "POSTPROP_MISSED_WINDOW_SIZE=${postprop_missed_window_size}"
+    --set-env "POSTPROP_MISSED_WINDOW_STRIDE=${postprop_missed_window_stride}"
+    --set-env "POSTPROP_MISSED_MAX_ISSUES_PER_WINDOW=${postprop_missed_max_issues_per_window}"
+    --set-env "POSTPROP_MISSED_MAX_ROUNDS=${postprop_missed_max_rounds}"
+    --set-env "POSTPROP_MISSED_MAX_ATTEMPTS_PER_ISSUE=${postprop_missed_max_attempts_per_issue}"
+    --set-env "POSTPROP_MISSED_MAX_IMAGES_PER_REQUEST=${postprop_missed_max_images_per_request}"
+    --set-env "POSTPROP_MISSED_MAX_JSON_RETRIES=${postprop_missed_max_json_retries}"
+    --set-env "POSTPROP_MISSED_PROMPT_PATH=${postprop_missed_prompt_path}"
+    --set-env "POSTPROP_MISSED_VERIFY_PROMPT_PATH=${postprop_missed_verify_prompt_path}"
     --set-env "POSTPROP_QA_MLLM=${postprop_qa_mllm}"
     --set-env "POSTPROP_QA_WINDOW_SIZE=${postprop_qa_window_size}"
     --set-env "POSTPROP_QA_WINDOW_STRIDE=${postprop_qa_window_stride}"

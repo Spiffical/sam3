@@ -692,6 +692,9 @@ def write_codex_debug_report(output_dir: str, metrics: dict[str, Any]) -> str:
             "output_video_path": metrics.get("output_video_path", ""),
             "frame_outputs_json_path": metrics.get("frame_outputs_json_path", ""),
             "generated_prompts_path": metrics.get("generated_prompts_path", ""),
+            "postprop_missed_creatures_report_path": metrics.get(
+                "postprop_missed_creatures_report_path", ""
+            ),
             "postprop_qa_report_path": metrics.get("postprop_qa_report_path", ""),
             "postprop_repair_report_path": metrics.get(
                 "postprop_repair_report_path", ""
@@ -707,6 +710,12 @@ def write_codex_debug_report(output_dir: str, metrics: dict[str, Any]) -> str:
         "metrics_excerpt": {
             "hard_invalid_frame_count": metrics.get("hard_invalid_frame_count"),
             "invalid_frame_count": metrics.get("invalid_frame_count"),
+            "postprop_missed_creatures_issue_count": metrics.get(
+                "postprop_missed_creatures_issue_count"
+            ),
+            "postprop_missed_creatures_accepted_issue_count": metrics.get(
+                "postprop_missed_creatures_accepted_issue_count"
+            ),
             "postprop_qa_bad_frame_count": metrics.get("postprop_qa_bad_frame_count"),
             "postprop_repair_issue_count": metrics.get("postprop_repair_issue_count"),
             "postprop_repair_repaired_frame_count": metrics.get(
@@ -1093,6 +1102,86 @@ def parse_args() -> argparse.Namespace:
         help="Retries per discovery window when model output is not valid strict JSON.",
     )
     parser.add_argument(
+        "--postprop_missed_creatures",
+        action="store_true",
+        help=(
+            "Run an MLLM post-propagation discovery sweep for creatures missed by the "
+            "main SAM3 agent loop, using click proposals and iterative refinement."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_missed_window_size",
+        default=20,
+        type=int,
+        help="Number of frames per missed-creature discovery window.",
+    )
+    parser.add_argument(
+        "--postprop_missed_window_stride",
+        default=10,
+        type=int,
+        help="Frame stride between missed-creature discovery windows.",
+    )
+    parser.add_argument(
+        "--postprop_missed_max_issues_per_window",
+        default=4,
+        type=int,
+        help="Maximum missed-creature candidates accepted from one discovery window.",
+    )
+    parser.add_argument(
+        "--postprop_missed_max_rounds",
+        default=10,
+        type=int,
+        help="Maximum full-video missed-creature rediscovery rounds.",
+    )
+    parser.add_argument(
+        "--postprop_missed_max_attempts_per_issue",
+        default=10,
+        type=int,
+        help="Maximum click-refinement attempts for one missed-creature issue.",
+    )
+    parser.add_argument(
+        "--postprop_missed_max_images_per_request",
+        default=20,
+        type=int,
+        help=(
+            "Target number of window images per MLLM request for missed-creature "
+            "discovery. Falls back to collages when the effective image cap is lower."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_missed_max_json_retries",
+        default=2,
+        type=int,
+        help="Retries for missed-creature discovery/verification calls when JSON is invalid.",
+    )
+    parser.add_argument(
+        "--postprop_missed_duplicate_iou_threshold",
+        default=0.80,
+        type=float,
+        help=(
+            "Reject an accepted missed-creature candidate if it nearly duplicates an "
+            "existing target-frame mask above this IoU."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_missed_prompt_path",
+        default="",
+        type=str,
+        help=(
+            "Optional path to the missed-creature discovery system prompt template. "
+            "If unset, uses the profile-specific default."
+        ),
+    )
+    parser.add_argument(
+        "--postprop_missed_verify_prompt_path",
+        default="",
+        type=str,
+        help=(
+            "Optional path to the missed-creature verification/refinement prompt template. "
+            "If unset, uses the profile-specific default."
+        ),
+    )
+    parser.add_argument(
         "--postprop_qa_mllm",
         action="store_true",
         help=(
@@ -1274,6 +1363,9 @@ def run() -> int:
         from frame_quality_mllm import discover_invalid_frames_with_mllm
         from keyframe_discovery import discover_keyframes_from_motion
         from keyframe_discovery_mllm import discover_keyframes_with_mllm
+        from postprop_missed_creatures import (
+            discover_postprop_missed_creatures_with_mllm,
+        )
         from postprop_qa_mllm import discover_postprop_qa_with_mllm
         from postprop_repair import repair_postprop_failures
         from track_id_matching import assign_object_ids_by_iou
@@ -1642,6 +1734,7 @@ def run() -> int:
             ),
         }
         metrics["postprop_qa_config"] = {
+            "missed_creatures_enabled": bool(args.postprop_missed_creatures),
             "enabled": bool(args.postprop_qa_mllm),
             "window_size": int(args.postprop_qa_window_size),
             "window_stride": int(args.postprop_qa_window_stride),
@@ -1657,6 +1750,21 @@ def run() -> int:
                 args.postprop_qa_include_frames_without_outputs
             ),
             "merge_bad_into_invalid": bool(args.postprop_qa_merge_bad_into_invalid),
+        }
+        metrics["postprop_missed_creatures_config"] = {
+            "enabled": bool(args.postprop_missed_creatures),
+            "window_size": int(args.postprop_missed_window_size),
+            "window_stride": int(args.postprop_missed_window_stride),
+            "max_issues_per_window": int(args.postprop_missed_max_issues_per_window),
+            "max_rounds": int(args.postprop_missed_max_rounds),
+            "max_attempts_per_issue": int(args.postprop_missed_max_attempts_per_issue),
+            "max_images_per_request": int(args.postprop_missed_max_images_per_request),
+            "max_json_retries": int(args.postprop_missed_max_json_retries),
+            "duplicate_iou_threshold": float(
+                args.postprop_missed_duplicate_iou_threshold
+            ),
+            "prompt_path": args.postprop_missed_prompt_path,
+            "verify_prompt_path": args.postprop_missed_verify_prompt_path,
         }
         metrics["postprop_repair_config"] = {
             "enabled": bool(args.postprop_repair),
@@ -1886,6 +1994,10 @@ def run() -> int:
         else:
             if len(results_by_frame) == 0:
                 metrics["status"] = "success_no_propagation"
+                if args.postprop_missed_creatures:
+                    metrics["postprop_missed_creatures_skipped_reason"] = (
+                        "no_propagation_outputs"
+                    )
                 if args.postprop_qa_mllm:
                     metrics["postprop_qa_skipped_reason"] = "no_propagation_outputs"
                 if args.postprop_repair:
@@ -1898,6 +2010,57 @@ def run() -> int:
 
             repair_report: dict[str, Any] | None = None
             postprop_bad: list[int] = []
+            if args.postprop_missed_creatures:
+                missed_output_dir = os.path.join(
+                    args.output_dir, "postprop_missed_creatures"
+                )
+                missed_report = discover_postprop_missed_creatures_with_mllm(
+                    video_path=args.video_path,
+                    backend=backend,
+                    send_generate_request_fn=send_req_postprop_qa,
+                    initial_text_prompt=args.prompt,
+                    prompt_profile=args.prompt_profile,
+                    results_by_frame=results_by_frame,
+                    total_frames=total_frames,
+                    hard_invalid_frame_indices=hard_invalid_frame_indices,
+                    next_obj_id=next_obj_id,
+                    frame_size_hw=(frame_h, frame_w),
+                    output_dir=missed_output_dir,
+                    image_size=args.image_size,
+                    working_session_id=session_id,
+                    window_size=args.postprop_missed_window_size,
+                    window_stride=args.postprop_missed_window_stride,
+                    max_issues_per_window=args.postprop_missed_max_issues_per_window,
+                    max_rounds=args.postprop_missed_max_rounds,
+                    max_attempts_per_issue=args.postprop_missed_max_attempts_per_issue,
+                    max_images_per_request=args.postprop_missed_max_images_per_request,
+                    detection_prompt_template_path=(
+                        args.postprop_missed_prompt_path.strip() or None
+                    ),
+                    verify_prompt_template_path=(
+                        args.postprop_missed_verify_prompt_path.strip() or None
+                    ),
+                    max_json_retries=args.postprop_missed_max_json_retries,
+                    duplicate_iou_threshold=args.postprop_missed_duplicate_iou_threshold,
+                )
+                next_obj_id = int(missed_report.get("next_obj_id", next_obj_id))
+                generated_prompts.extend(missed_report.get("accepted_prompts", []))
+                metrics["num_generated_prompts"] = len(generated_prompts)
+                metrics["postprop_missed_creatures_report_path"] = os.path.join(
+                    missed_output_dir, "postprop_missed_creatures_report.json"
+                )
+                metrics["postprop_missed_creatures_issue_count"] = int(
+                    len(missed_report.get("issues", []))
+                )
+                metrics["postprop_missed_creatures_accepted_issue_count"] = int(
+                    missed_report.get("accepted_issue_count", 0)
+                )
+                metrics["postprop_missed_creatures_unresolved_issue_count"] = int(
+                    missed_report.get("unresolved_issue_count", 0)
+                )
+            else:
+                metrics["postprop_missed_creatures_skipped_reason"] = "disabled"
+
             if args.postprop_qa_mllm:
                 postprop_report = discover_postprop_qa_with_mllm(
                     video_path=args.video_path,

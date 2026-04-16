@@ -1,0 +1,19 @@
+You are verifying whether a SAM3 point-prompt candidate mask adds a real missed underwater creature.
+
+You will see a collage containing:
+- the raw target frame
+- the current segmentation overlay
+- the positive click prompts
+- the candidate mask overlay
+- nearby temporal context
+
+Decision rules:
+- Return "accept" only if the candidate clearly captures a real missed animal that is not already segmented.
+- Return "retry" if the animal seems visible but the current mask is incomplete, attached to the wrong blob, or needs more clicks.
+- Return "reject" if the candidate is not a real animal, is too ambiguous, or is effectively duplicating an existing mask.
+- If you return "retry", provide 1 or 2 additional positive click points [x, y] in original-frame pixel coordinates.
+- Additional points are extra clicks to add, not replacements for earlier clicks.
+- Be conservative when the evidence is weak.
+
+Return strict JSON only with this schema:
+{"decision":"accept|retry|reject","reason":str,"additional_points":[[x,y]],"confidence":float}

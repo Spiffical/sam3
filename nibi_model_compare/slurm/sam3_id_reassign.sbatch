@@ -178,6 +178,8 @@ PROMPT_PROFILE="${PROMPT_PROFILE:-underwater}"
 PROMPT_PATH="${PROMPT_PATH:-}"
 MISSING_MASK_PROMPT_PATH="${MISSING_MASK_PROMPT_PATH:-}"
 VERIFY_GAP_FILL_PROMPT_PATH="${VERIFY_GAP_FILL_PROMPT_PATH:-}"
+MISSED_CREATURES_PROMPT_PATH="${MISSED_CREATURES_PROMPT_PATH:-}"
+VERIFY_MISSED_CREATURES_PROMPT_PATH="${VERIFY_MISSED_CREATURES_PROMPT_PATH:-}"
 OUTLIER_MASK_PROMPT_PATH="${OUTLIER_MASK_PROMPT_PATH:-}"
 OUTPUT_SUBDIR="${OUTPUT_SUBDIR:-consistent_ids_mllm}"
 OUTPUT_VIDEO_NAME="${OUTPUT_VIDEO_NAME:-overlay_consistent_ids.mp4}"
@@ -187,6 +189,15 @@ WINDOW_SIZE="${WINDOW_SIZE:-10}"
 WINDOW_STRIDE="${WINDOW_STRIDE:-8}"
 ASSIGNMENT_HISTORY_FRAMES="${ASSIGNMENT_HISTORY_FRAMES:-8}"
 ASSIGNMENT_HEURISTIC_MIN_SCORE="${ASSIGNMENT_HEURISTIC_MIN_SCORE:-0.85}"
+STAGES_CSV="${STAGES_CSV:-}"
+FIND_MISSED_CREATURES="${FIND_MISSED_CREATURES:-0}"
+MISSED_CREATURES_WINDOW_SIZE="${MISSED_CREATURES_WINDOW_SIZE:-20}"
+MISSED_CREATURES_WINDOW_STRIDE="${MISSED_CREATURES_WINDOW_STRIDE:-10}"
+MAX_MISSED_CREATURE_ISSUES_PER_WINDOW="${MAX_MISSED_CREATURE_ISSUES_PER_WINDOW:-4}"
+MISSED_CREATURES_MAX_ROUNDS="${MISSED_CREATURES_MAX_ROUNDS:-10}"
+MISSED_CREATURES_MAX_ATTEMPTS="${MISSED_CREATURES_MAX_ATTEMPTS:-10}"
+MISSED_CREATURES_MAX_IMAGES_PER_REQUEST="${MISSED_CREATURES_MAX_IMAGES_PER_REQUEST:-20}"
+MISSED_CREATURES_DUPLICATE_IOU_THRESHOLD="${MISSED_CREATURES_DUPLICATE_IOU_THRESHOLD:-0.80}"
 MAX_GAP_ISSUES_PER_WINDOW="${MAX_GAP_ISSUES_PER_WINDOW:-8}"
 GAP_FILL_MAX_ATTEMPTS="${GAP_FILL_MAX_ATTEMPTS:-4}"
 GAP_FILL_POINT_CANDIDATES="${GAP_FILL_POINT_CANDIDATES:-6}"
@@ -318,7 +329,7 @@ PY
 )
 
 RUN_CMD=(
-  python3 scripts/reassign_frame_ids_mllm.py
+  python3 scripts/postprocess_framewise_mllm.py
 )
 for input_dir in "${INPUT_DIRS[@]}"; do
   RUN_CMD+=("$input_dir")
@@ -335,6 +346,13 @@ RUN_CMD+=(
   --window-stride "$WINDOW_STRIDE"
   --assignment-history-frames "$ASSIGNMENT_HISTORY_FRAMES"
   --assignment-heuristic-min-score "$ASSIGNMENT_HEURISTIC_MIN_SCORE"
+  --missed-creatures-window-size "$MISSED_CREATURES_WINDOW_SIZE"
+  --missed-creatures-window-stride "$MISSED_CREATURES_WINDOW_STRIDE"
+  --max-missed-creature-issues-per-window "$MAX_MISSED_CREATURE_ISSUES_PER_WINDOW"
+  --missed-creatures-max-rounds "$MISSED_CREATURES_MAX_ROUNDS"
+  --missed-creatures-max-attempts "$MISSED_CREATURES_MAX_ATTEMPTS"
+  --missed-creatures-max-images-per-request "$MISSED_CREATURES_MAX_IMAGES_PER_REQUEST"
+  --missed-creatures-duplicate-iou-threshold "$MISSED_CREATURES_DUPLICATE_IOU_THRESHOLD"
   --max-gap-issues-per-window "$MAX_GAP_ISSUES_PER_WINDOW"
   --gap-fill-max-attempts "$GAP_FILL_MAX_ATTEMPTS"
   --gap-fill-point-candidates "$GAP_FILL_POINT_CANDIDATES"
@@ -357,11 +375,28 @@ fi
 if [[ -n "$VERIFY_GAP_FILL_PROMPT_PATH" ]]; then
   RUN_CMD+=(--verify-gap-fill-prompt-path "$VERIFY_GAP_FILL_PROMPT_PATH")
 fi
+if [[ -n "$MISSED_CREATURES_PROMPT_PATH" ]]; then
+  RUN_CMD+=(--missed-creatures-prompt-path "$MISSED_CREATURES_PROMPT_PATH")
+fi
+if [[ -n "$VERIFY_MISSED_CREATURES_PROMPT_PATH" ]]; then
+  RUN_CMD+=(--verify-missed-creatures-prompt-path "$VERIFY_MISSED_CREATURES_PROMPT_PATH")
+fi
 if [[ -n "$OUTLIER_MASK_PROMPT_PATH" ]]; then
   RUN_CMD+=(--outlier-mask-prompt-path "$OUTLIER_MASK_PROMPT_PATH")
 fi
+if [[ -n "$STAGES_CSV" ]]; then
+  OLD_IFS="$IFS"
+  IFS=',' read -r -a STAGE_ITEMS <<< "$STAGES_CSV"
+  IFS="$OLD_IFS"
+  for stage_name in "${STAGE_ITEMS[@]}"; do
+    [[ -n "$stage_name" ]] && RUN_CMD+=(--stage "$stage_name")
+  done
+fi
 if [[ "$SAM3_OFFLOAD_VIDEO_TO_CPU" == "1" ]]; then
   RUN_CMD+=(--sam3-offload-video-to-cpu)
+fi
+if [[ "$FIND_MISSED_CREATURES" == "1" ]]; then
+  RUN_CMD+=(--find-missed-creatures)
 fi
 if [[ "$FILL_MISSING_MASKS" != "1" ]]; then
   RUN_CMD+=(--no-fill-missing-masks)
@@ -379,7 +414,7 @@ if [[ "$CONTINUE_ON_ERROR" == "1" ]]; then
   RUN_CMD+=(--continue-on-error)
 fi
 
-echo "=== Running ID reassignment job ==="
+echo "=== Running framewise post-process job ==="
 CUDA_VISIBLE_DEVICES="$RUNNER_CUDA_VISIBLE_DEVICES" "${RUN_CMD[@]}"
 
-echo "Finished ID reassignment for ${#INPUT_DIRS[@]} input run(s)."
+echo "Finished framewise post-process for ${#INPUT_DIRS[@]} input run(s)."

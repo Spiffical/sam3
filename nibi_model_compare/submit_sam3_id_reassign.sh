@@ -7,7 +7,7 @@ SBATCH_TEMPLATE="${REPO_ROOT}/nibi_model_compare/slurm/sam3_id_reassign.sbatch"
 
 usage() {
   cat <<'EOF'
-Submit a Slurm job that runs an MLLM post-process to make framewise SAM3 IDs temporally consistent.
+Submit a Slurm job that runs an MLLM post-process over framewise SAM3 outputs.
 
 Usage:
   nibi_model_compare/submit_sam3_id_reassign.sh [options] --input-dir /path/to/run [--input-dir /path/to/run2 ...]
@@ -23,6 +23,8 @@ Common options:
   --prompt-path <path>                Optional override system prompt for reassignment
   --missing-mask-prompt-path <path>   Optional override system prompt for missing-mask detection
   --verify-gap-fill-prompt-path <path> Optional override system prompt for gap-fill verification
+  --missed-creatures-prompt-path <path> Optional override system prompt for missed-creature discovery
+  --verify-missed-creatures-prompt-path <path> Optional override system prompt for missed-creature verification
   --outlier-mask-prompt-path <path>   Optional override system prompt for outlier-mask review
   --output-subdir <name>              Default: consistent_ids_mllm
   --output-video-name <name>          Default: overlay_consistent_ids.mp4
@@ -40,19 +42,28 @@ LLM/vLLM options:
   --max-model-len <n>                 Default: 16384
   --max-num-seqs <n>                  Default: 1
   --gpu-memory-utilization <f>        Default: 0.90
-  --limit-mm-per-prompt <json>        Default: {"image":3,"video":0}
+  --limit-mm-per-prompt <json>        Default: {"image":3,"video":0}; auto-raised to fit enabled stage requests
   --vllm-runtime <auto|venv|apptainer> Default: auto
   --apptainer-image <path>            Optional SIF path
   --vllm-cuda-visible-devices <ids>   Default: 0
   --runner-cuda-visible-devices <ids> Default: 1
 
-Reassignment options:
+Post-process options:
+  --stage <name>                      Ordered stage; repeat as needed. Choices: missed_creatures, gap_fill, outlier_filter, id_reassign
   --max-completion-tokens <n>         Default: 1024
   --max-json-retries <n>              Default: 2
   --window-size <n>                   Default: 10
   --window-stride <n>                 Default: 8
   --assignment-history-frames <n>     Default: 8
   --assignment-heuristic-min-score <f> Default: 0.85
+  --find-missed-creatures             Enable the missed-creature discovery stage
+  --missed-creatures-window-size <n>  Default: 20
+  --missed-creatures-window-stride <n> Default: 10
+  --max-missed-creature-issues-per-window <n> Default: 4
+  --missed-creatures-max-rounds <n>   Default: 10
+  --missed-creatures-max-attempts <n> Default: 10
+  --missed-creatures-max-images-per-request <n> Default: 20
+  --missed-creatures-duplicate-iou-threshold <f> Default: 0.80
   --max-gap-issues-per-window <n>     Default: 8
   --gap-fill-max-attempts <n>         Default: 4
   --gap-fill-point-candidates <n>     Default: 6
@@ -90,6 +101,8 @@ prompt_profile="underwater"
 prompt_path=""
 missing_mask_prompt_path=""
 verify_gap_fill_prompt_path=""
+missed_creatures_prompt_path=""
+verify_missed_creatures_prompt_path=""
 outlier_mask_prompt_path=""
 output_subdir="consistent_ids_mllm"
 output_video_name="overlay_consistent_ids.mp4"
@@ -117,6 +130,13 @@ window_size="10"
 window_stride="8"
 assignment_history_frames="8"
 assignment_heuristic_min_score="0.85"
+missed_creatures_window_size="20"
+missed_creatures_window_stride="10"
+max_missed_creature_issues_per_window="4"
+missed_creatures_max_rounds="10"
+missed_creatures_max_attempts="10"
+missed_creatures_max_images_per_request="20"
+missed_creatures_duplicate_iou_threshold="0.80"
 max_gap_issues_per_window="8"
 gap_fill_max_attempts="4"
 gap_fill_point_candidates="6"
@@ -130,6 +150,7 @@ collage_tile_max_edge="320"
 sam3_gpu_ids="0"
 sam3_image_size="1008"
 sam3_offload_video_to_cpu=0
+find_missed_creatures=0
 fill_missing_masks=1
 filter_outlier_masks=1
 render_video=1
@@ -144,6 +165,7 @@ output_path=""
 error_path=""
 
 declare -a input_dirs=()
+declare -a stages=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -155,6 +177,8 @@ while [[ $# -gt 0 ]]; do
     --prompt-path) prompt_path="$2"; shift 2 ;;
     --missing-mask-prompt-path) missing_mask_prompt_path="$2"; shift 2 ;;
     --verify-gap-fill-prompt-path) verify_gap_fill_prompt_path="$2"; shift 2 ;;
+    --missed-creatures-prompt-path) missed_creatures_prompt_path="$2"; shift 2 ;;
+    --verify-missed-creatures-prompt-path) verify_missed_creatures_prompt_path="$2"; shift 2 ;;
     --outlier-mask-prompt-path) outlier_mask_prompt_path="$2"; shift 2 ;;
     --output-subdir) output_subdir="$2"; shift 2 ;;
     --output-video-name) output_video_name="$2"; shift 2 ;;
@@ -176,12 +200,22 @@ while [[ $# -gt 0 ]]; do
     --vllm-cuda-visible-devices) vllm_cuda_visible_devices="$2"; shift 2 ;;
     --runner-cuda-visible-devices) runner_cuda_visible_devices="$2"; shift 2 ;;
 
+    --stage) stages+=("$2"); shift 2 ;;
     --max-completion-tokens) max_completion_tokens="$2"; shift 2 ;;
     --max-json-retries) max_json_retries="$2"; shift 2 ;;
     --window-size) window_size="$2"; shift 2 ;;
     --window-stride) window_stride="$2"; shift 2 ;;
     --assignment-history-frames) assignment_history_frames="$2"; shift 2 ;;
     --assignment-heuristic-min-score) assignment_heuristic_min_score="$2"; shift 2 ;;
+    --find-missed-creatures) find_missed_creatures=1; shift ;;
+    --no-find-missed-creatures) find_missed_creatures=0; shift ;;
+    --missed-creatures-window-size) missed_creatures_window_size="$2"; shift 2 ;;
+    --missed-creatures-window-stride) missed_creatures_window_stride="$2"; shift 2 ;;
+    --max-missed-creature-issues-per-window) max_missed_creature_issues_per_window="$2"; shift 2 ;;
+    --missed-creatures-max-rounds) missed_creatures_max_rounds="$2"; shift 2 ;;
+    --missed-creatures-max-attempts) missed_creatures_max_attempts="$2"; shift 2 ;;
+    --missed-creatures-max-images-per-request) missed_creatures_max_images_per_request="$2"; shift 2 ;;
+    --missed-creatures-duplicate-iou-threshold) missed_creatures_duplicate_iou_threshold="$2"; shift 2 ;;
     --max-gap-issues-per-window) max_gap_issues_per_window="$2"; shift 2 ;;
     --gap-fill-max-attempts) gap_fill_max_attempts="$2"; shift 2 ;;
     --gap-fill-point-candidates) gap_fill_point_candidates="$2"; shift 2 ;;
@@ -270,15 +304,45 @@ PY
   exit 1
 fi
 
-if ! limit_mm_per_prompt="$(python3 - "$limit_mm_per_prompt" <<'PY'
+if ! limit_mm_per_prompt="$(python3 - \
+  "$limit_mm_per_prompt" \
+  "$max_images_per_request" \
+  "$missed_creatures_max_images_per_request" \
+  "$fill_missing_masks" \
+  "$find_missed_creatures" <<'PY'
 import json
 import sys
 
 value = sys.argv[1]
+max_images_per_request = int(sys.argv[2])
+missed_creatures_max_images_per_request = int(sys.argv[3])
+fill_missing_masks = sys.argv[4] == "1"
+find_missed_creatures = sys.argv[5] == "1"
 try:
     parsed = json.loads(value)
 except Exception as exc:
     raise SystemExit(f"Invalid --limit-mm-per-prompt JSON: {value}\n{exc}")
+
+if not isinstance(parsed, dict):
+    raise SystemExit(
+        f"Invalid --limit-mm-per-prompt JSON: expected object, got {type(parsed).__name__}"
+    )
+
+requested_image_budget = max(1, max_images_per_request)
+if fill_missing_masks:
+    requested_image_budget = max(requested_image_budget, 3)
+if find_missed_creatures:
+    requested_image_budget = max(
+        requested_image_budget, missed_creatures_max_images_per_request
+    )
+
+current_image_limit = parsed.get("image", 0)
+try:
+    current_image_limit = int(current_image_limit)
+except Exception:
+    current_image_limit = 0
+parsed["image"] = max(current_image_limit, requested_image_budget)
+
 print(json.dumps(parsed, separators=(",", ":")))
 PY
 )"; then
@@ -293,6 +357,11 @@ print(base64.b64encode(sys.argv[1].encode("utf-8")).decode("ascii"))
 PY
 )"; then
   exit 1
+fi
+
+stages_csv=""
+if [[ ${#stages[@]} -gt 0 ]]; then
+  stages_csv="$(IFS=,; echo "${stages[*]}")"
 fi
 
 if [[ ! -f "$SBATCH_TEMPLATE" ]]; then
@@ -335,6 +404,8 @@ env_vars=(
   "PROMPT_PATH=$prompt_path"
   "MISSING_MASK_PROMPT_PATH=$missing_mask_prompt_path"
   "VERIFY_GAP_FILL_PROMPT_PATH=$verify_gap_fill_prompt_path"
+  "MISSED_CREATURES_PROMPT_PATH=$missed_creatures_prompt_path"
+  "VERIFY_MISSED_CREATURES_PROMPT_PATH=$verify_missed_creatures_prompt_path"
   "OUTLIER_MASK_PROMPT_PATH=$outlier_mask_prompt_path"
   "OUTPUT_SUBDIR=$output_subdir"
   "OUTPUT_VIDEO_NAME=$output_video_name"
@@ -357,6 +428,15 @@ env_vars=(
   "WINDOW_STRIDE=$window_stride"
   "ASSIGNMENT_HISTORY_FRAMES=$assignment_history_frames"
   "ASSIGNMENT_HEURISTIC_MIN_SCORE=$assignment_heuristic_min_score"
+  "STAGES_CSV=$stages_csv"
+  "FIND_MISSED_CREATURES=$find_missed_creatures"
+  "MISSED_CREATURES_WINDOW_SIZE=$missed_creatures_window_size"
+  "MISSED_CREATURES_WINDOW_STRIDE=$missed_creatures_window_stride"
+  "MAX_MISSED_CREATURE_ISSUES_PER_WINDOW=$max_missed_creature_issues_per_window"
+  "MISSED_CREATURES_MAX_ROUNDS=$missed_creatures_max_rounds"
+  "MISSED_CREATURES_MAX_ATTEMPTS=$missed_creatures_max_attempts"
+  "MISSED_CREATURES_MAX_IMAGES_PER_REQUEST=$missed_creatures_max_images_per_request"
+  "MISSED_CREATURES_DUPLICATE_IOU_THRESHOLD=$missed_creatures_duplicate_iou_threshold"
   "MAX_GAP_ISSUES_PER_WINDOW=$max_gap_issues_per_window"
   "GAP_FILL_MAX_ATTEMPTS=$gap_fill_max_attempts"
   "GAP_FILL_POINT_CANDIDATES=$gap_fill_point_candidates"

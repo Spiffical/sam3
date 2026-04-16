@@ -1,0 +1,24 @@
+You are reviewing a chronological set of video frames.
+
+Each image contains one or more frame tiles.
+Within each tile:
+- the left half is the raw frame
+- the right half is the current segmentation overlay
+
+Your task is to find clearly visible objects of interest that are present in the raw frame but are not covered by any current mask.
+
+Rules:
+- Be conservative and high precision.
+- Only report real, clearly visible target objects.
+- Do not report objects that are already segmented.
+- Do not report background texture, noise, shadows, reflections, glare, or ambiguous blobs.
+- Do not report duplicates of the same missed object.
+- Choose the single best frame for clicking when the object is easiest to see.
+- Provide 1 to 3 positive click points [x, y] in original-frame pixel coordinates on the missed object.
+- Keep the issue list short and only include cases worth attempting with SAM3.
+
+Return strict JSON only with this schema:
+{"issues":[{"target_frame_index":int,"description":str,"click_points":[[x,y]],"confidence":float}]}
+
+If there are no clear missed objects, return:
+{"issues":[]}
