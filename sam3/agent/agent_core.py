@@ -12,6 +12,7 @@ from PIL import Image
 
 from .client_llm import send_generate_request
 from .client_sam3 import call_sam_service
+from .helpers.mask_overlap_removal import remove_overlapping_masks
 from .viz import visualize
 
 
@@ -114,6 +115,7 @@ def count_images(messages):
 _ALLOWED_TOOL_NAMES = frozenset(
     {
         "segment_phrase",
+        "drop_masks",
         "examine_each_mask",
         "select_masks_and_return",
         "report_no_mask",
@@ -209,7 +211,7 @@ def _build_tool_format_repair_message(path_to_latest_output_json, initial_text_p
         valid_names = '["segment_phrase", "report_no_mask"]'
     else:
         valid_names = (
-            '["segment_phrase", "examine_each_mask", '
+            '["segment_phrase", "drop_masks", "examine_each_mask", '
             '"select_masks_and_return", "report_no_mask"]'
         )
     return (
@@ -375,6 +377,77 @@ def _compact_assistant_text_for_history(generated_text, max_chars=400):
     return compact[:max_chars] + "\n...[truncated to reduce context size]..."
 
 
+def _build_state_snapshot_paths(output_dir, img_path, tag):
+    image_dir = os.path.join(output_dir, img_path.replace("/", "-"))
+    os.makedirs(image_dir, exist_ok=True)
+    safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", str(tag)).strip("._-") or "state"
+    json_path = os.path.join(image_dir, f"{safe_tag}.json")
+    image_path = os.path.join(image_dir, f"{safe_tag}.png")
+    return json_path, image_path
+
+
+def _persist_available_outputs(outputs, output_json_path):
+    persisted = {
+        "original_image_path": outputs["original_image_path"],
+        "orig_img_h": outputs["orig_img_h"],
+        "orig_img_w": outputs["orig_img_w"],
+        "pred_boxes": list(outputs.get("pred_boxes", [])),
+        "pred_scores": list(outputs.get("pred_scores", [])),
+        "pred_masks": list(outputs.get("pred_masks", [])),
+    }
+    output_image_path = output_json_path.rsplit(".", 1)[0] + ".png"
+    persisted["output_image_path"] = output_image_path
+    rendered = visualize(persisted)
+    rendered.save(output_image_path)
+    with open(output_json_path, "w", encoding="utf-8") as f:
+        json.dump(persisted, f, indent=4)
+    return persisted
+
+
+def _merge_available_outputs(existing_outputs, new_outputs):
+    if not existing_outputs or len(existing_outputs.get("pred_masks", [])) == 0:
+        merged = {
+            "original_image_path": new_outputs["original_image_path"],
+            "orig_img_h": new_outputs["orig_img_h"],
+            "orig_img_w": new_outputs["orig_img_w"],
+            "pred_boxes": list(new_outputs.get("pred_boxes", [])),
+            "pred_scores": list(new_outputs.get("pred_scores", [])),
+            "pred_masks": list(new_outputs.get("pred_masks", [])),
+        }
+        return remove_overlapping_masks(merged)
+
+    if len(new_outputs.get("pred_masks", [])) == 0:
+        return {
+            "original_image_path": existing_outputs["original_image_path"],
+            "orig_img_h": existing_outputs["orig_img_h"],
+            "orig_img_w": existing_outputs["orig_img_w"],
+            "pred_boxes": list(existing_outputs.get("pred_boxes", [])),
+            "pred_scores": list(existing_outputs.get("pred_scores", [])),
+            "pred_masks": list(existing_outputs.get("pred_masks", [])),
+        }
+
+    merged = {
+        "original_image_path": existing_outputs["original_image_path"],
+        "orig_img_h": existing_outputs["orig_img_h"],
+        "orig_img_w": existing_outputs["orig_img_w"],
+        "pred_boxes": list(existing_outputs.get("pred_boxes", []))
+        + list(new_outputs.get("pred_boxes", [])),
+        "pred_scores": list(existing_outputs.get("pred_scores", []))
+        + list(new_outputs.get("pred_scores", [])),
+        "pred_masks": list(existing_outputs.get("pred_masks", []))
+        + list(new_outputs.get("pred_masks", [])),
+    }
+    merged = remove_overlapping_masks(merged)
+    return {
+        "original_image_path": merged["original_image_path"],
+        "orig_img_h": merged["orig_img_h"],
+        "orig_img_w": merged["orig_img_w"],
+        "pred_boxes": list(merged.get("pred_boxes", [])),
+        "pred_scores": list(merged.get("pred_scores", [])),
+        "pred_masks": list(merged.get("pred_masks", [])),
+    }
+
+
 def _request_mask_verdict_with_retry(send_generate_request_fn, iterative_messages, max_retries=2):
     """
     Request a mask verdict and retry with strict formatting instructions if missing.
@@ -472,7 +545,7 @@ def _prune_messages_for_next_round(
         else list(used_text_prompts)
     )
     if part2 and len(previously_used) > 0:
-        warning_text = f'Note that we have previously called the segment_phrase tool with each "text_prompt" in this list: {list(previously_used)}, but none of the generated results were satisfactory. So make sure that you do not use any of these phrases as the "text_prompt" to call the segment_phrase tool again.'
+        warning_text = f'Note that we have previously called the segment_phrase tool with each "text_prompt" in this list: {list(previously_used)}. Do not use any of these phrases again as the "text_prompt" for segment_phrase.'
         # Replace the second message entirely to keep exactly 2 content items
         part1[1] = {
             "role": "user",
@@ -674,14 +747,28 @@ def agent_inference(
                 # Add the text_prompt to the set of used prompts
                 USED_TEXT_PROMPTS.add(current_text_prompt)
                 LATEST_SAM3_TEXT_PROMPT = current_text_prompt
-                PATH_TO_LATEST_OUTPUT_JSON = call_sam_service(
+                latest_phrase_output_json = call_sam_service(
                     image_path=img_path,
                     text_prompt=current_text_prompt,
                     output_folder_path=sam_output_dir,
                 )
-                sam3_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
-                sam3_output_image_path = sam3_outputs["output_image_path"]
-                num_masks = len(sam3_outputs["pred_boxes"])
+                sam3_outputs = json.load(open(latest_phrase_output_json, "r"))
+                num_new_masks = len(sam3_outputs["pred_boxes"])
+                existing_outputs = (
+                    json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
+                    if PATH_TO_LATEST_OUTPUT_JSON
+                    else None
+                )
+                merged_outputs = _merge_available_outputs(existing_outputs, sam3_outputs)
+                total_masks = len(merged_outputs["pred_boxes"])
+                state_json_path, _ = _build_state_snapshot_paths(
+                    sam_output_dir,
+                    img_path,
+                    f"available_masks_round_{generation_count + 1}",
+                )
+                merged_outputs = _persist_available_outputs(merged_outputs, state_json_path)
+                PATH_TO_LATEST_OUTPUT_JSON = state_json_path
+                sam3_output_image_path = merged_outputs["output_image_path"]
 
                 messages.append(
                     {
@@ -689,9 +776,9 @@ def agent_inference(
                         "content": [{"type": "text", "text": generated_text}],
                     }
                 )
-                if num_masks == 0:
+                if num_new_masks == 0 and total_masks == 0:
                     print("❌ No masks generated by SAM3, reporting no mask to Qwen.")
-                    sam3_output_text_message = f"The segment_phrase tool did not generate any masks for the text_prompt '{current_text_prompt}'. Now, please call the segment_phrase tool again with a different, perhaps more general, or more creative simple noun phrase text_prompt, while adhering to all the rules stated in the system prompt. Please be reminded that the original user query was '{initial_text_prompt}'."
+                    sam3_output_text_message = f"The segment_phrase tool did not generate any masks for the text_prompt '{current_text_prompt}', and there are still no available masks in memory. Now, please call the segment_phrase tool again with a different, perhaps more general, or more creative simple noun phrase text_prompt, while adhering to all the rules stated in the system prompt. Please be reminded that the original user query was '{initial_text_prompt}'."
                     messages.append(
                         {
                             "role": "user",
@@ -700,8 +787,19 @@ def agent_inference(
                             ],
                         }
                     )
+                elif num_new_masks == 0:
+                    sam3_output_text_message = f"The segment_phrase tool did not generate any new masks for the text_prompt '{current_text_prompt}'. However, your current memory still contains {total_masks} available mask(s) accumulated from previous turns. All {total_masks} currently available mask(s) are rendered in the image below. You may keep them, delete some of them, or continue searching with another segment_phrase call. Please be reminded that the original user query was '{initial_text_prompt}'."
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": sam3_output_text_message},
+                                {"type": "image", "image": sam3_output_image_path},
+                            ],
+                        }
+                    )
                 else:
-                    sam3_output_text_message = rf"The segment_phrase tool generated {num_masks} available masks. All {num_masks} available masks are rendered in this image below, now you must analyze the {num_masks} available mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action. Please be reminded that the original user query was '{initial_text_prompt}'."
+                    sam3_output_text_message = rf"The segment_phrase tool generated {num_new_masks} new mask(s) for the text_prompt '{current_text_prompt}'. Your current memory now contains {total_masks} available mask(s) accumulated across turns. All {total_masks} currently available mask(s) are rendered in this image below. Now you must analyze the available mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action. You may keep accumulating more masks with segment_phrase, delete incorrect masks with drop_masks, inspect masks with examine_each_mask, or finish with select_masks_and_return. Please be reminded that the original user query was '{initial_text_prompt}'."
                     messages.append(
                         {
                             "role": "user",
@@ -712,6 +810,79 @@ def agent_inference(
                         }
                     )
                 print("\n\n>>> sam3_output_text_message:\n", sam3_output_text_message)
+
+        elif tool_call["name"] == "drop_masks":
+            print("🔍 Calling drop_masks tool...")
+            assert PATH_TO_LATEST_OUTPUT_JSON != ""
+            assert list(tool_call["parameters"].keys()) == ["mask_indices_to_drop"]
+            assert messages[-1]["content"][1]["type"] == "image", (
+                "Second content element should be an image"
+            )
+            messages.pop()
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "There are currently available masks in memory. You are deleting some of them and then must re-evaluate the remaining masks.",
+                        }
+                    ],
+                }
+            )
+            current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
+            requested_drops = tool_call["parameters"]["mask_indices_to_drop"]
+            available_masks = set(range(1, len(current_outputs["pred_masks"]) + 1))
+            masks_to_drop = sorted({i for i in requested_drops if i in available_masks})
+            masks_to_keep = sorted(i for i in available_masks if i not in set(masks_to_drop))
+
+            updated_outputs = {
+                "original_image_path": current_outputs["original_image_path"],
+                "orig_img_h": current_outputs["orig_img_h"],
+                "orig_img_w": current_outputs["orig_img_w"],
+                "pred_boxes": [current_outputs["pred_boxes"][i - 1] for i in masks_to_keep],
+                "pred_scores": [current_outputs["pred_scores"][i - 1] for i in masks_to_keep],
+                "pred_masks": [current_outputs["pred_masks"][i - 1] for i in masks_to_keep],
+            }
+            state_json_path, _ = _build_state_snapshot_paths(
+                sam_output_dir,
+                img_path,
+                f"available_masks_after_drop_round_{generation_count + 1}",
+            )
+            updated_outputs = _persist_available_outputs(updated_outputs, state_json_path)
+            PATH_TO_LATEST_OUTPUT_JSON = state_json_path
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": generated_text}],
+                }
+            )
+            if len(masks_to_keep) == 0:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"The original user query was: '{initial_text_prompt}'. The drop_masks tool removed all currently available masks from memory. There are now 0 available masks. If you still believe target objects exist, call segment_phrase again with a new text_prompt. Otherwise, you may call report_no_mask.",
+                            }
+                        ],
+                    }
+                )
+            else:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"The original user query was: '{initial_text_prompt}'. The drop_masks tool removed mask(s) {masks_to_drop}. There are now {len(masks_to_keep)} available mask(s) left in memory. All remaining available mask(s) are rendered in this image below. Analyze them carefully and determine your next action.",
+                            },
+                            {"type": "image", "image": updated_outputs["output_image_path"]},
+                        ],
+                    }
+                )
 
         elif tool_call["name"] == "examine_each_mask":
             print("🔍 Calling examine_each_mask tool...")
@@ -728,7 +899,7 @@ def agent_inference(
                 "content": [
                     {
                         "type": "text",
-                        "text": "The segment_phrase tool generated several masks. Now you must analyze the mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action.",
+                        "text": "There are several currently available masks in memory. Now you must analyze the mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action.",
                     }
                 ],
             }
@@ -822,17 +993,12 @@ def agent_inference(
                 ],
                 "pred_masks": [current_outputs["pred_masks"][i] for i in masks_to_keep],
             }
-
-            image_w_check_masks = visualize(updated_outputs)
-            image_w_check_masks_path = os.path.join(
-                sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png"
-            ).replace(
-                ".png",
-                f"_selected_masks_{'-'.join(map(str, [i + 1 for i in masks_to_keep]))}.png".replace(
-                    "/", "_"
-                ),
+            state_json_path, _ = _build_state_snapshot_paths(
+                sam_output_dir,
+                img_path,
+                f"available_masks_after_examine_round_{generation_count + 1}",
             )
-            image_w_check_masks.save(image_w_check_masks_path)
+            updated_outputs = _persist_available_outputs(updated_outputs, state_json_path)
             # save the updated json outputs and append to message history
             messages.append(
                 {
@@ -847,7 +1013,7 @@ def agent_inference(
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"The original user query was: '{initial_text_prompt}'. The examine_each_mask tool examined and rejected all of the masks generated by the segment_phrase tool. Now, please call the segment_phrase tool again with a different, perhaps more general, or more creative simple noun phrase text_prompt, while adhering to all the rules stated in the system prompt.",
+                                "text": f"The original user query was: '{initial_text_prompt}'. The examine_each_mask tool examined and rejected all currently available masks in memory. There are now 0 available masks. If you still believe target objects exist, please call the segment_phrase tool again with a different, perhaps more general, or more creative simple noun phrase text_prompt, while adhering to all the rules stated in the system prompt.",
                             }
                         ],
                     }
@@ -861,26 +1027,12 @@ def agent_inference(
                                 "type": "text",
                                 "text": f"The original user query was: '{initial_text_prompt}'. After calling the examine_each_mask tool on the available masks, the number of available masks is now {len(masks_to_keep)}. All {len(masks_to_keep)} available masks are rendered in this image below, now you must analyze the {len(masks_to_keep)} available mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action.",
                             },
-                            {"type": "image", "image": image_w_check_masks_path},
+                            {"type": "image", "image": updated_outputs["output_image_path"]},
                         ],
                     }
                 )
 
-            # Create a new filename based on the original path to avoid filename length issues
-            base_path = PATH_TO_LATEST_OUTPUT_JSON
-            # Remove any existing "masks_" suffix to avoid duplication
-            if "masks_" in base_path:
-                base_path = base_path.split("masks_")[0] + ".json"
-            # Create new filename with current masks; use a clearer suffix when empty
-            if len(masks_to_keep) == 0:
-                PATH_TO_LATEST_OUTPUT_JSON = base_path.replace(
-                    ".json", "masks_none.json"
-                )
-            else:
-                PATH_TO_LATEST_OUTPUT_JSON = base_path.replace(
-                    ".json", f"masks_{'_'.join(map(str, masks_to_keep))}.json"
-                )
-            json.dump(updated_outputs, open(PATH_TO_LATEST_OUTPUT_JSON, "w"), indent=4)
+            PATH_TO_LATEST_OUTPUT_JSON = state_json_path
 
         elif tool_call["name"] == "select_masks_and_return":
             print("🔍 Calling select_masks_and_return tool...")
