@@ -45,6 +45,19 @@ class ParseSomResponseTests(unittest.TestCase):
         text = '<answer>{"accepted_marks": [1, "2", 3.5, true, 4]}</answer>'
         self.assertEqual(parse_som_response(text), [1, 4])
 
+    def test_nested_json_in_answer_payload(self):
+        text = '<answer>{"accepted_marks": [1, 3], "meta": {"note": "ok"}}</answer>'
+        self.assertEqual(parse_som_response(text), [1, 3])
+
+    def test_non_string_input_returns_empty(self):
+        self.assertEqual(parse_som_response(None), [])
+        self.assertEqual(parse_som_response(12345), [])
+        self.assertEqual(parse_som_response(""), [])
+
+    def test_empty_valid_ids_filters_everything(self):
+        text = '<answer>{"accepted_marks": [1, 2, 3]}</answer>'
+        self.assertEqual(parse_som_response(text, valid_ids=set()), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import re
 
-_ANSWER_RE = re.compile(r"<answer>\s*(\{.*?\})\s*</answer>", re.DOTALL)
+_ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
 
 
 def parse_som_response(text: str, *, valid_ids: set[int] | None = None) -> list[int]:
@@ -33,6 +33,11 @@ def parse_som_response(text: str, *, valid_ids: set[int] | None = None) -> list[
     Returns an empty list if the response is missing the tag entirely or
     has a malformed payload -- callers should treat that as "no
     creatures accepted" rather than an error.
+
+    The function is lenient on bad input: non-string ``text`` (including
+    ``None``) returns an empty list rather than raising. Callers that have
+    just gotten a model response that might be ``None`` due to upstream
+    error get a safe default instead of an exception.
     """
     if not isinstance(text, str) or not text:
         return []
