@@ -415,6 +415,28 @@ class BuildSomPromptMessagesTests(unittest.TestCase):
         image_items = [c for c in content if c.get("type") == "image"]
         self.assertEqual(len(image_items), 1)
 
+    def test_zero_num_marks_raises(self):
+        with self.assertRaises(ValueError):
+            build_som_prompt_messages(
+                system_prompt="SYS",
+                target_image_path=self.target_path,
+                neighbour_image_paths=[],
+                initial_text_prompt="x",
+                num_marks=0,
+            )
+
+    def test_answer_instruction_is_last_content_item(self):
+        msgs = build_som_prompt_messages(
+            system_prompt="SYS",
+            target_image_path=self.target_path,
+            neighbour_image_paths=self.neighbour_paths,
+            initial_text_prompt="small creatures",
+            num_marks=3,
+        )
+        last_item = msgs[1]["content"][-1]
+        self.assertEqual(last_item.get("type"), "text")
+        self.assertIn("accepted_marks", last_item["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

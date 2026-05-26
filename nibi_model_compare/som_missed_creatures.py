@@ -319,6 +319,11 @@ def build_som_prompt_messages(
 
     Returns: list of two message dicts.
     """
+    if num_marks < 1:
+        raise ValueError(
+            f"num_marks must be >= 1; got {num_marks}. SoM has nothing to ask about."
+        )
+
     target_blurb = (
         f"The first image is the target frame, annotated with numbered "
         f"marks 1..{num_marks} on candidate masks that SAM3 produced "
