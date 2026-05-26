@@ -163,14 +163,12 @@ def _mask_iou(a, b) -> float:
     if inter == 0:
         return 0.0
     union = int(np.logical_or(a, b).sum())
-    return inter / max(1, union)
+    return inter / union
 
 
 def _touches_edges(mask, edge_tol_px: int) -> int:
     """Number of frame edges (top/bottom/left/right) the mask touches
     within ``edge_tol_px`` pixels."""
-    import numpy as np
-
     h, w = mask.shape
     t = edge_tol_px
     count = 0
@@ -202,6 +200,8 @@ def filter_candidates(
       - candidates with area > max_area_frac * (H * W)
       - candidates that touch the frame edge on more than one side
 
+    Pass edge_tol_px=0 to disable edge filtering entirely.
+
     Returns the surviving candidates in the same order they were given.
     Callers that want the full pre-filter list with drop reasons should call
     ``filter_candidates_with_reasons`` instead (see below).
@@ -225,6 +225,8 @@ def filter_candidates_with_reasons(
     """Like ``filter_candidates`` but returns ``(candidate, drop_reason)``
     for every input candidate so debug artefacts can log filter
     decisions. ``drop_reason`` is None for survivors.
+
+    Pass edge_tol_px=0 to disable edge filtering entirely.
     """
     import numpy as np
 

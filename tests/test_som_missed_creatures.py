@@ -255,5 +255,33 @@ class FilterCandidatesTests(unittest.TestCase):
         self.assertEqual(len(out), 1)
 
 
+    def test_with_reasons_returns_all_with_correct_strings(self):
+        tiny = _disk_mask(self.H, self.W, 20, 20, 1)
+        huge = np.ones((self.H, self.W), dtype=bool)
+        multi_edge = np.zeros((self.H, self.W), dtype=bool)
+        multi_edge[0:5, 0:5] = True
+        dup_mask = _disk_mask(self.H, self.W, 32, 32, 6)
+        existing = [{"mask": _disk_mask(self.H, self.W, 32, 32, 6)}]
+        good = _disk_mask(self.H, self.W, 12, 50, 5)
+
+        from nibi_model_compare.som_missed_creatures import filter_candidates_with_reasons
+
+        cands = [_cand(tiny), _cand(huge), _cand(multi_edge),
+                 _cand(dup_mask), _cand(good)]
+        out = filter_candidates_with_reasons(
+            cands, existing,
+            iou_dedup=0.3, min_area_px=20, max_area_frac=0.5,
+            edge_tol_px=2,
+        )
+        reasons = [reason for _c, reason in out]
+        self.assertEqual(reasons, [
+            "too_small",
+            "too_large",
+            "multi_edge_clipped",
+            "duplicate_of_existing",
+            None,
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()
