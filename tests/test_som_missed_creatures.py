@@ -972,5 +972,94 @@ class RunSomStageTests(unittest.TestCase):
         self.assertGreaterEqual(result["targets_processed"], 1)
 
 
+import subprocess
+
+
+class MergeSomOutputsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workdir = self.tmp.name
+        # Original frame_outputs with 2 frames, 1 mask each
+        from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+        yy, xx = np.ogrid[:32, :32]
+        m1 = ((yy - 8) ** 2 + (xx - 8) ** 2) <= 3 * 3
+        m2 = ((yy - 24) ** 2 + (xx - 24) ** 2) <= 3 * 3
+        self.original_path = os.path.join(self.workdir, "fo.json")
+        with open(self.original_path, "w") as f:
+            _json.dump({
+                "format_version": 2,
+                "frames": [
+                    {"frame_index": 0, "out_obj_ids": [1],
+                     "out_binary_masks_rle": [encode_binary_mask_to_rle(m1)],
+                     "out_boxes_xywh": [[5, 5, 7, 7]],
+                     "out_probs": [0.9], "out_tracker_probs": [0.9]},
+                    {"frame_index": 5, "out_obj_ids": [1],
+                     "out_binary_masks_rle": [encode_binary_mask_to_rle(m2)],
+                     "out_boxes_xywh": [[21, 21, 7, 7]],
+                     "out_probs": [0.9], "out_tracker_probs": [0.9]},
+                ],
+            }, f)
+
+        # Augmented JSONL: replaces frame 5 with +1 mask
+        m3 = ((yy - 16) ** 2 + (xx - 16) ** 2) <= 3 * 3
+        self.augmented_path = os.path.join(self.workdir, "aug.jsonl")
+        with open(self.augmented_path, "w") as f:
+            f.write(_json.dumps({
+                "frame_index": 5,
+                "source": "som",
+                "added_obj_ids": [2],
+                "out_obj_ids": [1, 2],
+                "out_binary_masks_rle": [
+                    encode_binary_mask_to_rle(m2),
+                    encode_binary_mask_to_rle(m3),
+                ],
+                "out_boxes_xywh": [[21, 21, 7, 7], [13, 13, 7, 7]],
+                "out_probs": [0.9, 0.85],
+                "out_tracker_probs": [0.9, 0.85],
+                "source_per_obj_id": {"1": "text_agent", "2": "som"},
+            }) + "\n")
+        self.out_path = os.path.join(self.workdir, "merged.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_merge_replaces_augmented_frames_only(self):
+        cmd = [
+            ".venv/bin/python", "scripts/merge_som_outputs.py",
+            "--frame-outputs", self.original_path,
+            "--augmented", self.augmented_path,
+            "--output", self.out_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                cwd=os.path.abspath(
+                                    os.path.join(os.path.dirname(__file__),
+                                                 "..")))
+        self.assertEqual(result.returncode, 0,
+                         f"merge failed: {result.stderr}")
+
+        with open(self.out_path) as f:
+            merged = _json.load(f)
+        frames_by_idx = {f["frame_index"]: f for f in merged["frames"]}
+        # Frame 0 unchanged
+        self.assertEqual(frames_by_idx[0]["out_obj_ids"], [1])
+        # Frame 5 augmented
+        self.assertEqual(frames_by_idx[5]["out_obj_ids"], [1, 2])
+        self.assertEqual(frames_by_idx[5]["source"], "som")
+
+    def test_original_file_is_not_mutated(self):
+        before = open(self.original_path).read()
+        cmd = [
+            ".venv/bin/python", "scripts/merge_som_outputs.py",
+            "--frame-outputs", self.original_path,
+            "--augmented", self.augmented_path,
+            "--output", self.out_path,
+        ]
+        subprocess.run(cmd, capture_output=True, text=True,
+                       cwd=os.path.abspath(
+                           os.path.join(os.path.dirname(__file__), "..")))
+        after = open(self.original_path).read()
+        self.assertEqual(before, after)
+
+
 if __name__ == "__main__":
     unittest.main()
