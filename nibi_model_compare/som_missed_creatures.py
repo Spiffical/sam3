@@ -641,6 +641,10 @@ def parse_click_proposals(text: str) -> list[dict]:
     Returns [] for any malformed or missing tag (lenient -- same policy as
     parse_som_response). Coordinates are accepted only if both x and y
     are floats in [0, 1]; out-of-range entries are dropped silently.
+
+    LEGACY single-click-per-creature contract.  The new grouped contract is
+    implemented by ``parse_creature_click_groups``.  This function is kept for
+    backwards-compatibility and as documentation of the prior format.
     """
     if not isinstance(text, str) or not text:
         return []
@@ -671,6 +675,119 @@ def parse_click_proposals(text: str) -> list[dict]:
             desc = ""
         out.append({"x": float(x), "y": float(y), "description": desc})
     return out
+
+
+def parse_creature_click_groups(text: str) -> list[dict]:
+    """Parse the NEW grouped-click MLLM contract.
+
+    Expected answer tag::
+
+        <answer>{"missed_creatures":[
+          {"id":1,"description":"large tan crab","clicks":[
+             {"x":0.12,"y":0.08,"label":1},
+             {"x":0.15,"y":0.11,"label":1}
+          ]},
+          ...
+        ]}</answer>
+
+    Returns a list of dicts::
+
+        {
+          "id": int,
+          "description": str,
+          "clicks": [{"x": float, "y": float, "label": int}, ...],
+        }
+
+    Validation rules (lenient -- same policy as ``parse_som_response``):
+
+    * Returns ``[]`` on missing / malformed ``<answer>`` tag.
+    * Individual clicks with out-of-range coords (not in [0, 1]) are dropped.
+    * Individual clicks with invalid labels (not 0 or 1) are dropped.
+    * Creature entries whose ``clicks`` array is empty after filtering are
+      dropped entirely.
+    * If ``id`` values are absent or duplicated, sequential 1..N ids are
+      re-assigned.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    matches = _ANSWER_RE.findall(text)
+    if not matches:
+        return []
+    try:
+        payload = json.loads(matches[-1])
+    except json.JSONDecodeError:
+        return []
+    raw = payload.get("missed_creatures") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+
+    groups: list[dict] = []
+    seen_ids: set = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        raw_clicks = item.get("clicks")
+        if not isinstance(raw_clicks, list):
+            continue
+
+        good_clicks: list[dict] = []
+        for c in raw_clicks:
+            if not isinstance(c, dict):
+                continue
+            x = c.get("x")
+            y = c.get("y")
+            label = c.get("label")
+            # Drop non-numeric coords (bool counts as int in Python, reject it)
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                continue
+            if isinstance(y, bool) or not isinstance(y, (int, float)):
+                continue
+            if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
+                continue
+            if label not in (0, 1):
+                continue
+            good_clicks.append({"x": float(x), "y": float(y), "label": int(label)})
+
+        if not good_clicks:
+            continue  # creature has no usable clicks — drop it
+
+        desc = item.get("description")
+        if not isinstance(desc, str):
+            desc = ""
+
+        raw_id = item.get("id")
+        # Accept id only if it's a plain positive int and not already seen
+        if (
+            not isinstance(raw_id, bool)
+            and isinstance(raw_id, int)
+            and raw_id > 0
+            and raw_id not in seen_ids
+        ):
+            creature_id = raw_id
+        else:
+            creature_id = None  # will be re-assigned below
+
+        seen_ids.add(creature_id)  # may add None; handled below
+        groups.append({
+            "id": creature_id,
+            "description": desc,
+            "clicks": good_clicks,
+        })
+
+    # Re-assign ids if any were missing / duplicated
+    if any(g["id"] is None for g in groups):
+        # Full re-assignment: keep ids that are unique ints and reassign the rest
+        assigned: set[int] = {g["id"] for g in groups if g["id"] is not None}
+        counter = 1
+        for g in groups:
+            if g["id"] is None:
+                while counter in assigned:
+                    counter += 1
+                g["id"] = counter
+                assigned.add(counter)
+                counter += 1
+
+    return groups
 
 
 def render_proposed_clicks_overlay(
@@ -708,6 +825,72 @@ def render_proposed_clicks_overlay(
     return out
 
 
+def render_proposed_click_groups_overlay(
+    frame_bgr,
+    groups: list[dict],
+    existing_masks: list[dict] | None = None,
+):
+    """Render frame with existing-masks overlay (faint green) + proposed
+    click GROUPS, color-coded by creature id.
+
+    Each group entry is expected to be shaped as returned by
+    ``parse_creature_click_groups``::
+
+        {"id": int, "description": str,
+         "clicks": [{"x": float, "y": float, "label": int}, ...]}
+
+    Visual conventions:
+
+    * Positive clicks (label=1) are drawn as a circle with a white centre
+      dot -- the classic SAM positive-click marker.
+    * Negative clicks (label=0) are drawn as an X with
+      ``cv2.MARKER_TILTED_CROSS``.
+    * Each click is labelled ``<creature_id>.<click_idx>`` (e.g. "1.1",
+      "1.2", "2.1") to let reviewers quickly associate clicks with
+      creatures.
+    * Colors cycle through a small BGR palette keyed by ``id``.
+
+    Keep ``render_proposed_clicks_overlay`` (flat list) for legacy use.
+    """
+    import cv2
+
+    out = (
+        frame_bgr.copy()
+        if existing_masks is None
+        else render_existing_masks_overlay(frame_bgr, existing_masks, alpha=0.2)
+    )
+    h, w = out.shape[:2]
+
+    # BGR palette (red, cyan-ish, yellow, magenta, orange, purple)
+    palette = [
+        (0, 0, 255),    # red
+        (255, 200, 0),  # cyan-ish
+        (0, 255, 255),  # yellow
+        (255, 0, 255),  # magenta
+        (0, 200, 255),  # orange
+        (200, 0, 255),  # purple
+    ]
+
+    for grp in groups:
+        cid = int(grp.get("id", -1))
+        color = palette[(cid - 1) % len(palette)] if cid > 0 else (200, 200, 200)
+        for click_idx, c in enumerate(grp.get("clicks") or [], start=1):
+            cx = int(round(c["x"] * w))
+            cy = int(round(c["y"] * h))
+            label_text = f"{cid}.{click_idx}"
+            if int(c.get("label", 1)) == 1:
+                cv2.circle(out, (cx, cy), 12, color, 2)
+                cv2.circle(out, (cx, cy), 2, (255, 255, 255), -1)
+            else:
+                # negative -> tilted cross
+                cv2.drawMarker(out, (cx, cy), color, cv2.MARKER_TILTED_CROSS, 20, 2)
+            cv2.putText(out, label_text, (cx + 14, cy + 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(out, label_text, (cx + 14, cy + 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, color, 1, cv2.LINE_AA)
+    return out
+
+
 class Sam3PointService:
     """Run SAM3 single-image click mode on (x, y) prompts using the
     processor/model API documented in examples/sam3_for_sam1_task_example.ipynb.
@@ -730,34 +913,70 @@ class Sam3PointService:
                 "enable_inst_interactivity=True."
             )
 
-    def point_segment(
-        self, image_path: str, clicks: list[dict], output_folder: str | None = None,
+    def group_segment(
+        self,
+        image_path: str,
+        groups: list[dict],
+        output_folder: str | None = None,
     ) -> list[dict]:
-        """For each click {x: float (norm 0-1), y: float (norm 0-1), description: str},
-        run SAM3 in click mode with a single foreground point. Returns a list of
-        {mask: bool ndarray HxW, score: float, sam_text_prompt: str (empty -- legacy),
-         spatial_match: "click_mode"} matching the consumer shape in
-        generate_click_based_candidates.
+        """For each creature group, run SAM3 click mode with ALL the group's
+        positive + negative points jointly.
 
-        output_folder is accepted for API compatibility with the previous
-        text-mode workaround but is unused in click mode (no per-call JSON
-        artefacts to write).
+        ``groups`` is shaped as returned by ``parse_creature_click_groups``::
+
+            [{"id": int, "description": str,
+              "clicks": [{"x": float, "y": float, "label": int}, ...]}, ...]
+
+        Returns one result per group::
+
+            {"creature_id": int, "description": str,
+             "mask": bool HxW, "score": float, "area_px": int,
+             "select_reason": str,
+             "spatial_match": "click_mode" | "click_mode_empty" | "click_mode_error",
+             "clicks_used": list of {x, y, label}}
+
+        Multiple foreground (label=1) clicks let SAM3 jointly disambiguate
+        elongated objects; background (label=0) clicks exclude substrate or
+        a neighbouring creature.
+
+        ``output_folder`` is accepted for API compatibility but is unused in
+        click mode (no per-call JSON artefacts to write).
         """
         import numpy as np
         from PIL import Image
 
         pil = Image.open(image_path).convert("RGB")
         w, h = pil.size
-
-        # Compute embeddings once per image
         inference_state = self.processor.set_image(pil)
 
-        results: list[dict] = []
-        for click in clicks:
-            x_px = float(click["x"]) * w
-            y_px = float(click["y"]) * h
-            point_coords = np.array([[x_px, y_px]], dtype=np.float32)
-            point_labels = np.array([1], dtype=np.int64)
+        out: list[dict] = []
+        for grp in groups:
+            clicks = grp.get("clicks") or []
+            # Defensive re-filter (parser should have already done this)
+            good = [
+                c for c in clicks
+                if isinstance(c.get("x"), (int, float))
+                and isinstance(c.get("y"), (int, float))
+                and c.get("label") in (0, 1)
+            ]
+            if not good:
+                out.append({
+                    "creature_id": int(grp.get("id", -1)),
+                    "description": str(grp.get("description", "")),
+                    "mask": np.zeros((h, w), dtype=bool),
+                    "score": 0.0,
+                    "area_px": 0,
+                    "select_reason": "no_clicks",
+                    "spatial_match": "click_mode_empty",
+                    "clicks_used": [],
+                })
+                continue
+
+            point_coords = np.array(
+                [[float(c["x"]) * w, float(c["y"]) * h] for c in good],
+                dtype=np.float32,
+            )
+            point_labels = np.array([int(c["label"]) for c in good], dtype=np.int64)
 
             try:
                 masks, scores, _logits = self.model.predict_inst(
@@ -767,99 +986,127 @@ class Sam3PointService:
                     multimask_output=True,
                 )
             except Exception as exc:
-                print(f"[som] click mode failed for {click.get('description')!r}: "
-                      f"{type(exc).__name__}: {exc}")
-                results.append({
+                print(
+                    f"[som] group_segment failed for creature {grp.get('id')!r} "
+                    f"({grp.get('description')!r}): {type(exc).__name__}: {exc}"
+                )
+                out.append({
+                    "creature_id": int(grp.get("id", -1)),
+                    "description": str(grp.get("description", "")),
                     "mask": np.zeros((h, w), dtype=bool),
                     "score": 0.0,
-                    "sam_text_prompt": "",
+                    "area_px": 0,
+                    "select_reason": "click_mode_error",
                     "spatial_match": "click_mode_error",
+                    "clicks_used": good,
                 })
                 continue
 
-            # masks: (N, H, W) bool. Pick the highest-scoring.
-            if hasattr(masks, "detach"):
-                masks_np = masks.detach().cpu().numpy()
-            else:
-                masks_np = np.asarray(masks)
-            if hasattr(scores, "detach"):
-                scores_np = scores.detach().cpu().numpy()
-            else:
-                scores_np = np.asarray(scores)
-
+            # Normalise tensor/array shapes
+            masks_np = masks.detach().cpu().numpy() if hasattr(masks, "detach") else np.asarray(masks)
+            scores_np = scores.detach().cpu().numpy() if hasattr(scores, "detach") else np.asarray(scores)
             if masks_np.ndim == 4:  # (1, N, H, W) -> (N, H, W)
                 masks_np = masks_np[0]
                 scores_np = scores_np[0] if scores_np.ndim >= 1 else scores_np
+            masks_np = masks_np.astype(bool)
 
             if masks_np.size == 0:
-                results.append({
+                out.append({
+                    "creature_id": int(grp.get("id", -1)),
+                    "description": str(grp.get("description", "")),
                     "mask": np.zeros((h, w), dtype=bool),
                     "score": 0.0,
-                    "sam_text_prompt": "",
-                    "spatial_match": "click_mode_empty",
                     "area_px": 0,
-                    "select_reason": "empty_output",
+                    "select_reason": "click_mode_empty",
+                    "spatial_match": "click_mode_empty",
+                    "clicks_used": good,
                 })
                 continue
 
-            # masks_np: (N, H, W) bool
-            # scores_np: (N,) float
-            # Compute area for each mask
-            areas = masks_np.reshape(masks_np.shape[0], -1).sum(axis=1)
-
+            # Smallest-in-band selection (same policy as the legacy point_segment)
             img_h, img_w = masks_np.shape[1], masks_np.shape[2]
             total_pixels = float(img_h * img_w)
-
-            # Hard-coded sensible defaults; could be plumbed through cfg later.
-            # Reuse the same filter thresholds the candidate filter uses downstream,
-            # but applied here per-mask to pick the right scale BEFORE downstream
-            # filtering. Use the smaller of (1% of image area, 200 px) as min, and
-            # the same max_area_frac the driver passes to filter_candidates_with_reasons.
+            areas = masks_np.reshape(masks_np.shape[0], -1).sum(axis=1)
             min_area_for_selection = max(200, int(0.001 * total_pixels))
-            max_area_for_selection = 0.5 * total_pixels  # 50% — same convention as filter step
+            max_area_for_selection = 0.5 * total_pixels
 
-            # Eligible: masks within the area band, sorted ascending by area
-            eligible = [
-                (a, i) for i, a in enumerate(areas)
-                if min_area_for_selection <= a <= max_area_for_selection
-            ]
-            eligible.sort()  # smallest first
-
+            eligible = sorted(
+                [(int(a), i) for i, a in enumerate(areas)
+                 if min_area_for_selection <= a <= max_area_for_selection]
+            )
             if eligible:
-                _area, best_idx = eligible[0]   # smallest mask in the acceptable range
+                _area, best_idx = eligible[0]
                 select_reason = "smallest_in_band"
             else:
-                # No mask in the band -> pick the smallest above min_area regardless
-                # of upper bound (could be a large object spanning the frame; better
-                # than nothing), or fall back to highest score if all are too small.
-                above_min = [(a, i) for i, a in enumerate(areas) if a >= min_area_for_selection]
+                above_min = sorted(
+                    [(int(a), i) for i, a in enumerate(areas) if a >= min_area_for_selection]
+                )
                 if above_min:
-                    above_min.sort()
                     _area, best_idx = above_min[0]
                     select_reason = "smallest_above_min"
                 else:
                     best_idx = int(np.argmax(scores_np))
                     select_reason = "fallback_highest_score"
 
-            best_mask = masks_np[best_idx].astype(bool)
+            best_mask = masks_np[best_idx]
             best_score = float(scores_np[best_idx])
+            area_px = int(best_mask.sum())
 
             print(
-                f"[som] click '{click.get('description')!r}' -> "
-                f"mask area {int(best_mask.sum())}/{int(total_pixels)} "
-                f"({best_mask.sum() / total_pixels * 100:.1f}%) reason={select_reason} score={best_score:.3f}"
+                f"[som] creature id={grp.get('id')} '{grp.get('description')}' "
+                f"({len(good)} clicks) -> "
+                f"mask {area_px}/{int(total_pixels)} "
+                f"({area_px / total_pixels * 100:.1f}%) "
+                f"reason={select_reason} score={best_score:.3f}"
             )
 
-            results.append({
+            out.append({
+                "creature_id": int(grp.get("id", -1)),
+                "description": str(grp.get("description", "")),
                 "mask": best_mask,
                 "score": best_score,
-                "sam_text_prompt": "",
-                "spatial_match": "click_mode",
-                "area_px": int(best_mask.sum()),
+                "area_px": area_px,
                 "select_reason": select_reason,
+                "spatial_match": "click_mode",
+                "clicks_used": good,
             })
 
-        return results
+        return out
+
+    def point_segment(
+        self, image_path: str, clicks: list[dict], output_folder: str | None = None,
+    ) -> list[dict]:
+        """Legacy single-click-per-creature wrapper around ``group_segment``.
+
+        Each input click ``{x, y, description}`` becomes a 1-click foreground
+        group fed to ``group_segment``. The result is re-shaped to the OLD
+        consumer format ``{mask, score, sam_text_prompt: "", spatial_match,
+        area_px, select_reason}`` so existing callers (tests, scripts) that
+        were written against the prior API keep working without modification.
+
+        LEGACY: kept for backwards compatibility with any callers.  New code
+        should use ``group_segment`` directly with the grouped-click contract.
+        """
+        groups = [
+            {
+                "id": i + 1,
+                "description": c.get("description", ""),
+                "clicks": [{"x": c["x"], "y": c["y"], "label": 1}],
+            }
+            for i, c in enumerate(clicks)
+        ]
+        grp_results = self.group_segment(image_path, groups, output_folder=output_folder)
+        out = []
+        for r in grp_results:
+            out.append({
+                "mask": r["mask"],
+                "score": r["score"],
+                "sam_text_prompt": "",
+                "spatial_match": r["spatial_match"],
+                "area_px": r["area_px"],
+                "select_reason": r["select_reason"],
+            })
+        return out
 
 
 def generate_click_based_candidates(
@@ -874,14 +1121,19 @@ def generate_click_based_candidates(
     mllm_send,
     sam3_point_service,
 ) -> tuple[list[dict], list[dict], str | None]:
-    """Returns (candidates, proposed_clicks, mllm_response_text).
+    """Returns (candidates, proposed_groups, mllm_response_text).
 
     - Renders an existing-masks overlay to disk (for the MLLM to see covered regions).
-    - Asks the MLLM to propose click points for MISSED creatures.
-    - For each click, runs SAM3 image point-mode -> mask.
-    - Returns candidates in the same {mask, bbox_xywh, score, source_prompt} shape
-      that filter_candidates_with_reasons consumes, plus the raw click proposals
+    - Asks the MLLM to propose click GROUPS for MISSED creatures (new grouped contract).
+    - For each group, runs SAM3 image point-mode with ALL clicks in the group jointly.
+    - Returns candidates in the {mask, bbox_xywh, score, source_prompt, creature_id,
+      description, clicks_used, select_reason, spatial_match} shape that
+      filter_candidates_with_reasons consumes, plus the raw group proposals
       (for visualization) and the raw MLLM response text (for debug).
+
+    The return signature changed from ``(candidates, clicks, response_text)`` to
+    ``(candidates, groups, response_text)`` -- ``groups`` is a list of dicts shaped
+    as returned by ``parse_creature_click_groups``.
     """
     import cv2
     import numpy as np
@@ -893,19 +1145,21 @@ def generate_click_based_candidates(
     overlay_path = os.path.join(output_folder, "02_existing_masks.png")
     cv2.imwrite(overlay_path, overlay)
 
-    # 2. Build discovery messages
+    # 2. Build discovery messages (new grouped-click contract)
     user_text = (
         f"The first image is the TARGET FRAME with translucent green overlays "
         f"showing masks already produced by a text-prompted detector with query "
         f"'{initial_text_prompt}'. The subsequent images are REFERENCE FRAMES "
         f"from nearby times. Identify any creatures matching '{initial_text_prompt}' "
         f"that are visible in the TARGET FRAME but NOT covered by the green overlays. "
-        f"For each missed creature, output an approximate (x, y) click point in "
-        f"NORMALIZED coordinates where (0,0) is the top-left and (1,1) is the "
-        f"bottom-right of the TARGET image. Also include a 1-5 word description "
-        f"so we can verify your judgment.\n\n"
+        f"For each missed creature, output a GROUP of click points in NORMALIZED "
+        f"coordinates where (0,0) is the top-left and (1,1) is the bottom-right of "
+        f"the TARGET image. Also include a 1-5 word description and a sequential id.\n\n"
+        f"Each click has a label: 1=FOREGROUND (on the creature) or 0=BACKGROUND "
+        f"(on substrate or a neighbouring creature to EXCLUDE from segmentation).\n\n"
         f"Output format -- free-text reasoning then EXACTLY ONE trailing tag:\n"
-        f'<answer>{{"missed_creatures":[{{"x":<float>,"y":<float>,"description":"<text>"}},...]}}</answer>\n\n'
+        f'<answer>{{"missed_creatures":[{{"id":1,"description":"<text>","clicks":[{{"x":<float>,"y":<float>,"label":1}},...]}},...]}}'
+        f'</answer>\n\n'
         f"An empty list is valid if you see no missed creatures. Prefer fewer "
         f"high-confidence proposals over many uncertain ones."
     )
@@ -922,48 +1176,54 @@ def generate_click_based_candidates(
     ]
 
     response_text = mllm_send(messages)
-    clicks = parse_click_proposals(response_text)
+    groups = parse_creature_click_groups(response_text)
 
-    if not clicks:
+    if not groups:
         return [], [], response_text
 
-    # 3. SAM3 click-mode per MLLM-proposed coordinate
-    sam_results = sam3_point_service.point_segment(
-        target_image_path, clicks, output_folder=output_folder,
+    # 3. SAM3 click-mode per MLLM-proposed group (all clicks in a group jointly)
+    sam_results = sam3_point_service.group_segment(
+        target_image_path, groups, output_folder=output_folder,
     )
 
     candidates = []
-    for click, sam_out in zip(clicks, sam_results):
+    for grp, sam_out in zip(groups, sam_results):
         mask = sam_out["mask"]
         if not mask.any():
-            # spatial_match == "none" or empty -> filter step will drop it.
-            # Still record it as a candidate so debug artefacts capture the attempt.
-            # filter_candidates_with_reasons will mark drop_reason="too_small".
             candidates.append({
                 "mask": mask,
                 "bbox_xywh": [0, 0, 0, 0],
                 "score": 0.0,
-                "source_prompt": f"click[{click['description']}]",
-                "click_xy_norm": (click["x"], click["y"]),
-                "sam_text_prompt": sam_out["sam_text_prompt"],
+                "source_prompt": f"click_group[{grp.get('description', '')}]",
+                "creature_id": grp.get("id"),
+                "description": grp.get("description", ""),
+                "clicks_used": sam_out.get("clicks_used", []),
+                "sam_text_prompt": "",
                 "spatial_match": sam_out["spatial_match"],
+                "select_reason": sam_out.get("select_reason", ""),
             })
             continue
         ys, xs = np.where(mask)
-        bbox = [int(xs.min()), int(ys.min()),
-                int(xs.max() - xs.min() + 1),
-                int(ys.max() - ys.min() + 1)]
+        bbox = [
+            int(xs.min()), int(ys.min()),
+            int(xs.max() - xs.min() + 1),
+            int(ys.max() - ys.min() + 1),
+        ]
         candidates.append({
             "mask": mask,
             "bbox_xywh": bbox,
             "score": float(sam_out["score"]),
-            "source_prompt": f"click[{click['description']}]",
-            "click_xy_norm": (click["x"], click["y"]),
-            "sam_text_prompt": sam_out["sam_text_prompt"],
+            "source_prompt": f"click_group[{grp.get('description', '')}]",
+            "creature_id": grp.get("id"),
+            "description": grp.get("description", ""),
+            "clicks_used": sam_out.get("clicks_used", []),
+            "sam_text_prompt": "",
             "spatial_match": sam_out["spatial_match"],
+            "select_reason": sam_out.get("select_reason", ""),
+            "area_px": sam_out.get("area_px", int(mask.sum())),
         })
 
-    return candidates, clicks, response_text
+    return candidates, groups, response_text
 
 
 from dataclasses import dataclass
@@ -1210,7 +1470,7 @@ def run_som_stage(
             )
 
             if point_service is not None:
-                candidates, clicks, discovery_resp = generate_click_based_candidates(
+                candidates, groups, discovery_resp = generate_click_based_candidates(
                     target_frame_bgr=target_frame,
                     target_image_path=target_img_path,
                     existing_masks=existing_masks,
@@ -1223,21 +1483,21 @@ def run_som_stage(
                 )
                 stats["mllm_calls"] += 1
 
-                # Save discovery artefacts
+                # Save discovery artefacts (groups = new grouped-click contract)
                 with open(os.path.join(target_dir, "discovery_request.json"), "w") as f:
-                    json.dump(clicks, f, indent=2)
+                    json.dump(groups, f, indent=2)
                 with open(os.path.join(target_dir, "discovery_response.txt"), "w") as f:
                     f.write(discovery_resp or "")
 
-                # Render proposed clicks visualisation → 03_proposed_clicks.png
-                clicks_vis = render_proposed_clicks_overlay(
-                    target_frame, clicks, existing_masks=existing_masks
+                # Render proposed click groups → 03_proposed_clicks.png
+                clicks_vis = render_proposed_click_groups_overlay(
+                    target_frame, groups, existing_masks=existing_masks
                 )
                 cv2.imwrite(os.path.join(target_dir, "03_proposed_clicks.png"), clicks_vis)
             else:
                 # No point service provided (test / fallback): skip discovery
                 candidates = []
-                clicks = []
+                groups = []
 
             if not candidates:
                 stats["targets_skipped"] += 1

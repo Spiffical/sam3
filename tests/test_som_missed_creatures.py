@@ -765,12 +765,18 @@ from nibi_model_compare.som_missed_creatures import (
 
 
 class FakeSam3PointService:
-    """Deterministic fake that returns a center-disk mask for every click.
+    """Deterministic fake that returns a center-disk mask for every click group.
 
-    Matches the new Sam3PointService.point_segment signature:
-        point_segment(image_path, clicks, output_folder=None) -> list[dict]
-    where each click is {x, y, description} and each result is
-    {mask, score, sam_text_prompt: "" (legacy empty), spatial_match: "click_mode"}.
+    Exposes both ``group_segment`` (new primary API) and ``point_segment``
+    (legacy wrapper) so existing tests that call either method still work.
+
+    ``group_segment`` returns one result per group shaped as
+    Sam3PointService.group_segment promises:
+        {"creature_id": int, "description": str, "mask": bool HxW,
+         "score": float, "area_px": int, "select_reason": str,
+         "spatial_match": "click_mode", "clicks_used": list}
+
+    ``point_segment`` returns the legacy shape as before.
     """
 
     def __init__(self, h=64, w=64, radius=5):
@@ -778,6 +784,33 @@ class FakeSam3PointService:
         self.w = w
         self.radius = radius
         self.calls = []
+
+    def group_segment(self, image_path, groups, output_folder=None):
+        self.calls.append((image_path, [dict(g) for g in groups], output_folder))
+        results = []
+        for grp in groups:
+            clicks = grp.get("clicks") or []
+            # Use the first foreground click to place the mask center
+            fg_clicks = [c for c in clicks if int(c.get("label", 1)) == 1]
+            if fg_clicks:
+                c = fg_clicks[0]
+                cx = int(round(c["x"] * self.w))
+                cy = int(round(c["y"] * self.h))
+            else:
+                cx, cy = self.w // 2, self.h // 2
+            yy, xx = np.ogrid[:self.h, :self.w]
+            mask = ((yy - cy) ** 2 + (xx - cx) ** 2) <= self.radius ** 2
+            results.append({
+                "creature_id": int(grp.get("id", -1)),
+                "description": str(grp.get("description", "")),
+                "mask": mask,
+                "score": 0.85,
+                "area_px": int(mask.sum()),
+                "select_reason": "smallest_in_band",
+                "spatial_match": "click_mode",
+                "clicks_used": clicks,
+            })
+        return results
 
     def point_segment(self, image_path, clicks, output_folder=None):
         self.calls.append((image_path, [dict(c) for c in clicks], output_folder))
@@ -868,10 +901,11 @@ class RunSomStageTests(unittest.TestCase):
             ]
             joined = " ".join(text_items)
             if "missed_creatures" in joined or "NORMALIZED" in joined:
-                # Discovery response
+                # Discovery response -- new grouped-click contract
                 return (
                     'I see a creature at center.\n'
-                    '<answer>{"missed_creatures":[{"x":0.5,"y":0.5,"description":"center crab"}]}</answer>'
+                    '<answer>{"missed_creatures":[{"id":1,"description":"center crab",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
                 )
             else:
                 # Judge response
@@ -960,7 +994,8 @@ class RunSomStageTests(unittest.TestCase):
             joined = " ".join(text_items)
             if "missed_creatures" in joined or "NORMALIZED" in joined:
                 return (
-                    '<answer>{"missed_creatures":[{"x":0.5,"y":0.5,"description":"test"}]}</answer>'
+                    '<answer>{"missed_creatures":[{"id":1,"description":"test",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
                 )
             # Judge: return out-of-range id
             return '<answer>{"accepted_marks": [99]}</answer>'
@@ -1081,7 +1116,7 @@ class RunSomStageTests(unittest.TestCase):
             )
 
     def test_discovery_request_json_saved(self):
-        """discovery_request.json should be written with the click proposals."""
+        """discovery_request.json should be written with the grouped click proposals."""
         cfg = self._config(num_target_frames=1, target_frames_explicit=[5])
         run_som_stage(
             cfg,
@@ -1093,10 +1128,13 @@ class RunSomStageTests(unittest.TestCase):
         req_path = os.path.join(target_dir, "discovery_request.json")
         self.assertTrue(os.path.exists(req_path))
         with open(req_path) as f:
-            clicks = _json.load(f)
-        self.assertIsInstance(clicks, list)
-        self.assertEqual(len(clicks), 1)
-        self.assertAlmostEqual(clicks[0]["x"], 0.5)
+            groups = _json.load(f)
+        self.assertIsInstance(groups, list)
+        self.assertEqual(len(groups), 1)
+        # New grouped contract: each entry has an id, description, and clicks list
+        self.assertIn("id", groups[0])
+        self.assertIn("clicks", groups[0])
+        self.assertAlmostEqual(groups[0]["clicks"][0]["x"], 0.5)
 
 
 import subprocess
@@ -1258,6 +1296,298 @@ class Sam3PointServiceSelectionTests(unittest.TestCase):
             out = svc.point_segment(img_path, [{"x": 0.5, "y": 0.5, "description": "x"}])
             # Should fall back to highest score (0.9 -> m3)
             self.assertEqual(out[0]["select_reason"], "fallback_highest_score")
+
+
+from nibi_model_compare.som_missed_creatures import parse_creature_click_groups
+
+
+class ParseCreatureClickGroupsTests(unittest.TestCase):
+    """Tests for the new grouped-click MLLM contract parser."""
+
+    def test_happy_path_two_creatures_one_click_each(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"large crab","clicks":[{"x":0.1,"y":0.2,"label":1}]},'
+            '{"id":2,"description":"small snail","clicks":[{"x":0.8,"y":0.9,"label":1}]}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["id"], 1)
+        self.assertEqual(result[0]["description"], "large crab")
+        self.assertEqual(len(result[0]["clicks"]), 1)
+        self.assertAlmostEqual(result[0]["clicks"][0]["x"], 0.1)
+        self.assertEqual(result[0]["clicks"][0]["label"], 1)
+        self.assertEqual(result[1]["id"], 2)
+
+    def test_mixed_positive_and_negative_labels_accepted(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"crab","clicks":['
+            '{"x":0.5,"y":0.5,"label":1},'
+            '{"x":0.6,"y":0.6,"label":0}'
+            ']}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 1)
+        labels = [c["label"] for c in result[0]["clicks"]]
+        self.assertEqual(labels, [1, 0])
+
+    def test_out_of_range_coords_filtered(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"oob crab","clicks":['
+            '{"x":1.5,"y":0.5,"label":1},'
+            '{"x":0.5,"y":-0.1,"label":1},'
+            '{"x":0.4,"y":0.6,"label":1}'
+            ']}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]["clicks"]), 1)
+        self.assertAlmostEqual(result[0]["clicks"][0]["x"], 0.4)
+
+    def test_empty_or_missing_clicks_drops_creature(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"no clicks creature","clicks":[]},'
+            '{"id":2,"description":"missing clicks key"},'
+            '{"id":3,"description":"valid","clicks":[{"x":0.5,"y":0.5,"label":1}]}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["id"], 3)
+
+    def test_auto_assigns_ids_when_omitted(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"description":"crab A","clicks":[{"x":0.1,"y":0.1,"label":1}]},'
+            '{"description":"crab B","clicks":[{"x":0.9,"y":0.9,"label":1}]}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 2)
+        ids = [g["id"] for g in result]
+        self.assertEqual(sorted(ids), [1, 2])
+
+    def test_returns_empty_on_missing_tag(self):
+        self.assertEqual(parse_creature_click_groups("no answer here"), [])
+
+    def test_returns_empty_on_malformed_json(self):
+        self.assertEqual(parse_creature_click_groups("<answer>{bad json}</answer>"), [])
+
+    def test_returns_empty_on_non_string_input(self):
+        self.assertEqual(parse_creature_click_groups(None), [])
+        self.assertEqual(parse_creature_click_groups(123), [])
+
+    def test_duplicate_ids_reassigned_sequentially(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"first","clicks":[{"x":0.1,"y":0.1,"label":1}]},'
+            '{"id":1,"description":"duplicate id","clicks":[{"x":0.2,"y":0.2,"label":1}]}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 2)
+        self.assertNotEqual(result[0]["id"], result[1]["id"])
+
+    def test_invalid_label_filtered(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"bad label","clicks":['
+            '{"x":0.5,"y":0.5,"label":2},'
+            '{"x":0.5,"y":0.5,"label":1}'
+            ']}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]["clicks"]), 1)
+        self.assertEqual(result[0]["clicks"][0]["label"], 1)
+
+    def test_takes_last_answer_block(self):
+        text = (
+            '<answer>{"missed_creatures":[{"id":1,"description":"first",'
+            '"clicks":[{"x":0.1,"y":0.1,"label":1}]}]}</answer>\n'
+            'Actually...\n'
+            '<answer>{"missed_creatures":[{"id":1,"description":"final",'
+            '"clicks":[{"x":0.9,"y":0.9,"label":1}]}]}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "final")
+
+
+from nibi_model_compare.som_missed_creatures import Sam3PointService
+
+
+class Sam3PointServiceGroupSegmentTests(unittest.TestCase):
+    """Tests for Sam3PointService.group_segment."""
+
+    def _make_service(self, h=200, w=200):
+        """Return a Sam3PointService with a deterministic fake model."""
+        captured = {}
+
+        class FakeProcessor:
+            def set_image(self, image):
+                captured["set_image"] = True
+                return {"_state": "fake"}
+
+        class FakeModel:
+            def predict_inst(self, state, point_coords, point_labels,
+                             multimask_output=True):
+                captured["point_coords"] = point_coords
+                captured["point_labels"] = point_labels
+                m_small = np.zeros((h, w), dtype=bool)
+                m_small[20:60, 20:60] = True   # 1600 px (in band)
+                m_huge = np.zeros((h, w), dtype=bool)
+                m_huge[0:h, 0:w] = True         # full frame (above max)
+                masks = np.stack([m_small, m_huge], axis=0)
+                scores = np.array([0.9, 0.5], dtype=np.float32)
+                return masks, scores, np.zeros((2, 256, 256), dtype=np.float32)
+
+        self.captured = captured
+        from PIL import Image
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        img_path = os.path.join(tmp, "frame.png")
+        Image.new("RGB", (w, h)).save(img_path)
+        return Sam3PointService(FakeModel(), FakeProcessor()), img_path
+
+    def test_multi_click_group_passes_all_coords_to_predict_inst(self):
+        svc, img_path = self._make_service()
+        groups = [
+            {
+                "id": 1,
+                "description": "elongated worm",
+                "clicks": [
+                    {"x": 0.1, "y": 0.2, "label": 1},
+                    {"x": 0.3, "y": 0.4, "label": 1},
+                ],
+            }
+        ]
+        results = svc.group_segment(img_path, groups)
+        # predict_inst should have received 2 rows
+        self.assertEqual(self.captured["point_coords"].shape[0], 2)
+        self.assertEqual(len(results), 1)
+
+    def test_result_contains_required_keys(self):
+        svc, img_path = self._make_service()
+        groups = [
+            {
+                "id": 5,
+                "description": "test crab",
+                "clicks": [{"x": 0.5, "y": 0.5, "label": 1}],
+            }
+        ]
+        results = svc.group_segment(img_path, groups)
+        self.assertEqual(len(results), 1)
+        r = results[0]
+        for key in ("creature_id", "description", "mask", "score",
+                    "area_px", "select_reason", "spatial_match", "clicks_used"):
+            self.assertIn(key, r, f"Missing key: {key}")
+        self.assertEqual(r["creature_id"], 5)
+        self.assertEqual(r["description"], "test crab")
+        self.assertEqual(r["spatial_match"], "click_mode")
+        self.assertGreater(r["area_px"], 0)
+
+    def test_negative_label_propagates_to_point_labels(self):
+        svc, img_path = self._make_service()
+        groups = [
+            {
+                "id": 2,
+                "description": "crab near substrate",
+                "clicks": [
+                    {"x": 0.5, "y": 0.5, "label": 1},
+                    {"x": 0.2, "y": 0.8, "label": 0},
+                ],
+            }
+        ]
+        svc.group_segment(img_path, groups)
+        labels = list(self.captured["point_labels"])
+        self.assertIn(1, labels)
+        self.assertIn(0, labels)
+
+    def test_empty_group_returns_click_mode_empty(self):
+        svc, img_path = self._make_service()
+        groups = [
+            {"id": 3, "description": "no clicks", "clicks": []},
+        ]
+        results = svc.group_segment(img_path, groups)
+        self.assertEqual(results[0]["spatial_match"], "click_mode_empty")
+        self.assertEqual(results[0]["area_px"], 0)
+        self.assertEqual(results[0]["clicks_used"], [])
+
+    def test_multiple_groups_produce_one_result_each(self):
+        svc, img_path = self._make_service()
+        groups = [
+            {"id": 1, "description": "A", "clicks": [{"x": 0.1, "y": 0.1, "label": 1}]},
+            {"id": 2, "description": "B", "clicks": [{"x": 0.9, "y": 0.9, "label": 1}]},
+        ]
+        results = svc.group_segment(img_path, groups)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["creature_id"], 1)
+        self.assertEqual(results[1]["creature_id"], 2)
+
+
+from nibi_model_compare.som_missed_creatures import render_proposed_click_groups_overlay
+
+
+class RenderProposedClickGroupsTests(unittest.TestCase):
+    H, W = 64, 64
+
+    def _frame(self):
+        return np.zeros((self.H, self.W, 3), dtype=np.uint8) + 80
+
+    def test_returns_same_shape(self):
+        frame = self._frame()
+        groups = [
+            {"id": 1, "description": "crab", "clicks": [{"x": 0.5, "y": 0.5, "label": 1}]},
+        ]
+        out = render_proposed_click_groups_overlay(frame, groups)
+        self.assertEqual(out.shape, frame.shape)
+        self.assertEqual(out.dtype, frame.dtype)
+
+    def test_empty_groups_returns_copy(self):
+        frame = self._frame()
+        out = render_proposed_click_groups_overlay(frame, [])
+        self.assertEqual(out.shape, frame.shape)
+
+    def test_modifies_pixels_for_positive_click(self):
+        frame = self._frame()
+        groups = [
+            {"id": 1, "description": "crab", "clicks": [{"x": 0.5, "y": 0.5, "label": 1}]},
+        ]
+        out = render_proposed_click_groups_overlay(frame, groups)
+        self.assertFalse(np.array_equal(frame, out))
+
+    def test_different_groups_can_coexist(self):
+        frame = self._frame()
+        groups = [
+            {"id": 1, "description": "crab A",
+             "clicks": [{"x": 0.2, "y": 0.2, "label": 1}]},
+            {"id": 2, "description": "crab B",
+             "clicks": [{"x": 0.8, "y": 0.8, "label": 1},
+                        {"x": 0.7, "y": 0.9, "label": 0}]},
+        ]
+        out = render_proposed_click_groups_overlay(frame, groups)
+        self.assertEqual(out.shape, frame.shape)
+        self.assertFalse(np.array_equal(frame, out))
+
+    def test_with_existing_masks_applies_overlay(self):
+        frame = self._frame()
+        yy, xx = np.ogrid[:self.H, :self.W]
+        mask = ((yy - 10) ** 2 + (xx - 10) ** 2) <= 5 * 5
+        groups = [
+            {"id": 1, "description": "crab",
+             "clicks": [{"x": 0.7, "y": 0.7, "label": 1}]},
+        ]
+        out = render_proposed_click_groups_overlay(frame, groups, existing_masks=[{"mask": mask}])
+        self.assertEqual(out.shape, frame.shape)
+        self.assertFalse(np.array_equal(frame, out))
 
 
 if __name__ == "__main__":
