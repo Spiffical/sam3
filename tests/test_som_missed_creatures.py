@@ -547,5 +547,102 @@ class MergeAcceptedMasksTests(unittest.TestCase):
         self.assertEqual(out["added_obj_ids"], [8])
 
 
+from nibi_model_compare.som_missed_creatures import generate_dense_candidates
+
+
+class GenerateDenseCandidatesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        from PIL import Image
+        self.img_path = os.path.join(self.tmp.name, "frame.png")
+        Image.new("RGB", (64, 64)).save(self.img_path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_sam_result(self, path, masks_xy_pairs):
+        """Helper: write a JSON in the shape call_sam_service emits."""
+        import json
+        from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+        rles = []
+        boxes = []
+        for cy, cx, r in masks_xy_pairs:
+            yy, xx = np.ogrid[:64, :64]
+            m = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+            rles.append(encode_binary_mask_to_rle(m))
+            ys, xs = np.where(m)
+            boxes.append([int(xs.min()), int(ys.min()),
+                          int(xs.max() - xs.min() + 1),
+                          int(ys.max() - ys.min() + 1)])
+        payload = {
+            "original_image_path": self.img_path,
+            "orig_img_h": 64,
+            "orig_img_w": 64,
+            "pred_masks": rles,
+            "pred_boxes": boxes,
+            "pred_scores": [0.9] * len(rles),
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f)
+        return path
+
+    def test_calls_sam_per_prompt_and_unions(self):
+        calls = []
+
+        def fake_sam(image_path, text_prompt, output_folder_path):
+            calls.append(text_prompt)
+            n = len(calls)
+            out_path = os.path.join(output_folder_path, f"out_{n}.json")
+            if text_prompt == "creature":
+                return self._write_sam_result(out_path, [(20, 20, 5)])
+            if text_prompt == "animal":
+                return self._write_sam_result(out_path, [(40, 40, 5)])
+            return self._write_sam_result(out_path, [])
+
+        out = generate_dense_candidates(
+            image_path=self.img_path,
+            broad_prompts=["creature", "animal"],
+            output_folder=self.tmp.name,
+            _call_sam_service=fake_sam,
+        )
+        self.assertEqual(calls, ["creature", "animal"])
+        self.assertEqual(len(out), 2)
+        for cand in out:
+            self.assertIn("mask", cand)
+            self.assertIn("bbox_xywh", cand)
+            self.assertIn("score", cand)
+
+    def test_zero_results_returns_empty(self):
+        def fake_sam(image_path, text_prompt, output_folder_path):
+            out_path = os.path.join(output_folder_path, f"out_{text_prompt}.json")
+            return self._write_sam_result(out_path, [])
+
+        out = generate_dense_candidates(
+            image_path=self.img_path,
+            broad_prompts=["creature"],
+            output_folder=self.tmp.name,
+            _call_sam_service=fake_sam,
+        )
+        self.assertEqual(out, [])
+
+    def test_internal_dedup_by_iou(self):
+        # Same prompt produces overlapping masks across calls -> intra-batch dedup
+        def fake_sam(image_path, text_prompt, output_folder_path):
+            n = len([f for f in os.listdir(output_folder_path)
+                     if f.endswith(".json")])
+            out_path = os.path.join(output_folder_path, f"out_{n}.json")
+            return self._write_sam_result(out_path, [(20, 20, 5)])
+
+        out = generate_dense_candidates(
+            image_path=self.img_path,
+            broad_prompts=["creature", "animal"],
+            output_folder=self.tmp.name,
+            _call_sam_service=fake_sam,
+            internal_iou_dedup=0.5,
+        )
+        # Two identical masks -> dedup keeps one
+        self.assertEqual(len(out), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

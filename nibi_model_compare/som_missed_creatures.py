@@ -454,3 +454,76 @@ def filter_candidates_with_reasons(
         results.append((cand, None))
 
     return results
+
+
+DEFAULT_BROAD_PROMPTS = ("creature", "animal", "organism")
+
+
+def generate_dense_candidates(
+    *,
+    image_path: str,
+    broad_prompts=DEFAULT_BROAD_PROMPTS,
+    output_folder: str,
+    internal_iou_dedup: float = 0.5,
+    _call_sam_service=None,
+) -> list:
+    """Produce dense SoM candidates for one frame.
+
+    MVP strategy: run SAM3 text-prompted inference once per broad prompt
+    (e.g. "creature", "animal", "organism"), parse each result file,
+    union the masks, and dedupe intra-batch by IoU.
+
+    Each returned dict has ``{"mask": np.ndarray (bool), "bbox_xywh":
+    [x, y, w, h], "score": float, "source_prompt": str}``.
+
+    The contract is the only thing other components depend on; if smoke
+    tests show poor recall, a real grid-sampled AMG can replace this
+    body without touching downstream code.
+    """
+    import json
+    import os
+
+    import numpy as np
+
+    from nibi_model_compare.frame_output_utils import decode_rle_to_mask
+
+    call_sam = _call_sam_service
+    if call_sam is None:
+        from sam3.agent.client_sam3 import call_sam_service as _live_call
+        call_sam = _live_call
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    pooled = []
+    for prompt in broad_prompts:
+        result_path = call_sam(
+            image_path=image_path,
+            text_prompt=prompt,
+            output_folder_path=output_folder,
+        )
+        with open(result_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        h = payload.get("orig_img_h", 0)
+        w = payload.get("orig_img_w", 0)
+        rles = payload.get("pred_masks") or []
+        boxes = payload.get("pred_boxes") or []
+        scores = payload.get("pred_scores") or [0.0] * len(rles)
+        for rle, bbox, score in zip(rles, boxes, scores):
+            mask = decode_rle_to_mask(rle, h, w).astype(bool)
+            pooled.append({
+                "mask": mask,
+                "bbox_xywh": list(bbox),
+                "score": float(score),
+                "source_prompt": prompt,
+            })
+
+    # Intra-batch dedup by IoU: walk in descending score order, keep cand
+    # only if it has no >iou_dedup overlap with any already-kept mask.
+    pooled.sort(key=lambda c: -c["score"])
+    kept = []
+    for cand in pooled:
+        if any(_mask_iou(cand["mask"], k["mask"]) > internal_iou_dedup
+               for k in kept):
+            continue
+        kept.append(cand)
+    return kept
