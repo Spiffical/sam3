@@ -794,6 +794,8 @@ class FakeSam3PointService:
                 "score": 0.85,
                 "sam_text_prompt": "",
                 "spatial_match": "click_mode",
+                "area_px": int(mask.sum()),
+                "select_reason": "smallest_in_band",
             })
         return results
 
@@ -1184,6 +1186,78 @@ class MergeSomOutputsTests(unittest.TestCase):
                            os.path.join(os.path.dirname(__file__), "..")))
         after = open(self.original_path).read()
         self.assertEqual(before, after)
+
+
+class Sam3PointServiceSelectionTests(unittest.TestCase):
+    def test_picks_smallest_in_band(self):
+        import numpy as np
+        from PIL import Image
+        from nibi_model_compare.som_missed_creatures import Sam3PointService
+
+        H, W = 200, 200
+        # Three masks: tiny (50 px), small-creature (1600 px), huge (30000 px)
+        m_tiny = np.zeros((H, W), dtype=bool); m_tiny[10:15, 10:20] = True
+        m_small = np.zeros((H, W), dtype=bool); m_small[20:60, 20:60] = True
+        m_huge = np.zeros((H, W), dtype=bool); m_huge[10:160, 10:210][:, :200] = True
+
+        captured = {}
+
+        class FakeProcessor:
+            def set_image(self, image):
+                captured["set_image"] = True
+                return {"_state": "fake"}
+
+        class FakeModel:
+            def predict_inst(self, state, point_coords, point_labels,
+                             multimask_output=True):
+                captured["state"] = state
+                # Return masks ordered tiny->small->huge with monotone scores
+                masks = np.stack([m_tiny, m_small, m_huge], axis=0)
+                scores = np.array([0.9, 0.7, 0.5], dtype=np.float32)
+                logits = np.zeros((3, 256, 256), dtype=np.float32)
+                return masks, scores, logits
+
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = os.path.join(tmp, "f.png")
+            Image.new("RGB", (W, H)).save(img_path)
+            svc = Sam3PointService(FakeModel(), FakeProcessor())
+            out = svc.point_segment(img_path, [{"x": 0.5, "y": 0.5, "description": "thing"}])
+            self.assertEqual(len(out), 1)
+            # Should pick m_small (1600 px), not m_tiny (50 px, below min) or m_huge
+            picked_area = int(out[0]["mask"].sum())
+            self.assertEqual(picked_area, int(m_small.sum()))
+            self.assertEqual(out[0]["select_reason"], "smallest_in_band")
+
+    def test_falls_back_when_all_below_min(self):
+        import numpy as np
+        from PIL import Image
+        from nibi_model_compare.som_missed_creatures import Sam3PointService
+
+        H, W = 200, 200
+        # All three masks below the 200-pixel min (image is 200x200=40000 -> min=200)
+        m1 = np.zeros((H, W), dtype=bool); m1[0:5, 0:5] = True       # 25 px
+        m2 = np.zeros((H, W), dtype=bool); m2[10:18, 10:18] = True   # 64 px
+        m3 = np.zeros((H, W), dtype=bool); m3[20:30, 20:30] = True   # 100 px
+
+        class FakeProcessor:
+            def set_image(self, image):
+                return {}
+
+        class FakeModel:
+            def predict_inst(self, state, **kw):
+                masks = np.stack([m1, m2, m3], axis=0)
+                scores = np.array([0.1, 0.5, 0.9], dtype=np.float32)
+                return masks, scores, np.zeros((3, 256, 256), dtype=np.float32)
+
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = os.path.join(tmp, "f.png")
+            Image.new("RGB", (W, H)).save(img_path)
+            svc = Sam3PointService(FakeModel(), FakeProcessor())
+            out = svc.point_segment(img_path, [{"x": 0.5, "y": 0.5, "description": "x"}])
+            # Should fall back to highest score (0.9 -> m3)
+            self.assertEqual(out[0]["select_reason"], "fallback_highest_score")
 
 
 if __name__ == "__main__":

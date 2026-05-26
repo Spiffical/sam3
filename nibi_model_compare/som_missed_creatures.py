@@ -797,18 +797,66 @@ class Sam3PointService:
                     "score": 0.0,
                     "sam_text_prompt": "",
                     "spatial_match": "click_mode_empty",
+                    "area_px": 0,
+                    "select_reason": "empty_output",
                 })
                 continue
 
-            best_idx = int(np.argmax(scores_np))
+            # masks_np: (N, H, W) bool
+            # scores_np: (N,) float
+            # Compute area for each mask
+            areas = masks_np.reshape(masks_np.shape[0], -1).sum(axis=1)
+
+            img_h, img_w = masks_np.shape[1], masks_np.shape[2]
+            total_pixels = float(img_h * img_w)
+
+            # Hard-coded sensible defaults; could be plumbed through cfg later.
+            # Reuse the same filter thresholds the candidate filter uses downstream,
+            # but applied here per-mask to pick the right scale BEFORE downstream
+            # filtering. Use the smaller of (1% of image area, 200 px) as min, and
+            # the same max_area_frac the driver passes to filter_candidates_with_reasons.
+            min_area_for_selection = max(200, int(0.001 * total_pixels))
+            max_area_for_selection = 0.5 * total_pixels  # 50% — same convention as filter step
+
+            # Eligible: masks within the area band, sorted ascending by area
+            eligible = [
+                (a, i) for i, a in enumerate(areas)
+                if min_area_for_selection <= a <= max_area_for_selection
+            ]
+            eligible.sort()  # smallest first
+
+            if eligible:
+                _area, best_idx = eligible[0]   # smallest mask in the acceptable range
+                select_reason = "smallest_in_band"
+            else:
+                # No mask in the band -> pick the smallest above min_area regardless
+                # of upper bound (could be a large object spanning the frame; better
+                # than nothing), or fall back to highest score if all are too small.
+                above_min = [(a, i) for i, a in enumerate(areas) if a >= min_area_for_selection]
+                if above_min:
+                    above_min.sort()
+                    _area, best_idx = above_min[0]
+                    select_reason = "smallest_above_min"
+                else:
+                    best_idx = int(np.argmax(scores_np))
+                    select_reason = "fallback_highest_score"
+
             best_mask = masks_np[best_idx].astype(bool)
             best_score = float(scores_np[best_idx])
+
+            print(
+                f"[som] click '{click.get('description')!r}' -> "
+                f"mask area {int(best_mask.sum())}/{int(total_pixels)} "
+                f"({best_mask.sum() / total_pixels * 100:.1f}%) reason={select_reason} score={best_score:.3f}"
+            )
 
             results.append({
                 "mask": best_mask,
                 "score": best_score,
                 "sam_text_prompt": "",
                 "spatial_match": "click_mode",
+                "area_px": int(best_mask.sum()),
+                "select_reason": select_reason,
             })
 
         return results
