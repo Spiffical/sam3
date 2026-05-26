@@ -160,5 +160,100 @@ class SelectTargetFramesTests(unittest.TestCase):
         self.assertEqual(out, [0])
 
 
+import numpy as np
+
+from nibi_model_compare.som_missed_creatures import filter_candidates
+
+
+def _disk_mask(h, w, cy, cx, r):
+    yy, xx = np.ogrid[:h, :w]
+    return ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+
+
+def _bbox(mask):
+    ys, xs = np.where(mask)
+    return [int(xs.min()), int(ys.min()),
+            int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)]
+
+
+def _cand(mask, score=0.9):
+    return {"mask": mask, "bbox_xywh": _bbox(mask), "score": score}
+
+
+class FilterCandidatesTests(unittest.TestCase):
+    H, W = 64, 64
+
+    def test_drops_high_iou_against_existing(self):
+        cand_mask = _disk_mask(self.H, self.W, 20, 20, 6)
+        existing_mask = _disk_mask(self.H, self.W, 20, 20, 6)  # identical
+        candidates = [_cand(cand_mask)]
+        existing = [{"mask": existing_mask}]
+        out = filter_candidates(
+            candidates, existing,
+            iou_dedup=0.3, min_area_px=4, max_area_frac=0.5,
+            edge_tol_px=2,
+        )
+        self.assertEqual(out, [])
+
+    def test_keeps_low_iou_against_existing(self):
+        cand_mask = _disk_mask(self.H, self.W, 20, 20, 6)
+        existing_mask = _disk_mask(self.H, self.W, 50, 50, 6)
+        out = filter_candidates(
+            [_cand(cand_mask)], [{"mask": existing_mask}],
+            iou_dedup=0.3, min_area_px=4, max_area_frac=0.5,
+            edge_tol_px=2,
+        )
+        self.assertEqual(len(out), 1)
+
+    def test_drops_too_small(self):
+        tiny = _disk_mask(self.H, self.W, 20, 20, 1)  # ~5 px
+        out = filter_candidates(
+            [_cand(tiny)], [],
+            iou_dedup=0.3, min_area_px=20, max_area_frac=0.5,
+            edge_tol_px=2,
+        )
+        self.assertEqual(out, [])
+
+    def test_drops_too_large(self):
+        huge = np.ones((self.H, self.W), dtype=bool)  # full frame
+        out = filter_candidates(
+            [_cand(huge)], [],
+            iou_dedup=0.3, min_area_px=4, max_area_frac=0.5,
+            edge_tol_px=2,
+        )
+        self.assertEqual(out, [])
+
+    def test_drops_multi_edge_clipped(self):
+        # touches top + left edges
+        m = np.zeros((self.H, self.W), dtype=bool)
+        m[0:10, 0:10] = True
+        out = filter_candidates(
+            [_cand(m)], [],
+            iou_dedup=0.3, min_area_px=4, max_area_frac=0.5,
+            edge_tol_px=2,
+        )
+        self.assertEqual(out, [])
+
+    def test_keeps_single_edge_clipped(self):
+        # touches only top
+        m = np.zeros((self.H, self.W), dtype=bool)
+        m[0:10, 20:30] = True
+        out = filter_candidates(
+            [_cand(m)], [],
+            iou_dedup=0.3, min_area_px=4, max_area_frac=0.5,
+            edge_tol_px=2,
+        )
+        self.assertEqual(len(out), 1)
+
+    def test_no_existing_masks_keeps_valid_candidates(self):
+        m = _disk_mask(self.H, self.W, 30, 30, 6)
+        out = filter_candidates(
+            [_cand(m)], [],
+            iou_dedup=0.3, min_area_px=4, max_area_frac=0.5,
+            edge_tol_px=2,
+        )
+        self.assertEqual(len(out), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

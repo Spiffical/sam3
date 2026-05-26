@@ -151,3 +151,106 @@ def _motion_keyframe_selector(valid_rows: list[dict], k: int) -> list[int]:
     if not indices:
         return []
     return _uniform_pick(indices, k)
+
+
+def _mask_iou(a, b) -> float:
+    """IoU of two boolean numpy masks of the same shape."""
+    import numpy as np
+
+    a = np.asarray(a, dtype=bool)
+    b = np.asarray(b, dtype=bool)
+    inter = int(np.logical_and(a, b).sum())
+    if inter == 0:
+        return 0.0
+    union = int(np.logical_or(a, b).sum())
+    return inter / max(1, union)
+
+
+def _touches_edges(mask, edge_tol_px: int) -> int:
+    """Number of frame edges (top/bottom/left/right) the mask touches
+    within ``edge_tol_px`` pixels."""
+    import numpy as np
+
+    h, w = mask.shape
+    t = edge_tol_px
+    count = 0
+    if mask[:t, :].any():
+        count += 1
+    if mask[h - t:, :].any():
+        count += 1
+    if mask[:, :t].any():
+        count += 1
+    if mask[:, w - t:].any():
+        count += 1
+    return count
+
+
+def filter_candidates(
+    candidates: list[dict],
+    existing_masks: list[dict],
+    *,
+    iou_dedup: float,
+    min_area_px: float,
+    max_area_frac: float,
+    edge_tol_px: int,
+) -> list[dict]:
+    """Filter dense SoM candidates.
+
+    Drops:
+      - candidates whose mask has IoU > iou_dedup against ANY existing mask
+      - candidates with area < min_area_px
+      - candidates with area > max_area_frac * (H * W)
+      - candidates that touch the frame edge on more than one side
+
+    Returns the surviving candidates in the same order they were given.
+    Callers that want the full pre-filter list with drop reasons should call
+    ``filter_candidates_with_reasons`` instead (see below).
+    """
+    return [c for c, reason in filter_candidates_with_reasons(
+        candidates, existing_masks,
+        iou_dedup=iou_dedup, min_area_px=min_area_px,
+        max_area_frac=max_area_frac, edge_tol_px=edge_tol_px,
+    ) if reason is None]
+
+
+def filter_candidates_with_reasons(
+    candidates: list[dict],
+    existing_masks: list[dict],
+    *,
+    iou_dedup: float,
+    min_area_px: float,
+    max_area_frac: float,
+    edge_tol_px: int,
+) -> list[tuple[dict, str | None]]:
+    """Like ``filter_candidates`` but returns ``(candidate, drop_reason)``
+    for every input candidate so debug artefacts can log filter
+    decisions. ``drop_reason`` is None for survivors.
+    """
+    import numpy as np
+
+    results: list[tuple[dict, str | None]] = []
+    existing_arrays = [np.asarray(e["mask"], dtype=bool) for e in existing_masks]
+
+    for cand in candidates:
+        mask = np.asarray(cand["mask"], dtype=bool)
+        h, w = mask.shape
+        area = int(mask.sum())
+
+        if area < min_area_px:
+            results.append((cand, "too_small"))
+            continue
+        if area > max_area_frac * h * w:
+            results.append((cand, "too_large"))
+            continue
+        if _touches_edges(mask, edge_tol_px) > 1:
+            results.append((cand, "multi_edge_clipped"))
+            continue
+
+        dup = any(_mask_iou(mask, em) > iou_dedup for em in existing_arrays)
+        if dup:
+            results.append((cand, "duplicate_of_existing"))
+            continue
+
+        results.append((cand, None))
+
+    return results
