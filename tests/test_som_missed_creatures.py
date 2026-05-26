@@ -516,6 +516,36 @@ class MergeAcceptedMasksTests(unittest.TestCase):
         merge_accepted_masks_into_row(existing_row, [self._disk_cand(20, 20, 6)])
         self.assertEqual(existing_row["out_obj_ids"], [1])
 
+    def test_numpy_int_existing_obj_ids_yields_python_int_outputs(self):
+        import json
+        existing_row = {
+            "frame_index": 5,
+            "out_obj_ids": [np.int64(1), np.int64(2)],
+            "out_binary_masks_rle": [{}, {}],
+            "out_boxes_xywh": [[0, 0, 1, 1], [0, 0, 1, 1]],
+            "out_probs": [0.9, 0.9],
+            "out_tracker_probs": [0.9, 0.9],
+        }
+        out = merge_accepted_masks_into_row(existing_row, [self._disk_cand(20, 20, 6)])
+        # Roundtrips through JSON without raising
+        serialized = json.dumps(out["out_obj_ids"])
+        self.assertIn("3", serialized)
+        self.assertIsInstance(out["added_obj_ids"][0], int)
+        # Source map keys are stringified
+        self.assertEqual(out["source_per_obj_id"]["3"], "som")
+
+    def test_sparse_existing_obj_ids_continues_from_max(self):
+        existing_row = {
+            "frame_index": 5,
+            "out_obj_ids": [1, 3, 7],
+            "out_binary_masks_rle": [{}, {}, {}],
+            "out_boxes_xywh": [[0, 0, 1, 1]] * 3,
+            "out_probs": [0.9] * 3,
+            "out_tracker_probs": [0.9] * 3,
+        }
+        out = merge_accepted_masks_into_row(existing_row, [self._disk_cand(20, 20, 6)])
+        self.assertEqual(out["added_obj_ids"], [8])
+
 
 if __name__ == "__main__":
     unittest.main()

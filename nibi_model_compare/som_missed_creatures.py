@@ -384,8 +384,10 @@ def merge_accepted_masks_into_row(
     from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
 
     row = copy.deepcopy(existing_row)
-    existing_ids = list(row.get("out_obj_ids", []))
-    next_id = (max(existing_ids) + 1) if existing_ids else 1
+    # Normalise to plain int so downstream json.dumps never sees numpy.int64.
+    row["out_obj_ids"] = [int(oid) for oid in row.get("out_obj_ids", [])]
+    existing_ids = row["out_obj_ids"]
+    next_id = (int(max(existing_ids)) + 1) if existing_ids else 1
 
     added_ids: list[int] = []
     for cand in accepted_candidates:
@@ -401,8 +403,9 @@ def merge_accepted_masks_into_row(
 
     row["source"] = "som"
     row["added_obj_ids"] = added_ids
+    added_set = set(added_ids)
     row["source_per_obj_id"] = {
-        str(oid): ("som" if oid in added_ids else "text_agent")
+        str(oid): ("som" if oid in added_set else "text_agent")
         for oid in row["out_obj_ids"]
     }
     return row
