@@ -281,6 +281,86 @@ def draw_numbered_marks(
     return out
 
 
+def build_som_prompt_messages(
+    *,
+    system_prompt: str,
+    target_image_path: str,
+    neighbour_image_paths: list[str],
+    initial_text_prompt: str,
+    num_marks: int,
+) -> list[dict]:
+    """Construct the multi-image SoM prompt for an MLLM call.
+
+    The structure mirrors the agent's existing message shape so the same
+    clients (sam3.agent.client_claude, sam3.agent.client_llm) can dispatch
+    it without modification:
+
+        [
+          {"role": "system", "content": "<system prompt text>"},
+          {"role": "user",   "content": [
+              {"type": "image", "image": "<target>"},
+              {"type": "text",  "text":  "<framing for target>"},
+              {"type": "image", "image": "<neighbour 1>"},
+              ...
+              {"type": "text",  "text":  "<the strict answer-format instruction>"},
+          ]},
+        ]
+
+    Args:
+        system_prompt: the loaded system-prompt body (already includes
+            underwater addendum if applicable).
+        target_image_path: path to the marked target frame.
+        neighbour_image_paths: 0..N unmarked reference frames, given in
+            chronological order. Empty list is fine.
+        initial_text_prompt: the user's original creature query (e.g.
+            "small creatures"), echoed into the prompt for context.
+        num_marks: how many marks were drawn on the target. The MLLM
+            uses this to bound its accepted-marks list.
+
+    Returns: list of two message dicts.
+    """
+    target_blurb = (
+        f"The first image is the target frame, annotated with numbered "
+        f"marks 1..{num_marks} on candidate masks that SAM3 produced "
+        f"and that the text-prompted agent did not already cover."
+    )
+    if neighbour_image_paths:
+        target_blurb += (
+            f" The following {len(neighbour_image_paths)} images are "
+            "unmarked reference frames from times near the target. Use "
+            "them as additional perspectives -- some creatures move and "
+            "some are stationary; do not require motion to accept a "
+            "mark. A persistent biological subject should be visible "
+            "in the reference frames (perhaps with slight lighting or "
+            "viewpoint shifts), while transient artefacts (floating "
+            "debris, glare, lighting flashes) usually are not."
+        )
+
+    answer_instruction = (
+        f"The original creature query is: '{initial_text_prompt}'. "
+        "Decide which of the numbered marks correspond to real biological "
+        "subjects matching that query. Respond with your reasoning in free "
+        "text, then end your response with EXACTLY ONE tag of this form "
+        "and nothing else after it:\n"
+        '<answer>{"accepted_marks": [<int>, ...]}</answer>\n'
+        f"Accepted-mark ids must be in the range 1..{num_marks}. An empty "
+        "list is valid if you do not see any biological subjects."
+    )
+
+    user_content: list[dict] = [
+        {"type": "image", "image": target_image_path},
+        {"type": "text", "text": target_blurb},
+    ]
+    for nb_path in neighbour_image_paths:
+        user_content.append({"type": "image", "image": nb_path})
+    user_content.append({"type": "text", "text": answer_instruction})
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
 def filter_candidates_with_reasons(
     candidates: list[dict],
     existing_masks: list[dict],

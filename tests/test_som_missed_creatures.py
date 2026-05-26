@@ -339,5 +339,82 @@ class DrawNumberedMarksTests(unittest.TestCase):
         self.assertEqual(out.shape, frame.shape)
 
 
+import os
+import tempfile
+
+from nibi_model_compare.som_missed_creatures import build_som_prompt_messages
+
+
+class BuildSomPromptMessagesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.target_path = os.path.join(self.tmp.name, "target.png")
+        self.neighbour_paths = [
+            os.path.join(self.tmp.name, f"n{i}.png") for i in range(4)
+        ]
+        # Create dummy files so the builder doesn't reject them
+        from PIL import Image
+        for p in [self.target_path, *self.neighbour_paths]:
+            Image.new("RGB", (32, 32)).save(p)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_messages_have_system_and_user_roles(self):
+        msgs = build_som_prompt_messages(
+            system_prompt="SYS",
+            target_image_path=self.target_path,
+            neighbour_image_paths=self.neighbour_paths,
+            initial_text_prompt="small creatures",
+            num_marks=5,
+        )
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertEqual(msgs[0]["content"], "SYS")
+        self.assertEqual(msgs[1]["role"], "user")
+
+    def test_user_message_includes_target_then_neighbours(self):
+        msgs = build_som_prompt_messages(
+            system_prompt="SYS",
+            target_image_path=self.target_path,
+            neighbour_image_paths=self.neighbour_paths,
+            initial_text_prompt="creature",
+            num_marks=3,
+        )
+        content = msgs[1]["content"]
+        image_items = [c for c in content if c.get("type") == "image"]
+        self.assertEqual(len(image_items), 1 + len(self.neighbour_paths))
+        self.assertEqual(image_items[0]["image"], self.target_path)
+        for nb_item, nb_path in zip(image_items[1:], self.neighbour_paths):
+            self.assertEqual(nb_item["image"], nb_path)
+
+    def test_user_message_mentions_query_and_num_marks(self):
+        msgs = build_som_prompt_messages(
+            system_prompt="SYS",
+            target_image_path=self.target_path,
+            neighbour_image_paths=self.neighbour_paths,
+            initial_text_prompt="small creatures",
+            num_marks=7,
+        )
+        text_blobs = [
+            c["text"] for c in msgs[1]["content"] if c.get("type") == "text"
+        ]
+        joined = " ".join(text_blobs)
+        self.assertIn("small creatures", joined)
+        self.assertIn("7", joined)
+        self.assertIn("accepted_marks", joined)
+
+    def test_neighbour_list_empty_is_allowed(self):
+        msgs = build_som_prompt_messages(
+            system_prompt="SYS",
+            target_image_path=self.target_path,
+            neighbour_image_paths=[],
+            initial_text_prompt="x",
+            num_marks=1,
+        )
+        content = msgs[1]["content"]
+        image_items = [c for c in content if c.get("type") == "image"]
+        self.assertEqual(len(image_items), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
