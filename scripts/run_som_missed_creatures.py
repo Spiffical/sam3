@@ -81,10 +81,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--bpe-path", default=None,
                    help="Optional BPE path. If unset, uses find_bpe_path() from "
                         "the every-frame script.")
-    # enable_inst_interactivity is required for Sam3PointService; default True.
-    p.add_argument("--no-interactive-predictor", action="store_true",
-                   help="Disable SAM3 interactive predictor (disables click-based "
-                        "discovery; for debugging only).")
 
     # Anthropic / MLLM
     p.add_argument("--claude-model",
@@ -102,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.broad_prompts is not None:
         print(
             "[som] WARNING: --broad-prompts is deprecated and has no effect. "
-            "The discovery step now uses MLLM-proposed clicks + SAM3 point-mode."
+            "The discovery step now uses MLLM-proposed clicks + SAM3 text-mode."
         )
 
     # ---------------------------------------------------------------------------
@@ -122,25 +118,24 @@ def main(argv: list[str] | None = None) -> int:
 
     bpe_path = args.bpe_path or find_bpe_path()
 
-    enable_interactive = not args.no_interactive_predictor
+    # Build the image model without enabling inst_interactivity (matches
+    # run_sam3_agent_every_frame_video.py; the interactive predictor's backbone
+    # is None in this checkout and would crash on set_image -- see Sam3PointService
+    # docstring for details).
     image_model = build_sam3_image_model(
         bpe_path=bpe_path,
         device=args.device,
         checkpoint_path=args.checkpoint_path,
         compile=args.compile,
-        enable_inst_interactivity=enable_interactive,
     )
     image_processor = Sam3Processor(
         image_model, confidence_threshold=args.confidence_threshold
     )
     local_service = LocalSam3Service(image_processor)
 
-    # Build Sam3PointService for click-based discovery
-    if enable_interactive:
-        sam3_point_service = Sam3PointService(image_model)
-    else:
-        sam3_point_service = None
-        print("[som] WARNING: interactive predictor disabled; click discovery will be skipped.")
+    # Sam3PointService now uses text-mode + spatial-filter (workaround for the
+    # backbone-less inst_interactive_predictor bug in this checkout).
+    sam3_point_service = Sam3PointService(local_service.call_service)
 
     # ---------------------------------------------------------------------------
     # Bind the Anthropic Claude callable

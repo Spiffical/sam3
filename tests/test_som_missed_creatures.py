@@ -765,7 +765,13 @@ from nibi_model_compare.som_missed_creatures import (
 
 
 class FakeSam3PointService:
-    """Deterministic fake that returns a center-disk mask for every click."""
+    """Deterministic fake that returns a center-disk mask for every click.
+
+    Updated to match the new Sam3PointService.point_segment signature:
+        point_segment(image_path, clicks, output_folder) -> list[dict]
+    where each click is {x, y, description} and each result is
+    {mask, score, sam_text_prompt, spatial_match}.
+    """
 
     def __init__(self, h=64, w=64, radius=5):
         self.h = h
@@ -773,15 +779,23 @@ class FakeSam3PointService:
         self.radius = radius
         self.calls = []
 
-    def point_segment(self, image_path, points_norm):
-        self.calls.append((image_path, list(points_norm)))
+    def point_segment(self, image_path, clicks, output_folder):
+        self.calls.append((image_path, [dict(c) for c in clicks], output_folder))
         results = []
-        for (x_n, y_n) in points_norm:
+        for click in clicks:
+            x_n = click["x"]
+            y_n = click["y"]
+            desc = click.get("description") or "creature"
             cx = int(round(x_n * self.w))
             cy = int(round(y_n * self.h))
             yy, xx = np.ogrid[:self.h, :self.w]
             mask = ((yy - cy) ** 2 + (xx - cx) ** 2) <= self.radius ** 2
-            results.append({"mask": mask, "score": 0.85})
+            results.append({
+                "mask": mask,
+                "score": 0.85,
+                "sam_text_prompt": desc,
+                "spatial_match": "contains",
+            })
         return results
 
 

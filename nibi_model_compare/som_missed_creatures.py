@@ -709,50 +709,154 @@ def render_proposed_clicks_overlay(
 
 
 class Sam3PointService:
-    """Wraps a Sam3Image model's inst_interactive_predictor for point-mode
-    inference on individual images. Stateless across calls (calls set_image
-    each time)."""
+    """Workaround: SAM3 image point-mode isn't usable in this checkout
+    (the bundled inst_interactive_predictor lacks a backbone). Instead,
+    use SAM3 in text-mode with the MLLM's per-click description as the
+    prompt, then spatially filter the returned masks to keep the one
+    containing or nearest to the click point.
 
-    def __init__(self, sam3_image_model):
-        self.model = sam3_image_model
-        if (
-            not hasattr(self.model, "inst_interactive_predictor")
-            or self.model.inst_interactive_predictor is None
-        ):
-            raise RuntimeError(
-                "Sam3Image model was built without inst_interactive_predictor; "
-                "rebuild with enable_inst_interactivity=True."
-            )
-        self.predictor = self.model.inst_interactive_predictor
+    Background on the bug worked around here:
+        ``sam3/model_builder.py`` builds ``inst_interactive_predictor``
+        via ``build_tracker(apply_temporal_disambiguation=False)`` without
+        ``with_backbone=True``, so the tracker's ``self.backbone`` is
+        ``None``. Calling ``SAM3InteractiveImagePredictor.set_image`` then
+        crashes with ``AttributeError: 'NoneType' object has no attribute
+        'forward_image'``. A future fix could share the image model's
+        backbone with the tracker to enable true SAM3 point-mode; until
+        then this text-mode + spatial-filter workaround is used.
+
+    Args:
+        text_service: a callable with the LocalSam3Service.call_service
+            signature: (image_path, text_prompt, output_folder_path) -> json_path.
+        nearest_centroid_radius_frac: when no mask CONTAINS the click,
+            fall back to the nearest mask by centroid distance, but only
+            if that distance is within this fraction of the image's
+            smaller dimension. Default 0.2.
+    """
+
+    def __init__(self, text_service, *, nearest_centroid_radius_frac: float = 0.2):
+        self.text_service = text_service
+        self.nearest_centroid_radius_frac = nearest_centroid_radius_frac
 
     def point_segment(
-        self, image_path: str, points_norm: list[tuple[float, float]]
+        self, image_path: str, clicks: list[dict], output_folder: str,
     ) -> list[dict]:
-        """For each normalised (x, y) point, run SAM3 image point-mode and
-        return the best mask. Returns list of {"mask": bool ndarray, "score": float}."""
-        from PIL import Image
+        """For each click {x, y, description}, run SAM3 text-mode with the
+        description and spatial-filter the returned masks to keep the one
+        that contains the click (or, if none contain it, the nearest mask
+        by centroid distance within nearest_centroid_radius_frac of the
+        smaller image dimension).
+
+        Returns list of dicts (one per input click) shaped like:
+            {"mask": np.ndarray (bool, HxW),
+             "score": float,
+             "sam_text_prompt": str,
+             "spatial_match": "contains" | "nearest" | "none"}
+        where mask is all-False if spatial_match == "none" (caller's
+        filter_candidates_with_reasons will then drop it as too_small).
+        """
+        import json
+        import os
         import numpy as np
+        from PIL import Image
+        from nibi_model_compare.frame_output_utils import decode_rle_to_mask
 
+        os.makedirs(output_folder, exist_ok=True)
         pil = Image.open(image_path).convert("RGB")
-        w, h = pil.size
-        self.predictor.set_image(pil)
+        img_w, img_h = pil.size
+        smaller_side = min(img_w, img_h)
+        nearest_radius_px = self.nearest_centroid_radius_frac * smaller_side
 
-        out = []
-        for (x_n, y_n) in points_norm:
-            x_px = float(x_n) * w
-            y_px = float(y_n) * h
-            point_coords = np.array([[x_px, y_px]], dtype=np.float32)
-            point_labels = np.array([1], dtype=np.int64)
-            masks, scores, _low = self.predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                multimask_output=False,
-                normalize_coords=True,
+        out: list[dict] = []
+        for click in clicks:
+            desc = (click.get("description") or "").strip()
+            if not desc:
+                # Fall back to a generic prompt if MLLM didn't give a description
+                desc = "creature"
+
+            click_x_px = float(click["x"]) * img_w
+            click_y_px = float(click["y"]) * img_h
+
+            result_path = self.text_service(
+                image_path=image_path,
+                text_prompt=desc,
+                output_folder_path=output_folder,
             )
-            # masks shape: (1, H, W) bool or float -- convert to bool
-            m = np.asarray(masks[0]).astype(bool)
-            s = float(scores[0])
-            out.append({"mask": m, "score": s})
+            with open(result_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            rles = payload.get("pred_masks") or []
+            scores = payload.get("pred_scores") or [0.0] * len(rles)
+            h = int(payload.get("orig_img_h") or img_h)
+            w = int(payload.get("orig_img_w") or img_w)
+
+            # Decode each mask (safe — wrap in try/except like the driver does)
+            masks: list[tuple[np.ndarray, float]] = []
+            for rle, score in zip(rles, scores):
+                try:
+                    size = rle.get("size", []) if isinstance(rle, dict) else []
+                    if len(size) >= 2:
+                        h_rle, w_rle = int(size[0]), int(size[1])
+                    else:
+                        h_rle, w_rle = h, w
+                    m = decode_rle_to_mask(rle, h_rle, w_rle).astype(bool)
+                    masks.append((m, float(score)))
+                except Exception:
+                    continue
+
+            if not masks:
+                # SAM3 text mode found nothing for the description
+                out.append({
+                    "mask": np.zeros((img_h, img_w), dtype=bool),
+                    "score": 0.0,
+                    "sam_text_prompt": desc,
+                    "spatial_match": "none",
+                })
+                continue
+
+            # Spatial filter: prefer the highest-scoring mask whose pixel-set
+            # contains the click point.
+            cy_int = int(round(click_y_px))
+            cx_int = int(round(click_x_px))
+            cy_int = max(0, min(masks[0][0].shape[0] - 1, cy_int))
+            cx_int = max(0, min(masks[0][0].shape[1] - 1, cx_int))
+
+            containing = [(m, s) for (m, s) in masks if m[cy_int, cx_int]]
+            if containing:
+                best_m, best_s = max(containing, key=lambda ms: ms[1])
+                out.append({
+                    "mask": best_m,
+                    "score": best_s,
+                    "sam_text_prompt": desc,
+                    "spatial_match": "contains",
+                })
+                continue
+
+            # Fallback: nearest mask by centroid distance
+            def centroid_dist(m):
+                ys, xs = np.where(m)
+                if len(ys) == 0:
+                    return float("inf")
+                mcx = xs.mean()
+                mcy = ys.mean()
+                return ((mcx - click_x_px) ** 2 + (mcy - click_y_px) ** 2) ** 0.5
+
+            nearest_m, nearest_s = min(masks, key=lambda ms: centroid_dist(ms[0]))
+            if centroid_dist(nearest_m) <= nearest_radius_px:
+                out.append({
+                    "mask": nearest_m,
+                    "score": nearest_s,
+                    "sam_text_prompt": desc,
+                    "spatial_match": "nearest",
+                })
+            else:
+                out.append({
+                    "mask": np.zeros((img_h, img_w), dtype=bool),
+                    "score": 0.0,
+                    "sam_text_prompt": desc,
+                    "spatial_match": "none",
+                })
+
         return out
 
 
@@ -821,31 +925,42 @@ def generate_click_based_candidates(
     if not clicks:
         return [], [], response_text
 
-    # 3. SAM3 point-mode per click
-    points_norm = [(c["x"], c["y"]) for c in clicks]
-    sam_results = sam3_point_service.point_segment(target_image_path, points_norm)
+    # 3. SAM3 text-mode per click (spatial-filter workaround for broken point-mode)
+    sam_out_folder = os.path.join(output_folder, "sam_text_out")
+    sam_results = sam3_point_service.point_segment(
+        target_image_path, clicks, output_folder=sam_out_folder,
+    )
 
     candidates = []
     for click, sam_out in zip(clicks, sam_results):
         mask = sam_out["mask"]
         if not mask.any():
-            continue
-        ys, xs = np.where(mask)
-        bbox = [
-            int(xs.min()),
-            int(ys.min()),
-            int(xs.max() - xs.min() + 1),
-            int(ys.max() - ys.min() + 1),
-        ]
-        candidates.append(
-            {
+            # spatial_match == "none" or empty -> filter step will drop it.
+            # Still record it as a candidate so debug artefacts capture the attempt.
+            # filter_candidates_with_reasons will mark drop_reason="too_small".
+            candidates.append({
                 "mask": mask,
-                "bbox_xywh": bbox,
-                "score": float(sam_out["score"]),
+                "bbox_xywh": [0, 0, 0, 0],
+                "score": 0.0,
                 "source_prompt": f"click[{click['description']}]",
                 "click_xy_norm": (click["x"], click["y"]),
-            }
-        )
+                "sam_text_prompt": sam_out["sam_text_prompt"],
+                "spatial_match": sam_out["spatial_match"],
+            })
+            continue
+        ys, xs = np.where(mask)
+        bbox = [int(xs.min()), int(ys.min()),
+                int(xs.max() - xs.min() + 1),
+                int(ys.max() - ys.min() + 1)]
+        candidates.append({
+            "mask": mask,
+            "bbox_xywh": bbox,
+            "score": float(sam_out["score"]),
+            "source_prompt": f"click[{click['description']}]",
+            "click_xy_norm": (click["x"], click["y"]),
+            "sam_text_prompt": sam_out["sam_text_prompt"],
+            "spatial_match": sam_out["spatial_match"],
+        })
 
     return candidates, clicks, response_text
 
