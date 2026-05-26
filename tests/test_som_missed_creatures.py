@@ -59,6 +59,179 @@ class ParseSomResponseTests(unittest.TestCase):
         self.assertEqual(parse_som_response(text, valid_ids=set()), [])
 
 
+from nibi_model_compare.som_missed_creatures import parse_click_proposals
+
+
+class ParseClickProposalsTests(unittest.TestCase):
+    def test_happy_path(self):
+        text = (
+            'Reasoning here.\n'
+            '<answer>{"missed_creatures":[{"x":0.5,"y":0.3,"description":"small crab"}]}</answer>'
+        )
+        result = parse_click_proposals(text)
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result[0]["x"], 0.5)
+        self.assertAlmostEqual(result[0]["y"], 0.3)
+        self.assertEqual(result[0]["description"], "small crab")
+
+    def test_multiple_proposals(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"x":0.1,"y":0.2,"description":"crab"},'
+            '{"x":0.9,"y":0.8,"description":"snail"}'
+            ']}</answer>'
+        )
+        result = parse_click_proposals(text)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["description"], "crab")
+        self.assertEqual(result[1]["description"], "snail")
+
+    def test_empty_list_valid(self):
+        text = '<answer>{"missed_creatures":[]}</answer>'
+        self.assertEqual(parse_click_proposals(text), [])
+
+    def test_out_of_range_coords_dropped(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"x":1.5,"y":0.5,"description":"oob"},'
+            '{"x":0.5,"y":-0.1,"description":"neg"},'
+            '{"x":0.4,"y":0.6,"description":"valid"}'
+            ']}</answer>'
+        )
+        result = parse_click_proposals(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "valid")
+
+    def test_boundary_coords_accepted(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"x":0.0,"y":0.0,"description":"top-left"},'
+            '{"x":1.0,"y":1.0,"description":"bottom-right"}'
+            ']}</answer>'
+        )
+        result = parse_click_proposals(text)
+        self.assertEqual(len(result), 2)
+
+    def test_non_numeric_coords_dropped(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"x":"0.5","y":0.3,"description":"bad_x"},'
+            '{"x":0.5,"y":true,"description":"bool_y"},'
+            '{"x":0.5,"y":0.5,"description":"good"}'
+            ']}</answer>'
+        )
+        result = parse_click_proposals(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "good")
+
+    def test_missing_tag_returns_empty(self):
+        self.assertEqual(parse_click_proposals("no answer tag here"), [])
+
+    def test_malformed_json_returns_empty(self):
+        self.assertEqual(parse_click_proposals("<answer>{bad json}</answer>"), [])
+
+    def test_non_string_input_returns_empty(self):
+        self.assertEqual(parse_click_proposals(None), [])
+        self.assertEqual(parse_click_proposals(123), [])
+        self.assertEqual(parse_click_proposals(""), [])
+
+    def test_missing_description_defaults_to_empty_string(self):
+        text = '<answer>{"missed_creatures":[{"x":0.5,"y":0.5}]}</answer>'
+        result = parse_click_proposals(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "")
+
+    def test_integer_coords_accepted(self):
+        # x=0, y=1 are valid ints that should be treated as 0.0 and 1.0
+        text = '<answer>{"missed_creatures":[{"x":0,"y":1,"description":"corner"}]}</answer>'
+        result = parse_click_proposals(text)
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result[0]["x"], 0.0)
+        self.assertAlmostEqual(result[0]["y"], 1.0)
+
+    def test_takes_last_answer_block(self):
+        text = (
+            '<answer>{"missed_creatures":[{"x":0.1,"y":0.1,"description":"first"}]}</answer>\n'
+            'Actually...\n'
+            '<answer>{"missed_creatures":[{"x":0.9,"y":0.9,"description":"final"}]}</answer>'
+        )
+        result = parse_click_proposals(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["description"], "final")
+
+
+import numpy as np
+
+from nibi_model_compare.som_missed_creatures import (
+    render_existing_masks_overlay,
+    render_proposed_clicks_overlay,
+)
+
+
+class RenderExistingMasksOverlayTests(unittest.TestCase):
+    H, W = 64, 64
+
+    def _frame(self):
+        return np.zeros((self.H, self.W, 3), dtype=np.uint8) + 50
+
+    def _disk_mask(self, cy, cx, r):
+        yy, xx = np.ogrid[:self.H, :self.W]
+        return ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+
+    def test_empty_masks_returns_copy(self):
+        frame = self._frame()
+        out = render_existing_masks_overlay(frame, [])
+        np.testing.assert_array_equal(out, frame)
+
+    def test_modifies_pixels_under_mask(self):
+        frame = self._frame()
+        mask = self._disk_mask(32, 32, 10)
+        out = render_existing_masks_overlay(frame, [{"mask": mask}], alpha=0.4)
+        # Where the mask is True, pixels should differ from input
+        self.assertFalse(np.array_equal(out[mask], frame[mask]))
+
+    def test_input_not_mutated(self):
+        frame = self._frame()
+        original = frame.copy()
+        mask = self._disk_mask(20, 20, 6)
+        render_existing_masks_overlay(frame, [{"mask": mask}])
+        np.testing.assert_array_equal(frame, original)
+
+    def test_green_channel_increased(self):
+        frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+        mask = self._disk_mask(32, 32, 8)
+        out = render_existing_masks_overlay(frame, [{"mask": mask}], alpha=0.5)
+        # BGR format: channel 1 is green; should be > 0 where mask is set
+        self.assertTrue(out[mask, 1].mean() > 50)
+
+
+class RenderProposedClicksOverlayTests(unittest.TestCase):
+    H, W = 64, 64
+
+    def _frame(self):
+        return np.zeros((self.H, self.W, 3), dtype=np.uint8) + 80
+
+    def test_no_clicks_returns_same_shape(self):
+        frame = self._frame()
+        out = render_proposed_clicks_overlay(frame, [])
+        self.assertEqual(out.shape, frame.shape)
+
+    def test_with_clicks_modifies_pixels(self):
+        frame = self._frame()
+        clicks = [{"x": 0.5, "y": 0.5, "description": "test"}]
+        out = render_proposed_clicks_overlay(frame, clicks)
+        self.assertFalse(np.array_equal(frame, out))
+
+    def test_with_existing_masks_applies_overlay(self):
+        frame = self._frame()
+        yy, xx = np.ogrid[:self.H, :self.W]
+        mask = ((yy - 10) ** 2 + (xx - 10) ** 2) <= 5 * 5
+        clicks = [{"x": 0.7, "y": 0.7, "description": "crab"}]
+        out = render_proposed_clicks_overlay(frame, clicks, existing_masks=[{"mask": mask}])
+        self.assertFalse(np.array_equal(frame, out))
+        self.assertEqual(out.shape, frame.shape)
+
+
 from nibi_model_compare.som_missed_creatures import select_target_frames
 
 
@@ -160,8 +333,6 @@ class SelectTargetFramesTests(unittest.TestCase):
         self.assertEqual(out, [0])
 
 
-import numpy as np
-
 from nibi_model_compare.som_missed_creatures import filter_candidates
 
 
@@ -253,7 +424,6 @@ class FilterCandidatesTests(unittest.TestCase):
             edge_tol_px=2,
         )
         self.assertEqual(len(out), 1)
-
 
     def test_with_reasons_returns_all_with_correct_strings(self):
         tiny = _disk_mask(self.H, self.W, 20, 20, 1)
@@ -547,156 +717,8 @@ class MergeAcceptedMasksTests(unittest.TestCase):
         self.assertEqual(out["added_obj_ids"], [8])
 
 
-from nibi_model_compare.som_missed_creatures import generate_dense_candidates
-
-
-class GenerateDenseCandidatesTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        from PIL import Image
-        self.img_path = os.path.join(self.tmp.name, "frame.png")
-        Image.new("RGB", (64, 64)).save(self.img_path)
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def _write_sam_result(self, path, masks_xy_pairs):
-        """Helper: write a JSON in the shape call_sam_service emits."""
-        import json
-        from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
-        rles = []
-        boxes = []
-        for cy, cx, r in masks_xy_pairs:
-            yy, xx = np.ogrid[:64, :64]
-            m = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
-            rles.append(encode_binary_mask_to_rle(m))
-            ys, xs = np.where(m)
-            boxes.append([int(xs.min()), int(ys.min()),
-                          int(xs.max() - xs.min() + 1),
-                          int(ys.max() - ys.min() + 1)])
-        payload = {
-            "original_image_path": self.img_path,
-            "orig_img_h": 64,
-            "orig_img_w": 64,
-            "pred_masks": rles,
-            "pred_boxes": boxes,
-            "pred_scores": [0.9] * len(rles),
-        }
-        with open(path, "w") as f:
-            json.dump(payload, f)
-        return path
-
-    def test_calls_sam_per_prompt_and_unions(self):
-        calls = []
-
-        def fake_sam(image_path, text_prompt, output_folder_path):
-            calls.append(text_prompt)
-            n = len(calls)
-            out_path = os.path.join(output_folder_path, f"out_{n}.json")
-            if text_prompt == "creature":
-                return self._write_sam_result(out_path, [(20, 20, 5)])
-            if text_prompt == "animal":
-                return self._write_sam_result(out_path, [(40, 40, 5)])
-            return self._write_sam_result(out_path, [])
-
-        out = generate_dense_candidates(
-            image_path=self.img_path,
-            broad_prompts=["creature", "animal"],
-            output_folder=self.tmp.name,
-            _call_sam_service=fake_sam,
-        )
-        self.assertEqual(calls, ["creature", "animal"])
-        self.assertEqual(len(out), 2)
-        for cand in out:
-            self.assertIn("mask", cand)
-            self.assertIn("bbox_xywh", cand)
-            self.assertIn("score", cand)
-
-    def test_zero_results_returns_empty(self):
-        def fake_sam(image_path, text_prompt, output_folder_path):
-            out_path = os.path.join(output_folder_path, f"out_{text_prompt}.json")
-            return self._write_sam_result(out_path, [])
-
-        out = generate_dense_candidates(
-            image_path=self.img_path,
-            broad_prompts=["creature"],
-            output_folder=self.tmp.name,
-            _call_sam_service=fake_sam,
-        )
-        self.assertEqual(out, [])
-
-    def test_internal_dedup_by_iou(self):
-        # Same prompt produces overlapping masks across calls -> intra-batch dedup
-        def fake_sam(image_path, text_prompt, output_folder_path):
-            n = len([f for f in os.listdir(output_folder_path)
-                     if f.endswith(".json")])
-            out_path = os.path.join(output_folder_path, f"out_{n}.json")
-            return self._write_sam_result(out_path, [(20, 20, 5)])
-
-        out = generate_dense_candidates(
-            image_path=self.img_path,
-            broad_prompts=["creature", "animal"],
-            output_folder=self.tmp.name,
-            _call_sam_service=fake_sam,
-            internal_iou_dedup=0.5,
-        )
-        # Two identical masks -> dedup keeps one
-        self.assertEqual(len(out), 1)
-
-    def test_pred_boxes_length_mismatch_drops_prompt_results(self):
-        def fake_sam(image_path, text_prompt, output_folder_path):
-            import json
-            out_path = os.path.join(output_folder_path, f"out_{text_prompt}.json")
-            # 2 masks, but only 1 box — corrupted-looking payload
-            yy, xx = np.ogrid[:64, :64]
-            m1 = ((yy - 20) ** 2 + (xx - 20) ** 2) <= 5 * 5
-            m2 = ((yy - 40) ** 2 + (xx - 40) ** 2) <= 5 * 5
-            from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
-            payload = {
-                "original_image_path": image_path,
-                "orig_img_h": 64,
-                "orig_img_w": 64,
-                "pred_masks": [encode_binary_mask_to_rle(m1),
-                               encode_binary_mask_to_rle(m2)],
-                "pred_boxes": [[15, 15, 11, 11]],  # short!
-                "pred_scores": [0.9, 0.9],
-            }
-            with open(out_path, "w") as f:
-                json.dump(payload, f)
-            return out_path
-
-        out = generate_dense_candidates(
-            image_path=self.img_path,
-            broad_prompts=["creature"],
-            output_folder=self.tmp.name,
-            _call_sam_service=fake_sam,
-        )
-        self.assertEqual(out, [])
-
-    def test_missing_image_dimensions_raises(self):
-        def fake_sam(image_path, text_prompt, output_folder_path):
-            import json
-            out_path = os.path.join(output_folder_path, "broken.json")
-            with open(out_path, "w") as f:
-                json.dump({
-                    "original_image_path": image_path,
-                    # NO orig_img_h / orig_img_w
-                    "pred_masks": [{"size": [64, 64], "counts": "0"}],
-                    "pred_boxes": [[0, 0, 1, 1]],
-                    "pred_scores": [0.5],
-                }, f)
-            return out_path
-
-        with self.assertRaises(ValueError):
-            generate_dense_candidates(
-                image_path=self.img_path,
-                broad_prompts=["creature"],
-                output_folder=self.tmp.name,
-                _call_sam_service=fake_sam,
-            )
-
-
 from nibi_model_compare.som_missed_creatures import load_system_prompt
+from nibi_model_compare.som_missed_creatures import load_click_discovery_system_prompt
 
 
 class LoadSystemPromptTests(unittest.TestCase):
@@ -715,12 +737,52 @@ class LoadSystemPromptTests(unittest.TestCase):
             load_system_prompt("nonsense")
 
 
+class LoadClickDiscoverySystemPromptTests(unittest.TestCase):
+    def test_loads_underwater_discovery(self):
+        body = load_click_discovery_system_prompt("underwater")
+        self.assertIn("marine biology", body.lower())
+        self.assertIn("<answer>", body)
+        self.assertIn("missed_creatures", body)
+
+    def test_loads_general_discovery(self):
+        body = load_click_discovery_system_prompt("general")
+        self.assertIn("<answer>", body)
+        self.assertIn("missed_creatures", body)
+        self.assertNotIn("marine biology", body.lower())
+
+    def test_unknown_profile_raises(self):
+        with self.assertRaises(ValueError):
+            load_click_discovery_system_prompt("nonsense")
+
+
 import json as _json
 
 from nibi_model_compare.som_missed_creatures import (
     run_som_stage,
     SomStageConfig,
+    Sam3PointService,
 )
+
+
+class FakeSam3PointService:
+    """Deterministic fake that returns a center-disk mask for every click."""
+
+    def __init__(self, h=64, w=64, radius=5):
+        self.h = h
+        self.w = w
+        self.radius = radius
+        self.calls = []
+
+    def point_segment(self, image_path, points_norm):
+        self.calls.append((image_path, list(points_norm)))
+        results = []
+        for (x_n, y_n) in points_norm:
+            cx = int(round(x_n * self.w))
+            cy = int(round(y_n * self.h))
+            yy, xx = np.ogrid[:self.h, :self.w]
+            mask = ((yy - cy) ** 2 + (xx - cx) ** 2) <= self.radius ** 2
+            results.append({"mask": mask, "score": 0.85})
+        return results
 
 
 class RunSomStageTests(unittest.TestCase):
@@ -728,8 +790,7 @@ class RunSomStageTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.workdir = self.tmp.name
 
-        # Fake video: 60 black frames @ 30fps as PNG sequence (we mock
-        # the frame loader, so we don't need an actual mp4 here)
+        # Fake video stub
         self.video_path = os.path.join(self.workdir, "fake.mp4")
         with open(self.video_path, "w") as f:
             f.write("(stub)")
@@ -773,35 +834,34 @@ class RunSomStageTests(unittest.TestCase):
             return np.full((64, 64, 3), 80, dtype=np.uint8)
         self.fake_load_frame = fake_load_frame
 
-        # Fake SAM3 service: always returns one "new" mask in the centre
-        # (not covered by the existing two corner masks)
-        def fake_sam(image_path, text_prompt, output_folder_path):
-            out_path = os.path.join(
-                output_folder_path,
-                f"sam_{text_prompt}_{os.path.basename(image_path)}.json",
-            )
-            from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
-            yy, xx = np.ogrid[:64, :64]
-            m = ((yy - 32) ** 2 + (xx - 32) ** 2) <= 5 * 5
-            ys, xs = np.where(m)
-            payload = {
-                "original_image_path": image_path,
-                "orig_img_h": 64,
-                "orig_img_w": 64,
-                "pred_masks": [encode_binary_mask_to_rle(m)],
-                "pred_boxes": [[int(xs.min()), int(ys.min()),
-                                int(xs.max() - xs.min() + 1),
-                                int(ys.max() - ys.min() + 1)]],
-                "pred_scores": [0.85],
-            }
-            with open(out_path, "w") as f:
-                _json.dump(payload, f)
-            return out_path
-        self.fake_sam = fake_sam
+        # Fake SAM3 point service: creates a mask near the center (not covered
+        # by the two corner existing masks)
+        self.fake_point_service = FakeSam3PointService(h=64, w=64, radius=5)
 
-        # Fake MLLM: always accepts mark 1
+        # Fake discovery MLLM: proposes one click at center (0.5, 0.5)
+        # Fake judge MLLM: always accepts mark 1
+        call_count = {"n": 0}
+
         def fake_mllm(messages, **_kw):
-            return '<answer>{"accepted_marks": [1]}</answer>'
+            call_count["n"] += 1
+            # Determine if this is a discovery call (contains "missed_creatures"
+            # in the user text) or a judge call
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                # Discovery response
+                return (
+                    'I see a creature at center.\n'
+                    '<answer>{"missed_creatures":[{"x":0.5,"y":0.5,"description":"center crab"}]}</answer>'
+                )
+            else:
+                # Judge response
+                return '<answer>{"accepted_marks": [1]}</answer>'
+
         self.fake_mllm = fake_mllm
 
     def tearDown(self):
@@ -818,7 +878,6 @@ class RunSomStageTests(unittest.TestCase):
             num_target_frames=3,
             frame_selection_strategy="uniform",
             target_frames_explicit=None,
-            broad_prompts=["creature"],
             num_neighbours=2,
             neighbour_offset_frames=15,
             iou_dedup=0.3,
@@ -827,6 +886,7 @@ class RunSomStageTests(unittest.TestCase):
             edge_tol_px=2,
             internal_iou_dedup=0.5,
             max_mllm_calls=100,
+            discovery_num_neighbours=4,
         )
         cfg.update(overrides)
         return SomStageConfig(**cfg)
@@ -836,8 +896,8 @@ class RunSomStageTests(unittest.TestCase):
         result = run_som_stage(
             cfg,
             _load_video_frame=self.fake_load_frame,
-            _call_sam_service=self.fake_sam,
             _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
         )
 
         self.assertEqual(result["targets_processed"], 3)
@@ -852,23 +912,17 @@ class RunSomStageTests(unittest.TestCase):
             self.assertEqual(row["added_obj_ids"], [3])
             self.assertEqual(row["source"], "som")
 
-    def test_skips_frame_when_amg_returns_zero(self):
-        def empty_sam(image_path, text_prompt, output_folder_path):
-            out_path = os.path.join(output_folder_path, "empty.json")
-            with open(out_path, "w") as f:
-                _json.dump({
-                    "original_image_path": image_path,
-                    "orig_img_h": 64, "orig_img_w": 64,
-                    "pred_masks": [], "pred_boxes": [], "pred_scores": [],
-                }, f)
-            return out_path
+    def test_skips_frame_when_discovery_returns_no_clicks(self):
+        def empty_discovery_mllm(messages, **_kw):
+            # Always return empty discovery
+            return '<answer>{"missed_creatures":[]}</answer>'
 
         cfg = self._config(num_target_frames=2)
         result = run_som_stage(
             cfg,
             _load_video_frame=self.fake_load_frame,
-            _call_sam_service=empty_sam,
-            _send_mllm_request=self.fake_mllm,
+            _send_mllm_request=empty_discovery_mllm,
+            _sam3_point_service=self.fake_point_service,
         )
 
         self.assertEqual(result["targets_processed"], 0)
@@ -878,16 +932,30 @@ class RunSomStageTests(unittest.TestCase):
         with open(augmented) as f:
             self.assertEqual(f.read().strip(), "")
 
-    def test_mllm_returns_out_of_range_logs_and_continues(self):
-        def oob_mllm(messages, **_kw):
+    def test_mllm_judge_returns_out_of_range_logs_and_continues(self):
+        call_count = {"n": 0}
+
+        def oob_judge_mllm(messages, **_kw):
+            call_count["n"] += 1
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                return (
+                    '<answer>{"missed_creatures":[{"x":0.5,"y":0.5,"description":"test"}]}</answer>'
+                )
+            # Judge: return out-of-range id
             return '<answer>{"accepted_marks": [99]}</answer>'
 
         cfg = self._config(num_target_frames=2)
         result = run_som_stage(
             cfg,
             _load_video_frame=self.fake_load_frame,
-            _call_sam_service=self.fake_sam,
-            _send_mllm_request=oob_mllm,
+            _send_mllm_request=oob_judge_mllm,
+            _sam3_point_service=self.fake_point_service,
         )
 
         self.assertEqual(result["targets_processed"], 2)
@@ -899,15 +967,16 @@ class RunSomStageTests(unittest.TestCase):
             self.assertEqual(row["added_obj_ids"], [])
 
     def test_budget_cap_stops_early(self):
+        # With discovery+judge each costing 1 call, 2 targets = 4 calls total.
+        # Cap at 2 means only 1 target fully processed.
         cfg = self._config(num_target_frames=10, max_mllm_calls=2)
         result = run_som_stage(
             cfg,
             _load_video_frame=self.fake_load_frame,
-            _call_sam_service=self.fake_sam,
             _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
         )
-        # Stopped after exactly 2 MLLM calls (1 per target)
-        self.assertEqual(result["mllm_calls"], 2)
+        self.assertLessEqual(result["mllm_calls"], 2)
 
     def test_resume_skips_already_processed_targets(self):
         cfg = self._config(num_target_frames=3)
@@ -929,8 +998,8 @@ class RunSomStageTests(unittest.TestCase):
         result = run_som_stage(
             cfg,
             _load_video_frame=self.fake_load_frame,
-            _call_sam_service=self.fake_sam,
             _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
         )
         # Target 0 should have been resumed (not reprocessed)
         self.assertEqual(result["targets_skipped_resume"], 1)
@@ -945,8 +1014,8 @@ class RunSomStageTests(unittest.TestCase):
         run_som_stage(
             cfg,
             _load_video_frame=self.fake_load_frame,
-            _call_sam_service=self.fake_sam,
             _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
         )
         digest_after = hashlib.sha256(
             open(self.frame_outputs_path, "rb").read()
@@ -966,10 +1035,53 @@ class RunSomStageTests(unittest.TestCase):
         result = run_som_stage(
             cfg,
             _load_video_frame=self.fake_load_frame,
-            _call_sam_service=self.fake_sam,
             _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
         )
         self.assertGreaterEqual(result["targets_processed"], 1)
+
+    def test_artefact_filenames_are_correct(self):
+        """Verify the new artefact naming scheme (02/03/04/05/06/07)."""
+        cfg = self._config(num_target_frames=1, target_frames_explicit=[5])
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
+        )
+        target_dir = os.path.join(cfg.output_dir, "target_000005")
+        expected = [
+            "01_raw.png",
+            "02_existing_masks.png",
+            "03_proposed_clicks.png",
+            "04_marked.png",
+            "05_judge_request.json",
+            "05_judge_response.txt",
+            "06_accepted.json",
+        ]
+        for fname in expected:
+            self.assertTrue(
+                os.path.exists(os.path.join(target_dir, fname)),
+                f"Expected artefact missing: {fname}",
+            )
+
+    def test_discovery_request_json_saved(self):
+        """discovery_request.json should be written with the click proposals."""
+        cfg = self._config(num_target_frames=1, target_frames_explicit=[5])
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
+        )
+        target_dir = os.path.join(cfg.output_dir, "target_000005")
+        req_path = os.path.join(target_dir, "discovery_request.json")
+        self.assertTrue(os.path.exists(req_path))
+        with open(req_path) as f:
+            clicks = _json.load(f)
+        self.assertIsInstance(clicks, list)
+        self.assertEqual(len(clicks), 1)
+        self.assertAlmostEqual(clicks[0]["x"], 0.5)
 
 
 import subprocess

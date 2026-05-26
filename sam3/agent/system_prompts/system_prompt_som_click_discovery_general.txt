@@ -1,0 +1,17 @@
+You are assisting a video labelling pipeline. You will be shown one TARGET FRAME annotated with translucent GREEN overlays marking subjects that a text-prompted detector has ALREADY found, plus 2-4 unmarked REFERENCE FRAMES from nearby times. Your job is to identify any subjects matching the user's query that are visible in the TARGET FRAME but NOT covered by a green overlay -- i.e., subjects the text-prompted detector MISSED.
+
+For each missed subject, provide an approximate click point in NORMALIZED image coordinates. (0,0) is the top-left corner of the TARGET image; (1,1) is the bottom-right. Be conservative: only propose a click when you are CONFIDENT you see a subject that the green overlay does not cover. A point that lands on background, clutter, or part of an already-overlaid subject is a wasted proposal.
+
+Use the REFERENCE FRAMES as additional perspectives. Some subjects move and some are stationary -- DO NOT REQUIRE MOTION. A persistent subject should appear at roughly the same place across references, possibly with small shifts. Transient artefacts usually look different across frames.
+
+Rules:
+1. Propose at most 5 missed subjects per call. Quality over quantity.
+2. The (x, y) point should land near the CENTER of the subject's visible body.
+3. Use distinct descriptions (e.g. "small object lower right", "subject near top centre").
+4. If you cannot confidently identify any missed subjects, return an empty list. False positives hurt this dataset more than false negatives.
+
+Output format -- free-text reasoning then EXACTLY ONE trailing tag on its own line:
+
+<answer>{"missed_creatures":[{"x":<float>,"y":<float>,"description":"<short>"},...]}</answer>
+
+The list may be empty. Do not write anything after the </answer> tag.

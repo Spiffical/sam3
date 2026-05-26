@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Run the Set-of-Mark missed-creature discovery stage on a video.
 
+Architecture: for each target frame the MLLM proposes click coordinates
+for creatures it identifies as MISSED by the text-agent, then SAM3
+image point-mode segments each click into a candidate mask, and a
+separate MLLM judge step accepts/rejects the numbered candidates.
+
 Spec: docs/superpowers/specs/2026-05-26-som-missed-creature-loop-design.md
 """
 
@@ -18,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from nibi_model_compare.som_missed_creatures import (  # noqa: E402
+    Sam3PointService,
     SomStageConfig,
     run_som_stage,
 )
@@ -25,10 +31,6 @@ from nibi_model_compare.som_missed_creatures import (  # noqa: E402
 
 def _csv_ints(text: str) -> list[int]:
     return [int(x) for x in text.split(",") if x.strip()]
-
-
-def _csv_strs(text: str) -> list[str]:
-    return [x.strip() for x in text.split(",") if x.strip()]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -49,10 +51,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--target-frames", type=_csv_ints, default=None,
                    help="Explicit comma-separated frame indices (overrides "
                         "strategy + num-target-frames).")
-    p.add_argument("--broad-prompts", type=_csv_strs,
-                   default=["creature", "animal", "organism"])
+
+    # Deprecated: --broad-prompts is no longer used; kept as a no-op with a warning.
+    p.add_argument("--broad-prompts", default=None,
+                   help=argparse.SUPPRESS)  # hidden; no-op
+
+    p.add_argument("--discovery-num-neighbours", type=int, default=4,
+                   help="Reference frames per side for MLLM discovery call. "
+                        "Total discovery neighbours = 2 * this.")
     p.add_argument("--num-neighbours", type=int, default=2,
-                   help="Reference frames per side. Total neighbours = 2 * this.")
+                   help="Reference frames per side for MLLM judge call. "
+                        "Total judge neighbours = 2 * this.")
     p.add_argument("--neighbour-offset-frames", type=int, default=30,
                    help="Frame gap between target and each neighbour ring.")
     p.add_argument("--iou-dedup", type=float, default=0.3)
@@ -65,11 +74,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # SAM3 model loading
     p.add_argument("--device", default="cuda")
     p.add_argument("--checkpoint-path", default=None,
-                   help="Path to SAM3 checkpoint. If unset, build_sam3_image_model uses its own default.")
+                   help="Path to SAM3 checkpoint. If unset, build_sam3_image_model "
+                        "uses its own default.")
     p.add_argument("--confidence-threshold", type=float, default=0.5)
     p.add_argument("--compile", action="store_true")
     p.add_argument("--bpe-path", default=None,
-                   help="Optional BPE path. If unset, uses find_bpe_path() from the every-frame script.")
+                   help="Optional BPE path. If unset, uses find_bpe_path() from "
+                        "the every-frame script.")
+    # enable_inst_interactivity is required for Sam3PointService; default True.
+    p.add_argument("--no-interactive-predictor", action="store_true",
+                   help="Disable SAM3 interactive predictor (disables click-based "
+                        "discovery; for debugging only).")
 
     # Anthropic / MLLM
     p.add_argument("--claude-model",
@@ -84,12 +99,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
+    if args.broad_prompts is not None:
+        print(
+            "[som] WARNING: --broad-prompts is deprecated and has no effect. "
+            "The discovery step now uses MLLM-proposed clicks + SAM3 point-mode."
+        )
+
     # ---------------------------------------------------------------------------
     # Load SAM3 runtime dependencies (mirrors run_sam3_agent_every_frame_video.py)
     # ---------------------------------------------------------------------------
-    # LocalSam3Service, find_bpe_path, and ensure_runtime_deps are module-level
-    # definitions in run_sam3_agent_every_frame_video.py and are importable.
-    # Sam3Processor and build_sam3_image_model are populated by ensure_runtime_deps().
     from scripts.run_sam3_agent_every_frame_video import (  # noqa: E402
         LocalSam3Service,
         ensure_runtime_deps,
@@ -99,27 +117,33 @@ def main(argv: list[str] | None = None) -> int:
 
     ensure_runtime_deps()
 
-    # After ensure_runtime_deps() the module globals Sam3Processor and
-    # build_sam3_image_model are populated.
     Sam3Processor = _efv.Sam3Processor
     build_sam3_image_model = _efv.build_sam3_image_model
 
     bpe_path = args.bpe_path or find_bpe_path()
+
+    enable_interactive = not args.no_interactive_predictor
     image_model = build_sam3_image_model(
         bpe_path=bpe_path,
         device=args.device,
         checkpoint_path=args.checkpoint_path,
         compile=args.compile,
+        enable_inst_interactivity=enable_interactive,
     )
     image_processor = Sam3Processor(
         image_model, confidence_threshold=args.confidence_threshold
     )
     local_service = LocalSam3Service(image_processor)
 
+    # Build Sam3PointService for click-based discovery
+    if enable_interactive:
+        sam3_point_service = Sam3PointService(image_model)
+    else:
+        sam3_point_service = None
+        print("[som] WARNING: interactive predictor disabled; click discovery will be skipped.")
+
     # ---------------------------------------------------------------------------
     # Bind the Anthropic Claude callable
-    # image_detail and max_images_per_request are consumed by send_claude_request
-    # via environment variables (same pattern as the every-frame script).
     # ---------------------------------------------------------------------------
     os.environ["SAM3_IMAGE_DETAIL"] = str(args.image_detail)
     os.environ["SAM3_MAX_IMAGES_PER_REQUEST"] = str(max(1, args.max_images_per_request))
@@ -148,7 +172,6 @@ def main(argv: list[str] | None = None) -> int:
     # ---------------------------------------------------------------------------
     # Build config and run
     # ---------------------------------------------------------------------------
-    # Stamp the output dir so reruns are isolated
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(args.output_dir, timestamp)
     os.makedirs(output_dir, exist_ok=True)
@@ -163,7 +186,6 @@ def main(argv: list[str] | None = None) -> int:
         num_target_frames=args.num_target_frames,
         frame_selection_strategy=args.frame_selection_strategy,
         target_frames_explicit=args.target_frames,
-        broad_prompts=args.broad_prompts,
         num_neighbours=args.num_neighbours,
         neighbour_offset_frames=args.neighbour_offset_frames,
         iou_dedup=args.iou_dedup,
@@ -172,13 +194,14 @@ def main(argv: list[str] | None = None) -> int:
         edge_tol_px=args.edge_tol_px,
         internal_iou_dedup=args.internal_iou_dedup,
         max_mllm_calls=args.max_mllm_calls,
+        discovery_num_neighbours=args.discovery_num_neighbours,
     )
 
     print(f"[som] writing artefacts to {output_dir}")
     stats = run_som_stage(
         cfg,
-        _call_sam_service=local_service.call_service,
         _send_mllm_request=send_mllm,
+        _sam3_point_service=sam3_point_service,
     )
     print(f"[som] done: {stats}")
     return 0

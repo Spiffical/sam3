@@ -1,14 +1,18 @@
 """Set-of-Mark missed-creature discovery stage.
 
 Given an existing per-frame text-agent run, on a small set of selected
-target frames: produce dense SAM3 candidates, drop the ones already
-covered, overlay numbered marks, ask the MLLM (with a few unmarked
-reference frames as context) which marks are real biological subjects,
-and write the accepted masks back into the per-frame outputs.
+target frames: use the MLLM to identify what was MISSED by the
+text-prompted detector and propose click coordinates for SAM3 to
+segment.
 
-The MLLM never emits raw (x, y) coordinates -- it selects by mark id.
-This sidesteps the failure mode that killed the prior point-proposal
-loop (commit ae72a4c).
+Architecture:
+  1. Render existing text-agent masks as a translucent overlay.
+  2. Ask MLLM (with overlay + temporal context): identify missed
+     creatures and propose click (x, y) coordinates in normalized space.
+  3. For each proposed click run SAM3 image point-mode → candidate mask.
+  4. Filter candidates (size, dedup) via filter_candidates_with_reasons.
+  5. Render numbered marks on survivors; ask MLLM judge to accept/reject.
+  6. Accepted masks are merged back into the per-frame output.
 
 Spec: docs/superpowers/specs/2026-05-26-som-missed-creature-loop-design.md
 """
@@ -468,6 +472,8 @@ def generate_dense_candidates(
     internal_iou_dedup: float = 0.5,
     _call_sam_service=None,
 ) -> list:
+    """DEPRECATED: broad text prompts produce mostly duplicates of what the
+    text-agent already found. Use generate_click_based_candidates instead."""
     """Produce dense SoM candidates for one frame.
 
     MVP strategy: run SAM3 text-prompted inference once per broad prompt
@@ -579,6 +585,271 @@ def load_system_prompt(profile: str) -> str:
         return f.read()
 
 
+def load_click_discovery_system_prompt(profile: str) -> str:
+    """Load the click-discovery step system prompt for the requested profile.
+
+    ``profile`` is one of: 'underwater', 'general'. Other values raise
+    ValueError. The file is:
+        sam3/agent/system_prompts/system_prompt_som_click_discovery_<profile>.txt
+    """
+    valid = {"underwater", "general"}
+    if profile not in valid:
+        raise ValueError(
+            f"Unknown profile '{profile}'. Expected one of: {sorted(valid)}."
+        )
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(
+        here,
+        "sam3", "agent", "system_prompts",
+        f"system_prompt_som_click_discovery_{profile}.txt",
+    )
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def render_existing_masks_overlay(
+    frame_bgr,
+    existing_masks: list[dict],
+    alpha: float = 0.4,
+):
+    """Render existing text-agent masks as translucent green overlays so the
+    MLLM can see what's already covered when judging what's missed."""
+    import cv2
+    import numpy as np
+
+    out = frame_bgr.copy()
+    for m in existing_masks:
+        mask = np.asarray(m["mask"], dtype=bool)
+        if not mask.any():
+            continue
+        green = np.array([0, 255, 0], dtype=np.float32)  # BGR
+        out_f = out.astype(np.float32)
+        out_f[mask] = (1 - alpha) * out_f[mask] + alpha * green
+        out = out_f.astype(np.uint8)
+        # Outline for crispness
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(out, contours, -1, (0, 200, 0), 1)
+    return out
+
+
+def parse_click_proposals(text: str) -> list[dict]:
+    """Extract list of {x: float, y: float, description: str} from
+    <answer>{"missed_creatures": [{"x": ..., "y": ..., "description": ...}, ...]}</answer>.
+
+    Returns [] for any malformed or missing tag (lenient -- same policy as
+    parse_som_response). Coordinates are accepted only if both x and y
+    are floats in [0, 1]; out-of-range entries are dropped silently.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    matches = _ANSWER_RE.findall(text)
+    if not matches:
+        return []
+    try:
+        payload = json.loads(matches[-1])
+    except json.JSONDecodeError:
+        return []
+    raw = payload.get("missed_creatures") if isinstance(payload, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        x = item.get("x")
+        y = item.get("y")
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            continue
+        if isinstance(y, bool) or not isinstance(y, (int, float)):
+            continue
+        if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
+            continue
+        desc = item.get("description")
+        if not isinstance(desc, str):
+            desc = ""
+        out.append({"x": float(x), "y": float(y), "description": desc})
+    return out
+
+
+def render_proposed_clicks_overlay(
+    frame_bgr,
+    clicks: list[dict],
+    existing_masks: list[dict] | None = None,
+):
+    """Render frame with existing-masks overlay (faint green) + proposed
+    click points (numbered red dots with crosshair) for visualization.
+    Used for debug artefact 03_proposed_clicks.png."""
+    import cv2
+    import numpy as np
+
+    out = (
+        frame_bgr.copy()
+        if existing_masks is None
+        else render_existing_masks_overlay(frame_bgr, existing_masks, alpha=0.2)
+    )
+    h, w = out.shape[:2]
+    for idx, c in enumerate(clicks, start=1):
+        cx = int(round(c["x"] * w))
+        cy = int(round(c["y"] * h))
+        cv2.circle(out, (cx, cy), 12, (0, 0, 255), 2)
+        cv2.circle(out, (cx, cy), 2, (255, 255, 255), -1)
+        cv2.drawMarker(out, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 18, 1)
+        label = str(idx)
+        cv2.putText(
+            out, label, (cx + 14, cy + 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA,
+        )
+        cv2.putText(
+            out, label, (cx + 14, cy + 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 1, cv2.LINE_AA,
+        )
+    return out
+
+
+class Sam3PointService:
+    """Wraps a Sam3Image model's inst_interactive_predictor for point-mode
+    inference on individual images. Stateless across calls (calls set_image
+    each time)."""
+
+    def __init__(self, sam3_image_model):
+        self.model = sam3_image_model
+        if (
+            not hasattr(self.model, "inst_interactive_predictor")
+            or self.model.inst_interactive_predictor is None
+        ):
+            raise RuntimeError(
+                "Sam3Image model was built without inst_interactive_predictor; "
+                "rebuild with enable_inst_interactivity=True."
+            )
+        self.predictor = self.model.inst_interactive_predictor
+
+    def point_segment(
+        self, image_path: str, points_norm: list[tuple[float, float]]
+    ) -> list[dict]:
+        """For each normalised (x, y) point, run SAM3 image point-mode and
+        return the best mask. Returns list of {"mask": bool ndarray, "score": float}."""
+        from PIL import Image
+        import numpy as np
+
+        pil = Image.open(image_path).convert("RGB")
+        w, h = pil.size
+        self.predictor.set_image(pil)
+
+        out = []
+        for (x_n, y_n) in points_norm:
+            x_px = float(x_n) * w
+            y_px = float(y_n) * h
+            point_coords = np.array([[x_px, y_px]], dtype=np.float32)
+            point_labels = np.array([1], dtype=np.int64)
+            masks, scores, _low = self.predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=False,
+                normalize_coords=True,
+            )
+            # masks shape: (1, H, W) bool or float -- convert to bool
+            m = np.asarray(masks[0]).astype(bool)
+            s = float(scores[0])
+            out.append({"mask": m, "score": s})
+        return out
+
+
+def generate_click_based_candidates(
+    *,
+    target_frame_bgr,
+    target_image_path: str,
+    existing_masks: list[dict],
+    neighbour_image_paths: list[str],
+    initial_text_prompt: str,
+    discovery_system_prompt: str,
+    output_folder: str,
+    mllm_send,
+    sam3_point_service,
+) -> tuple[list[dict], list[dict], str | None]:
+    """Returns (candidates, proposed_clicks, mllm_response_text).
+
+    - Renders an existing-masks overlay to disk (for the MLLM to see covered regions).
+    - Asks the MLLM to propose click points for MISSED creatures.
+    - For each click, runs SAM3 image point-mode -> mask.
+    - Returns candidates in the same {mask, bbox_xywh, score, source_prompt} shape
+      that filter_candidates_with_reasons consumes, plus the raw click proposals
+      (for visualization) and the raw MLLM response text (for debug).
+    """
+    import cv2
+    import numpy as np
+
+    os.makedirs(output_folder, exist_ok=True)
+
+    # 1. Render existing-masks overlay
+    overlay = render_existing_masks_overlay(target_frame_bgr, existing_masks)
+    overlay_path = os.path.join(output_folder, "02_existing_masks.png")
+    cv2.imwrite(overlay_path, overlay)
+
+    # 2. Build discovery messages
+    user_text = (
+        f"The first image is the TARGET FRAME with translucent green overlays "
+        f"showing masks already produced by a text-prompted detector with query "
+        f"'{initial_text_prompt}'. The subsequent images are REFERENCE FRAMES "
+        f"from nearby times. Identify any creatures matching '{initial_text_prompt}' "
+        f"that are visible in the TARGET FRAME but NOT covered by the green overlays. "
+        f"For each missed creature, output an approximate (x, y) click point in "
+        f"NORMALIZED coordinates where (0,0) is the top-left and (1,1) is the "
+        f"bottom-right of the TARGET image. Also include a 1-5 word description "
+        f"so we can verify your judgment.\n\n"
+        f"Output format -- free-text reasoning then EXACTLY ONE trailing tag:\n"
+        f'<answer>{{"missed_creatures":[{{"x":<float>,"y":<float>,"description":"<text>"}},...]}}</answer>\n\n'
+        f"An empty list is valid if you see no missed creatures. Prefer fewer "
+        f"high-confidence proposals over many uncertain ones."
+    )
+    messages = [
+        {"role": "system", "content": discovery_system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": overlay_path},
+                {"type": "text", "text": user_text},
+                *[{"type": "image", "image": p} for p in neighbour_image_paths],
+            ],
+        },
+    ]
+
+    response_text = mllm_send(messages)
+    clicks = parse_click_proposals(response_text)
+
+    if not clicks:
+        return [], [], response_text
+
+    # 3. SAM3 point-mode per click
+    points_norm = [(c["x"], c["y"]) for c in clicks]
+    sam_results = sam3_point_service.point_segment(target_image_path, points_norm)
+
+    candidates = []
+    for click, sam_out in zip(clicks, sam_results):
+        mask = sam_out["mask"]
+        if not mask.any():
+            continue
+        ys, xs = np.where(mask)
+        bbox = [
+            int(xs.min()),
+            int(ys.min()),
+            int(xs.max() - xs.min() + 1),
+            int(ys.max() - ys.min() + 1),
+        ]
+        candidates.append(
+            {
+                "mask": mask,
+                "bbox_xywh": bbox,
+                "score": float(sam_out["score"]),
+                "source_prompt": f"click[{click['description']}]",
+                "click_xy_norm": (click["x"], click["y"]),
+            }
+        )
+
+    return candidates, clicks, response_text
+
+
 from dataclasses import dataclass
 
 
@@ -593,7 +864,6 @@ class SomStageConfig:
     num_target_frames: int
     frame_selection_strategy: str
     target_frames_explicit: list[int] | None
-    broad_prompts: list[str]
     num_neighbours: int
     neighbour_offset_frames: int
     iou_dedup: float
@@ -602,6 +872,7 @@ class SomStageConfig:
     edge_tol_px: int
     internal_iou_dedup: float
     max_mllm_calls: int
+    discovery_num_neighbours: int = 4
 
 
 def _load_video_frame_default(video_path: str, frame_index: int):
@@ -657,29 +928,85 @@ def _existing_row_for_frame(frame_outputs: dict, frame_index: int) -> dict:
     }
 
 
+def _save_redacted_messages(messages: list[dict], path: str) -> None:
+    """Write a JSON-serialisable version of the MLLM message list (images
+    replaced by path references rather than raw bytes)."""
+    redacted = []
+    for msg in messages:
+        if isinstance(msg.get("content"), list):
+            items = [
+                ({"type": "image", "image": item["image"]}
+                 if item.get("type") == "image"
+                 else item)
+                for item in msg["content"]
+            ]
+            redacted.append({"role": msg["role"], "content": items})
+        else:
+            redacted.append(msg)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(redacted, f, indent=2)
+
+
+def _load_neighbours(
+    load_frame,
+    video_path: str,
+    target_idx: int,
+    num_neighbours: int,
+    neighbour_offset_frames: int,
+    nb_dir: str,
+    tag: str,
+) -> list[str]:
+    """Load neighbour frames and write them to disk; return path list."""
+    import cv2
+
+    os.makedirs(nb_dir, exist_ok=True)
+    paths: list[str] = []
+    for offset_idx in range(1, num_neighbours + 1):
+        for sign, label in ((-1, "neg"), (+1, "pos")):
+            nb_idx = target_idx + sign * neighbour_offset_frames * offset_idx
+            if nb_idx < 0:
+                continue
+            nb_frame = load_frame(video_path, nb_idx)
+            if nb_frame is None:
+                continue
+            nb_path = os.path.join(nb_dir, f"{tag}_{label}{offset_idx}.png")
+            cv2.imwrite(nb_path, nb_frame)
+            paths.append(nb_path)
+    return paths
+
+
 def run_som_stage(
     cfg: SomStageConfig,
     *,
     _load_video_frame=None,
-    _call_sam_service=None,
     _send_mllm_request=None,
+    _sam3_point_service=None,
 ) -> dict:
     """Run the SoM missed-creature stage end-to-end.
+
+    New architecture (click-discovery):
+      1. Render existing masks as overlay → 02_existing_masks.png
+      2. MLLM discovery call: proposes click (x,y) for missed creatures
+      3. SAM3 image point-mode → candidate masks per click
+      4. filter_candidates_with_reasons (size, dedup)
+      5. draw_numbered_marks → 04_marked.png
+      6. MLLM judge call: accepts/rejects numbered marks
+      7. merge accepted masks into augmented JSONL row
 
     Returns a summary dict with counts. All per-target artefacts and the
     augmented JSONL are written under ``cfg.output_dir``.
 
     Concurrency: this function appends to a single JSONL file with
     per-target flush. It is NOT safe to run two processes concurrently
-    on the same output_dir — there is no file lock around the append.
+    on the same output_dir -- there is no file lock around the append.
     Resume is supported within a single sequential run only.
     """
     import cv2
     import numpy as np
 
     load_frame = _load_video_frame or _load_video_frame_default
-    call_sam = _call_sam_service
     send_mllm = _send_mllm_request or _send_mllm_request_default
+    point_service = _sam3_point_service  # may be None for judge-only tests
 
     os.makedirs(cfg.output_dir, exist_ok=True)
 
@@ -699,7 +1026,8 @@ def run_som_stage(
     already_done = {int(row["frame_index"])
                     for row in _read_jsonl(augmented_path)}
 
-    system_prompt = load_system_prompt(cfg.prompt_profile)
+    judge_system_prompt = load_system_prompt(cfg.prompt_profile)
+    discovery_system_prompt = load_click_discovery_system_prompt(cfg.prompt_profile)
 
     stats = {
         "targets_total": len(targets),
@@ -716,6 +1044,7 @@ def run_som_stage(
             if target_idx in already_done:
                 stats["targets_skipped_resume"] += 1
                 continue
+            # Budget cap counts discovery + judge calls together
             if stats["mllm_calls"] >= cfg.max_mllm_calls:
                 print(f"[som] budget cap reached at {stats['mllm_calls']} mllm calls; stopping.")
                 break
@@ -733,20 +1062,6 @@ def run_som_stage(
             if not cv2.imwrite(target_img_path, target_frame):
                 stats["targets_skipped"] += 1
                 print(f"[som] frame {target_idx}: failed to write target raw PNG; skipping.")
-                continue
-
-            # Dense candidates
-            candidates = generate_dense_candidates(
-                image_path=target_img_path,
-                broad_prompts=list(cfg.broad_prompts),
-                output_folder=os.path.join(target_dir, "sam_out"),
-                internal_iou_dedup=cfg.internal_iou_dedup,
-                _call_sam_service=call_sam,
-            )
-
-            if not candidates:
-                stats["targets_skipped"] += 1
-                print(f"[som] frame {target_idx} no_candidates; skipping.")
                 continue
 
             # Existing text-agent masks for this frame
@@ -769,6 +1084,51 @@ def run_som_stage(
                     )
                     continue
 
+            # --- DISCOVERY step ---
+
+            # Discovery neighbour frames
+            discovery_nb_paths = _load_neighbours(
+                load_frame, cfg.video_path, target_idx,
+                cfg.discovery_num_neighbours, cfg.neighbour_offset_frames,
+                os.path.join(target_dir, "neighbours"), tag="disc",
+            )
+
+            if point_service is not None:
+                candidates, clicks, discovery_resp = generate_click_based_candidates(
+                    target_frame_bgr=target_frame,
+                    target_image_path=target_img_path,
+                    existing_masks=existing_masks,
+                    neighbour_image_paths=discovery_nb_paths,
+                    initial_text_prompt=cfg.initial_text_prompt,
+                    discovery_system_prompt=discovery_system_prompt,
+                    output_folder=target_dir,
+                    mllm_send=send_mllm,
+                    sam3_point_service=point_service,
+                )
+                stats["mllm_calls"] += 1
+
+                # Save discovery artefacts
+                with open(os.path.join(target_dir, "discovery_request.json"), "w") as f:
+                    json.dump(clicks, f, indent=2)
+                with open(os.path.join(target_dir, "discovery_response.txt"), "w") as f:
+                    f.write(discovery_resp or "")
+
+                # Render proposed clicks visualisation → 03_proposed_clicks.png
+                clicks_vis = render_proposed_clicks_overlay(
+                    target_frame, clicks, existing_masks=existing_masks
+                )
+                cv2.imwrite(os.path.join(target_dir, "03_proposed_clicks.png"), clicks_vis)
+            else:
+                # No point service provided (test / fallback): skip discovery
+                candidates = []
+                clicks = []
+
+            if not candidates:
+                stats["targets_skipped"] += 1
+                print(f"[som] frame {target_idx} no_candidates_from_clicks; skipping.")
+                continue
+
+            # --- FILTER candidates ---
             survivors_with_reasons = filter_candidates_with_reasons(
                 candidates, existing_masks,
                 iou_dedup=cfg.iou_dedup,
@@ -798,72 +1158,55 @@ def run_som_stage(
             # Sort by descending area so larger marks get lower ids
             survivors.sort(key=lambda c: -int(np.asarray(c["mask"], dtype=bool).sum()))
 
-            # Render marks
+            # Render marks → 04_marked.png
             marked = draw_numbered_marks(target_frame, survivors)
-            marked_path = os.path.join(target_dir, "02_marked.png")
+            marked_path = os.path.join(target_dir, "04_marked.png")
             if not cv2.imwrite(marked_path, marked):
                 stats["targets_skipped"] += 1
                 print(f"[som] frame {target_idx}: failed to write marked PNG; skipping.")
                 continue
 
-            # Neighbour frames (unmarked)
-            neighbour_paths: list[str] = []
-            nb_dir = os.path.join(target_dir, "neighbours")
-            os.makedirs(nb_dir, exist_ok=True)
-            for offset_idx in range(1, cfg.num_neighbours + 1):
-                for sign, label in ((-1, "neg"), (+1, "pos")):
-                    nb_idx = target_idx + sign * cfg.neighbour_offset_frames * offset_idx
-                    if nb_idx < 0:
-                        continue
-                    nb_frame = load_frame(cfg.video_path, nb_idx)
-                    if nb_frame is None:
-                        continue
-                    nb_path = os.path.join(nb_dir, f"{label}{offset_idx}.png")
-                    cv2.imwrite(nb_path, nb_frame)
-                    neighbour_paths.append(nb_path)
+            # --- JUDGE step ---
 
-            # MLLM call
+            # Check budget before judge call
+            if stats["mllm_calls"] >= cfg.max_mllm_calls:
+                print(f"[som] budget cap reached at {stats['mllm_calls']} mllm calls; stopping.")
+                break
+
+            # Judge neighbour frames (may differ in count from discovery)
+            judge_nb_paths = _load_neighbours(
+                load_frame, cfg.video_path, target_idx,
+                cfg.num_neighbours, cfg.neighbour_offset_frames,
+                os.path.join(target_dir, "neighbours"), tag="judge",
+            )
+
             messages = build_som_prompt_messages(
-                system_prompt=system_prompt,
+                system_prompt=judge_system_prompt,
                 target_image_path=marked_path,
-                neighbour_image_paths=neighbour_paths,
+                neighbour_image_paths=judge_nb_paths,
                 initial_text_prompt=cfg.initial_text_prompt,
                 num_marks=len(survivors),
             )
-            with open(os.path.join(target_dir, "mllm_request.json"), "w") as f:
-                # Don't serialise raw image bytes; just record the structure
-                redacted = []
-                for msg in messages:
-                    if isinstance(msg.get("content"), list):
-                        items = [
-                            ({"type": "image", "image": item["image"]}
-                             if item.get("type") == "image"
-                             else item)
-                            for item in msg["content"]
-                        ]
-                        redacted.append({"role": msg["role"], "content": items})
-                    else:
-                        redacted.append(msg)
-                json.dump(redacted, f, indent=2)
+            _save_redacted_messages(messages, os.path.join(target_dir, "05_judge_request.json"))
 
             response_text = send_mllm(messages)
             stats["mllm_calls"] += 1
-            with open(os.path.join(target_dir, "mllm_response.txt"), "w") as f:
+            with open(os.path.join(target_dir, "05_judge_response.txt"), "w") as f:
                 f.write(response_text or "")
 
             accepted_ids = parse_som_response(
                 response_text,
                 valid_ids=set(range(1, len(survivors) + 1)),
             )
-            accepted_candidates = [
-                survivors[i - 1] for i in accepted_ids
-            ]
-            with open(os.path.join(target_dir, "accepted.json"), "w") as f:
+            accepted_candidates = [survivors[i - 1] for i in accepted_ids]
+            with open(os.path.join(target_dir, "06_accepted.json"), "w") as f:
                 json.dump(accepted_ids, f)
 
-            new_row = merge_accepted_masks_into_row(
-                existing_row, accepted_candidates,
-            )
+            # Render accepted masks → 07_accepted_masks.png
+            accepted_vis = draw_numbered_marks(target_frame, accepted_candidates)
+            cv2.imwrite(os.path.join(target_dir, "07_accepted_masks.png"), accepted_vis)
+
+            new_row = merge_accepted_masks_into_row(existing_row, accepted_candidates)
             out_handle.write(json.dumps(new_row) + "\n")
             out_handle.flush()
 
