@@ -206,6 +206,75 @@ def _parse_tool_call_from_generated_text(generated_text):
     return None
 
 
+def _last_user_has_image_context(messages):
+    """Whether the most recent user message includes any image content item.
+
+    Several follow-up tools (drop_masks, examine_each_mask) assume the prior
+    user turn rendered an image of the current mask state. When the previous
+    user turn is text-only (e.g. a format-repair retry or a "no new masks"
+    response), invoking those tools used to index into a 1-element content
+    list and raise IndexError. Callers should consult this helper before
+    relying on that invariant.
+    """
+    if not messages:
+        return False
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "user":
+        return False
+    content = last.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == "image"
+        for item in content
+    )
+
+
+def _build_invalid_tool_state_redirect_message(tool_name, initial_text_prompt):
+    """Redirect message when a tool is invoked without a rendered-mask turn."""
+    return (
+        f"You called the {tool_name} tool, but there is no rendered mask "
+        "image to act on in the most recent turn. Please call segment_phrase "
+        "with a different, perhaps more general or more creative simple noun "
+        "phrase text_prompt, or call report_no_mask if you do not believe any "
+        f"targets exist. The original user query was: '{initial_text_prompt}'."
+    )
+
+
+def _redirect_for_invalid_tool_state(
+    *, messages, generated_text, tool_name, initial_text_prompt
+):
+    """Append an assistant + user pair that redirects the model away from
+    a tool invocation that cannot be served from the current context (e.g.
+    drop_masks/examine_each_mask called after a text-only user turn).
+    Mutates ``messages`` in place; the surrounding loop handles the next
+    generation round.
+    """
+    print(
+        f"⚠️ {tool_name} invoked without a rendered-mask image in the prior "
+        "turn; redirecting the agent."
+    )
+    messages.append(
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": generated_text}],
+        }
+    )
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": _build_invalid_tool_state_redirect_message(
+                        tool_name, initial_text_prompt
+                    ),
+                }
+            ],
+        }
+    )
+
+
 def _build_tool_format_repair_message(path_to_latest_output_json, initial_text_prompt):
     if path_to_latest_output_json == "":
         valid_names = '["segment_phrase", "report_no_mask"]'
@@ -333,6 +402,55 @@ def _build_malformed_tool_call_fallback(
         return tool_call, _make_tool_call_text(tool_call)
 
     return None
+
+
+def _terminate_for_cap_or_raise(
+    *,
+    path_to_latest_output_json,
+    max_generations,
+    initial_text_prompt,
+    prompt_profile,
+):
+    """Gracefully end a frame when the generation cap is reached.
+
+    Returns a terminating ``(tool_call, generated_text)`` tuple — either
+    ``select_masks_and_return`` over all accumulated masks, or
+    ``report_no_mask`` if none — so the caller can dispatch a final round
+    without making another model call.
+
+    Honours the same ``SAM3_TOOL_CALL_FALLBACK_POLICY`` env var as
+    ``_build_malformed_tool_call_fallback``: when the resolved policy is
+    ``strict_fail`` (the default for non-underwater prompts), this raises
+    ``ValueError`` instead of terminating gracefully.
+    """
+    configured_policy = (
+        os.environ.get("SAM3_TOOL_CALL_FALLBACK_POLICY", "").strip().lower()
+    )
+    if configured_policy:
+        policy = configured_policy
+    else:
+        if (
+            prompt_profile == "underwater"
+            and _is_broad_underwater_creature_query(initial_text_prompt)
+        ):
+            policy = "auto"
+        else:
+            policy = "strict_fail"
+
+    if policy in {"strict", "strict_fail", "off", "none"}:
+        raise ValueError(
+            f"Exceeded maximum number of allowed generation requests ({max_generations})"
+        )
+
+    available = _safe_count_available_masks(path_to_latest_output_json)
+    if available and available > 0:
+        tool_call = {
+            "name": "select_masks_and_return",
+            "parameters": {"final_answer_masks": list(range(1, available + 1))},
+        }
+    else:
+        tool_call = {"name": "report_no_mask", "parameters": {}}
+    return tool_call, _make_tool_call_text(tool_call)
 
 
 def _extract_mask_verdict(generated_text):
@@ -697,16 +815,24 @@ def agent_inference(
                 # Keep parse retries bounded within max_generations as well.
                 generation_count += 1
                 if generation_count > max_generations:
-                    raise ValueError(
-                        f"Exceeded maximum number of allowed generation requests ({max_generations})"
+                    _cap_tool_call, generated_text = _terminate_for_cap_or_raise(
+                        path_to_latest_output_json=PATH_TO_LATEST_OUTPUT_JSON,
+                        max_generations=max_generations,
+                        initial_text_prompt=initial_text_prompt,
+                        prompt_profile=prompt_profile,
                     )
-                print("\n\n")
-                print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
-                print("\n\n")
-                generated_text = send_generate_request(messages)
-                print(
-                    f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
-                )
+                    print(
+                        "⚠️ Max generations exceeded during format-repair retries. "
+                        f"Forcing terminating fallback: {_cap_tool_call}"
+                    )
+                else:
+                    print("\n\n")
+                    print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
+                    print("\n\n")
+                    generated_text = send_generate_request(messages)
+                    print(
+                        f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
+                    )
                 continue
 
         else:
@@ -815,224 +941,233 @@ def agent_inference(
             print("🔍 Calling drop_masks tool...")
             assert PATH_TO_LATEST_OUTPUT_JSON != ""
             assert list(tool_call["parameters"].keys()) == ["mask_indices_to_drop"]
-            assert messages[-1]["content"][1]["type"] == "image", (
-                "Second content element should be an image"
-            )
-            messages.pop()
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "There are currently available masks in memory. You are deleting some of them and then must re-evaluate the remaining masks.",
-                        }
-                    ],
-                }
-            )
-            current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
-            requested_drops = tool_call["parameters"]["mask_indices_to_drop"]
-            available_masks = set(range(1, len(current_outputs["pred_masks"]) + 1))
-            masks_to_drop = sorted({i for i in requested_drops if i in available_masks})
-            masks_to_keep = sorted(i for i in available_masks if i not in set(masks_to_drop))
-
-            updated_outputs = {
-                "original_image_path": current_outputs["original_image_path"],
-                "orig_img_h": current_outputs["orig_img_h"],
-                "orig_img_w": current_outputs["orig_img_w"],
-                "pred_boxes": [current_outputs["pred_boxes"][i - 1] for i in masks_to_keep],
-                "pred_scores": [current_outputs["pred_scores"][i - 1] for i in masks_to_keep],
-                "pred_masks": [current_outputs["pred_masks"][i - 1] for i in masks_to_keep],
-            }
-            state_json_path, _ = _build_state_snapshot_paths(
-                sam_output_dir,
-                img_path,
-                f"available_masks_after_drop_round_{generation_count + 1}",
-            )
-            updated_outputs = _persist_available_outputs(updated_outputs, state_json_path)
-            PATH_TO_LATEST_OUTPUT_JSON = state_json_path
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": generated_text}],
-                }
-            )
-            if len(masks_to_keep) == 0:
+            if not _last_user_has_image_context(messages):
+                _redirect_for_invalid_tool_state(
+                    messages=messages,
+                    generated_text=generated_text,
+                    tool_name="drop_masks",
+                    initial_text_prompt=initial_text_prompt,
+                )
+            else:
+                messages.pop()
                 messages.append(
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"The original user query was: '{initial_text_prompt}'. The drop_masks tool removed all currently available masks from memory. There are now 0 available masks. If you still believe target objects exist, call segment_phrase again with a new text_prompt. Otherwise, you may call report_no_mask.",
+                                "text": "There are currently available masks in memory. You are deleting some of them and then must re-evaluate the remaining masks.",
                             }
                         ],
                     }
                 )
-            else:
+                current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
+                requested_drops = tool_call["parameters"]["mask_indices_to_drop"]
+                available_masks = set(range(1, len(current_outputs["pred_masks"]) + 1))
+                masks_to_drop = sorted({i for i in requested_drops if i in available_masks})
+                masks_to_keep = sorted(i for i in available_masks if i not in set(masks_to_drop))
+
+                updated_outputs = {
+                    "original_image_path": current_outputs["original_image_path"],
+                    "orig_img_h": current_outputs["orig_img_h"],
+                    "orig_img_w": current_outputs["orig_img_w"],
+                    "pred_boxes": [current_outputs["pred_boxes"][i - 1] for i in masks_to_keep],
+                    "pred_scores": [current_outputs["pred_scores"][i - 1] for i in masks_to_keep],
+                    "pred_masks": [current_outputs["pred_masks"][i - 1] for i in masks_to_keep],
+                }
+                state_json_path, _ = _build_state_snapshot_paths(
+                    sam_output_dir,
+                    img_path,
+                    f"available_masks_after_drop_round_{generation_count + 1}",
+                )
+                updated_outputs = _persist_available_outputs(updated_outputs, state_json_path)
+                PATH_TO_LATEST_OUTPUT_JSON = state_json_path
+
                 messages.append(
                     {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"The original user query was: '{initial_text_prompt}'. The drop_masks tool removed mask(s) {masks_to_drop}. There are now {len(masks_to_keep)} available mask(s) left in memory. All remaining available mask(s) are rendered in this image below. Analyze them carefully and determine your next action.",
-                            },
-                            {"type": "image", "image": updated_outputs["output_image_path"]},
-                        ],
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": generated_text}],
                     }
                 )
+                if len(masks_to_keep) == 0:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"The original user query was: '{initial_text_prompt}'. The drop_masks tool removed all currently available masks from memory. There are now 0 available masks. If you still believe target objects exist, call segment_phrase again with a new text_prompt. Otherwise, you may call report_no_mask.",
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"The original user query was: '{initial_text_prompt}'. The drop_masks tool removed mask(s) {masks_to_drop}. There are now {len(masks_to_keep)} available mask(s) left in memory. All remaining available mask(s) are rendered in this image below. Analyze them carefully and determine your next action.",
+                                },
+                                {"type": "image", "image": updated_outputs["output_image_path"]},
+                            ],
+                        }
+                    )
 
         elif tool_call["name"] == "examine_each_mask":
             print("🔍 Calling examine_each_mask tool...")
             assert LATEST_SAM3_TEXT_PROMPT != ""
 
-            # Make sure that the last message is a image
-            assert messages[-1]["content"][1]["type"] == "image", (
-                "Second content element should be an image"
-            )
-            messages.pop()  # Remove the last user message
-            # Add simplified replacement message
-            simplified_message = {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "There are several currently available masks in memory. Now you must analyze the mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action.",
-                    }
-                ],
-            }
-            messages.append(simplified_message)
-
-            current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
-            num_masks = len(current_outputs["pred_masks"])
-            masks_to_keep = []
-
-            # MLLM check the mask one by one
-            for i in range(num_masks):
-                print(f"🔍 Checking mask {i + 1}/{num_masks}...")
-                image_w_mask_i, image_w_zoomed_in_mask_i = visualize(current_outputs, i)
-
-                image_w_zoomed_in_mask_i_path = os.path.join(
-                    sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png".replace("/", "_")
-                ).replace(".png", f"_zoom_in_mask_{i + 1}.png")
-                image_w_mask_i_path = os.path.join(
-                    sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png".replace("/", "_")
-                ).replace(".png", f"_selected_mask_{i + 1}.png")
-                image_w_zoomed_in_mask_i.save(image_w_zoomed_in_mask_i_path)
-                image_w_mask_i.save(image_w_mask_i_path)
-
-                iterative_checking_messages = [
-                    {"role": "system", "content": iterative_checking_system_prompt},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": f"The raw input image: "},
-                            {"type": "image", "image": img_path},
-                            {
-                                "type": "text",
-                                "text": f"The initial user input query is: '{initial_text_prompt}'",
-                            },
-                            {
-                                "type": "text",
-                                "text": f"Image with the predicted segmentation mask rendered on it: ",
-                            },
-                            {"type": "image", "image": image_w_mask_i_path},
-                            {
-                                "type": "text",
-                                "text": f"Image with the zoomed-in mask: ",
-                            },
-                            {"type": "image", "image": image_w_zoomed_in_mask_i_path},
-                        ],
-                    },
-                ]
-                checking_generated_text, verdict = _request_mask_verdict_with_retry(
-                    send_generate_request,
-                    iterative_checking_messages,
-                    max_retries=2,
-                )
-
-                # Process the generated text to determine if the mask should be kept or rejected
-                if checking_generated_text is None:
-                    raise ValueError(
-                        "Generated text is None, which is unexpected. Please check the Qwen server and the input parameters."
-                    )
-                print(f"Generated text for mask {i + 1}: {checking_generated_text}")
-                if verdict is None:
-                    fallback_verdict = (
-                        os.environ.get("SAM3_MASK_CHECK_DEFAULT_VERDICT", "Reject")
-                        .strip()
-                        .capitalize()
-                    )
-                    if fallback_verdict not in {"Accept", "Reject"}:
-                        fallback_verdict = "Reject"
-                    print(
-                        "⚠️ Could not parse Accept/Reject verdict after retries. "
-                        f"Falling back to {fallback_verdict} for mask {i + 1}."
-                    )
-                    verdict = fallback_verdict
-
-                if verdict == "Accept":
-                    print(f"Mask {i + 1} accepted, keeping it in the outputs.")
-                    masks_to_keep.append(i)
-                elif verdict == "Reject":
-                    print(f"Mask {i + 1} rejected, removing it from the outputs.")
-                else:
-                    raise ValueError(
-                        f"Unexpected verdict value '{verdict}' for generated text: {checking_generated_text}. Expected 'Accept' or 'Reject'."
-                    )
-
-            updated_outputs = {
-                "original_image_path": current_outputs["original_image_path"],
-                "orig_img_h": current_outputs["orig_img_h"],
-                "orig_img_w": current_outputs["orig_img_w"],
-                "pred_boxes": [current_outputs["pred_boxes"][i] for i in masks_to_keep],
-                "pred_scores": [
-                    current_outputs["pred_scores"][i] for i in masks_to_keep
-                ],
-                "pred_masks": [current_outputs["pred_masks"][i] for i in masks_to_keep],
-            }
-            state_json_path, _ = _build_state_snapshot_paths(
-                sam_output_dir,
-                img_path,
-                f"available_masks_after_examine_round_{generation_count + 1}",
-            )
-            updated_outputs = _persist_available_outputs(updated_outputs, state_json_path)
-            # save the updated json outputs and append to message history
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": generated_text}],
-                }
-            )
-            if len(masks_to_keep) == 0:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"The original user query was: '{initial_text_prompt}'. The examine_each_mask tool examined and rejected all currently available masks in memory. There are now 0 available masks. If you still believe target objects exist, please call the segment_phrase tool again with a different, perhaps more general, or more creative simple noun phrase text_prompt, while adhering to all the rules stated in the system prompt.",
-                            }
-                        ],
-                    }
+            if not _last_user_has_image_context(messages):
+                _redirect_for_invalid_tool_state(
+                    messages=messages,
+                    generated_text=generated_text,
+                    tool_name="examine_each_mask",
+                    initial_text_prompt=initial_text_prompt,
                 )
             else:
+                messages.pop()  # Remove the last user message
+                # Add simplified replacement message
+                simplified_message = {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "There are several currently available masks in memory. Now you must analyze the mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action.",
+                        }
+                    ],
+                }
+                messages.append(simplified_message)
+
+                current_outputs = json.load(open(PATH_TO_LATEST_OUTPUT_JSON, "r"))
+                num_masks = len(current_outputs["pred_masks"])
+                masks_to_keep = []
+
+                # MLLM check the mask one by one
+                for i in range(num_masks):
+                    print(f"🔍 Checking mask {i + 1}/{num_masks}...")
+                    image_w_mask_i, image_w_zoomed_in_mask_i = visualize(current_outputs, i)
+
+                    image_w_zoomed_in_mask_i_path = os.path.join(
+                        sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png".replace("/", "_")
+                    ).replace(".png", f"_zoom_in_mask_{i + 1}.png")
+                    image_w_mask_i_path = os.path.join(
+                        sam_output_dir, rf"{LATEST_SAM3_TEXT_PROMPT}.png".replace("/", "_")
+                    ).replace(".png", f"_selected_mask_{i + 1}.png")
+                    image_w_zoomed_in_mask_i.save(image_w_zoomed_in_mask_i_path)
+                    image_w_mask_i.save(image_w_mask_i_path)
+
+                    iterative_checking_messages = [
+                        {"role": "system", "content": iterative_checking_system_prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": f"The raw input image: "},
+                                {"type": "image", "image": img_path},
+                                {
+                                    "type": "text",
+                                    "text": f"The initial user input query is: '{initial_text_prompt}'",
+                                },
+                                {
+                                    "type": "text",
+                                    "text": f"Image with the predicted segmentation mask rendered on it: ",
+                                },
+                                {"type": "image", "image": image_w_mask_i_path},
+                                {
+                                    "type": "text",
+                                    "text": f"Image with the zoomed-in mask: ",
+                                },
+                                {"type": "image", "image": image_w_zoomed_in_mask_i_path},
+                            ],
+                        },
+                    ]
+                    checking_generated_text, verdict = _request_mask_verdict_with_retry(
+                        send_generate_request,
+                        iterative_checking_messages,
+                        max_retries=2,
+                    )
+
+                    # Process the generated text to determine if the mask should be kept or rejected
+                    if checking_generated_text is None:
+                        raise ValueError(
+                            "Generated text is None, which is unexpected. Please check the Qwen server and the input parameters."
+                        )
+                    print(f"Generated text for mask {i + 1}: {checking_generated_text}")
+                    if verdict is None:
+                        fallback_verdict = (
+                            os.environ.get("SAM3_MASK_CHECK_DEFAULT_VERDICT", "Reject")
+                            .strip()
+                            .capitalize()
+                        )
+                        if fallback_verdict not in {"Accept", "Reject"}:
+                            fallback_verdict = "Reject"
+                        print(
+                            "⚠️ Could not parse Accept/Reject verdict after retries. "
+                            f"Falling back to {fallback_verdict} for mask {i + 1}."
+                        )
+                        verdict = fallback_verdict
+
+                    if verdict == "Accept":
+                        print(f"Mask {i + 1} accepted, keeping it in the outputs.")
+                        masks_to_keep.append(i)
+                    elif verdict == "Reject":
+                        print(f"Mask {i + 1} rejected, removing it from the outputs.")
+                    else:
+                        raise ValueError(
+                            f"Unexpected verdict value '{verdict}' for generated text: {checking_generated_text}. Expected 'Accept' or 'Reject'."
+                        )
+
+                updated_outputs = {
+                    "original_image_path": current_outputs["original_image_path"],
+                    "orig_img_h": current_outputs["orig_img_h"],
+                    "orig_img_w": current_outputs["orig_img_w"],
+                    "pred_boxes": [current_outputs["pred_boxes"][i] for i in masks_to_keep],
+                    "pred_scores": [
+                        current_outputs["pred_scores"][i] for i in masks_to_keep
+                    ],
+                    "pred_masks": [current_outputs["pred_masks"][i] for i in masks_to_keep],
+                }
+                state_json_path, _ = _build_state_snapshot_paths(
+                    sam_output_dir,
+                    img_path,
+                    f"available_masks_after_examine_round_{generation_count + 1}",
+                )
+                updated_outputs = _persist_available_outputs(updated_outputs, state_json_path)
+                # save the updated json outputs and append to message history
                 messages.append(
                     {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"The original user query was: '{initial_text_prompt}'. After calling the examine_each_mask tool on the available masks, the number of available masks is now {len(masks_to_keep)}. All {len(masks_to_keep)} available masks are rendered in this image below, now you must analyze the {len(masks_to_keep)} available mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action.",
-                            },
-                            {"type": "image", "image": updated_outputs["output_image_path"]},
-                        ],
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": generated_text}],
                     }
                 )
+                if len(masks_to_keep) == 0:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"The original user query was: '{initial_text_prompt}'. The examine_each_mask tool examined and rejected all currently available masks in memory. There are now 0 available masks. If you still believe target objects exist, please call the segment_phrase tool again with a different, perhaps more general, or more creative simple noun phrase text_prompt, while adhering to all the rules stated in the system prompt.",
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"The original user query was: '{initial_text_prompt}'. After calling the examine_each_mask tool on the available masks, the number of available masks is now {len(masks_to_keep)}. All {len(masks_to_keep)} available masks are rendered in this image below, now you must analyze the {len(masks_to_keep)} available mask(s) carefully, compare them against the raw input image and the original user query, and determine your next action.",
+                                },
+                                {"type": "image", "image": updated_outputs["output_image_path"]},
+                            ],
+                        }
+                    )
 
-            PATH_TO_LATEST_OUTPUT_JSON = state_json_path
+                PATH_TO_LATEST_OUTPUT_JSON = state_json_path
 
         elif tool_call["name"] == "select_masks_and_return":
             print("🔍 Calling select_masks_and_return tool...")
@@ -1069,8 +1204,9 @@ def agent_inference(
                 }
             )
 
-            # Clean up debug files before successful return
-            cleanup_debug_files(debug, debug_folder_path, debug_jsonl_path)
+            # NOTE: debug files (when debug=True) are intentionally retained
+            # so scripts/analyze_agent_run.py can parse the per-frame tool
+            # sequence after a successful run.
             return messages, final_outputs, rendered_final_output
 
         elif tool_call["name"] == "report_no_mask":
@@ -1122,17 +1258,24 @@ def agent_inference(
         assert count_images(messages) <= 2
         generation_count += 1
         if generation_count > max_generations:
-            raise ValueError(
-                f"Exceeded maximum number of allowed generation requests ({max_generations})"
+            _cap_tool_call, generated_text = _terminate_for_cap_or_raise(
+                path_to_latest_output_json=PATH_TO_LATEST_OUTPUT_JSON,
+                max_generations=max_generations,
+                initial_text_prompt=initial_text_prompt,
+                prompt_profile=prompt_profile,
             )
-
-        print("\n\n")
-        print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
-        print("\n\n")
-        generated_text = send_generate_request(messages)
-        print(
-            f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
-        )
+            print(
+                "⚠️ Max generations exceeded. "
+                f"Forcing terminating fallback: {_cap_tool_call}"
+            )
+        else:
+            print("\n\n")
+            print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
+            print("\n\n")
+            generated_text = send_generate_request(messages)
+            print(
+                f"\n>>> MLLM Response [start]\n{generated_text}\n<<< MLLM Response [end]\n"
+            )
 
     print("\n\n>>> SAM 3 Agent execution ended.\n\n")
 

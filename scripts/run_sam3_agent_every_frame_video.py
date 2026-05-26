@@ -231,6 +231,20 @@ def parse_args() -> argparse.Namespace:
         help=f"SAM3 agent prompt profile. Default: {DEFAULT_PROMPT_PROFILE!r}",
     )
     parser.add_argument(
+        "--llm-provider",
+        choices=["openai", "claude"],
+        default=os.environ.get("SAM3_LLM_PROVIDER", "openai"),
+        help=(
+            "Which MLLM backend to use. 'openai' = OpenAI-compatible "
+            "server (vLLM/Qwen). 'claude' = Anthropic Messages API."
+        ),
+    )
+    parser.add_argument(
+        "--claude-model",
+        default=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        help="Anthropic model ID. Used only when --llm-provider=claude.",
+    )
+    parser.add_argument(
         "--server-url",
         default=os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1"),
         help="OpenAI-compatible server URL for the MLLM.",
@@ -254,8 +268,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-generations",
         type=int,
-        default=10,
-        help="Maximum agent generations per frame. Default: 10",
+        default=20,
+        help="Maximum agent generations per frame. Default: 20",
     )
     parser.add_argument(
         "--image-detail",
@@ -730,6 +744,28 @@ def serialize_agent_frame_outputs(
     }
 
 
+def _summarize_llm_backend(args: argparse.Namespace) -> dict[str, str]:
+    """Return summary fields reflecting the *actual* LLM backend in use.
+
+    Without this the summary writer just echoed the OpenAI-compatible defaults
+    (``--server-url`` and ``--model``), so runs that used ``--llm-provider claude``
+    were recorded with stale Qwen metadata. Centralising the mapping keeps the
+    summary, the launch log, and downstream tooling agreeing on which model
+    actually produced the masks.
+    """
+    if args.llm_provider == "claude":
+        return {
+            "llm_provider": "claude",
+            "model": str(args.claude_model),
+            "server_url": "",
+        }
+    return {
+        "llm_provider": str(args.llm_provider),
+        "model": str(args.model),
+        "server_url": str(args.server_url),
+    }
+
+
 def main() -> int:
     args = parse_args()
     ensure_runtime_deps()
@@ -762,18 +798,40 @@ def main() -> int:
             Path(args.iterative_system_prompt_path).resolve()
         )
 
-    api_key = (
-        args.api_key
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("VLLM_API_KEY")
-        or "DUMMY_API_KEY"
-    )
-    send_req_base = partial(
-        send_generate_request_orig,
-        server_url=args.server_url,
-        model=args.model,
-        api_key=api_key,
-    )
+    if args.llm_provider == "claude":
+        # Lazy import so the OpenAI path keeps working without anthropic installed.
+        from sam3.agent.client_claude import send_claude_request
+
+        anthropic_key = (
+            args.api_key
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or ""
+        )
+        if not anthropic_key:
+            raise RuntimeError(
+                "--llm-provider=claude requires ANTHROPIC_API_KEY (env var) "
+                "or --api-key."
+            )
+        send_req_base = partial(
+            send_claude_request,
+            model=args.claude_model,
+            api_key=anthropic_key,
+        )
+        log(f"Using Anthropic backend: model={args.claude_model}")
+    else:
+        api_key = (
+            args.api_key
+            or os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("VLLM_API_KEY")
+            or "DUMMY_API_KEY"
+        )
+        send_req_base = partial(
+            send_generate_request_orig,
+            server_url=args.server_url,
+            model=args.model,
+            api_key=api_key,
+        )
+        log(f"Using OpenAI-compatible backend: model={args.model}, url={args.server_url}")
     send_req = partial(send_req_base, max_tokens=int(args.max_completion_tokens))
 
     cap = cv2.VideoCapture(video_path)
@@ -1016,8 +1074,7 @@ def main() -> int:
         ),
         "prompt": args.prompt,
         "prompt_profile": args.prompt_profile,
-        "server_url": args.server_url,
-        "model": args.model,
+        **_summarize_llm_backend(args),
         "device": args.device,
         "max_generations": int(args.max_generations),
         "max_completion_tokens": int(args.max_completion_tokens),
