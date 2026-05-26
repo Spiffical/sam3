@@ -218,7 +218,6 @@ def draw_numbered_marks(
     candidates: list[dict],
     *,
     alpha: float = 0.35,
-    palette_seed: int = 7,
 ):
     """Render numbered marks on top of a frame.
 
@@ -231,9 +230,7 @@ def draw_numbered_marks(
     Returns a new BGR (uint8) array of the same shape as the input frame.
 
     Color source: ColorPalette.default().by_idx(idx) -- wraps at palette
-    length (~20 colours). ``palette_seed`` is ignored (kept for API
-    stability) because ColorPalette.by_idx takes no seed argument; callers
-    that need reproducible-but-different colours should wrap or subclass.
+    length (~20 colours).
     """
     import cv2
     import numpy as np
@@ -249,6 +246,8 @@ def draw_numbered_marks(
 
     for idx, cand in enumerate(candidates, start=1):
         mask = np.asarray(cand["mask"], dtype=bool)
+        if not mask.any():
+            continue  # nothing to render for an empty mask
         color_obj = palette.by_idx(idx)          # Color dataclass (r, g, b)
         color_bgr = color_obj.as_bgr()           # (b, g, r) tuple of ints
 

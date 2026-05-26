@@ -312,10 +312,19 @@ class DrawNumberedMarksTests(unittest.TestCase):
 
     def test_zero_candidates_returns_copy(self):
         frame = self._frame()
+        frame_before = frame.copy()
         out = draw_numbered_marks(frame, [])
         self.assertEqual(out.shape, frame.shape)
-        # Should not raise, should not modify input
-        np.testing.assert_array_equal(frame, np.zeros_like(frame) + 100)
+        np.testing.assert_array_equal(frame, frame_before)  # input not mutated
+        np.testing.assert_array_equal(out, frame_before)    # output equals input
+
+    def test_skips_empty_mask_without_crashing(self):
+        frame = self._frame()
+        empty = np.zeros((self.H, self.W), dtype=bool)
+        out = draw_numbered_marks(frame, [{"mask": empty, "bbox_xywh": [0, 0, 0, 0]}])
+        self.assertEqual(out.shape, frame.shape)
+        # Should be unchanged because no candidate produced output
+        np.testing.assert_array_equal(out, frame)
 
     def test_handles_many_candidates(self):
         # Stress test: 20 marks in dense scene
