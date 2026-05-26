@@ -10,6 +10,7 @@ import argparse
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -60,12 +61,93 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--edge-tol-px", type=int, default=2)
     p.add_argument("--internal-iou-dedup", type=float, default=0.5)
     p.add_argument("--max-mllm-calls", type=int, default=200)
+
+    # SAM3 model loading
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--checkpoint-path", default=None,
+                   help="Path to SAM3 checkpoint. If unset, build_sam3_image_model uses its own default.")
+    p.add_argument("--confidence-threshold", type=float, default=0.5)
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--bpe-path", default=None,
+                   help="Optional BPE path. If unset, uses find_bpe_path() from the every-frame script.")
+
+    # Anthropic / MLLM
+    p.add_argument("--claude-model",
+                   default=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"))
+    p.add_argument("--max-completion-tokens", type=int, default=2048)
+    p.add_argument("--image-detail", default="high", choices=["low", "high"])
+    p.add_argument("--max-images-per-request", type=int, default=8)
+
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
+    # ---------------------------------------------------------------------------
+    # Load SAM3 runtime dependencies (mirrors run_sam3_agent_every_frame_video.py)
+    # ---------------------------------------------------------------------------
+    # LocalSam3Service, find_bpe_path, and ensure_runtime_deps are module-level
+    # definitions in run_sam3_agent_every_frame_video.py and are importable.
+    # Sam3Processor and build_sam3_image_model are populated by ensure_runtime_deps().
+    from scripts.run_sam3_agent_every_frame_video import (  # noqa: E402
+        LocalSam3Service,
+        ensure_runtime_deps,
+        find_bpe_path,
+    )
+    import scripts.run_sam3_agent_every_frame_video as _efv  # noqa: E402
+
+    ensure_runtime_deps()
+
+    # After ensure_runtime_deps() the module globals Sam3Processor and
+    # build_sam3_image_model are populated.
+    Sam3Processor = _efv.Sam3Processor
+    build_sam3_image_model = _efv.build_sam3_image_model
+
+    bpe_path = args.bpe_path or find_bpe_path()
+    image_model = build_sam3_image_model(
+        bpe_path=bpe_path,
+        device=args.device,
+        checkpoint_path=args.checkpoint_path,
+        compile=args.compile,
+    )
+    image_processor = Sam3Processor(
+        image_model, confidence_threshold=args.confidence_threshold
+    )
+    local_service = LocalSam3Service(image_processor)
+
+    # ---------------------------------------------------------------------------
+    # Bind the Anthropic Claude callable
+    # image_detail and max_images_per_request are consumed by send_claude_request
+    # via environment variables (same pattern as the every-frame script).
+    # ---------------------------------------------------------------------------
+    os.environ["SAM3_IMAGE_DETAIL"] = str(args.image_detail)
+    os.environ["SAM3_MAX_IMAGES_PER_REQUEST"] = str(max(1, args.max_images_per_request))
+
+    try:
+        from dotenv import load_dotenv  # noqa: E402
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv is optional; fall back to os.environ only
+
+    from sam3.agent.client_claude import send_claude_request  # noqa: E402
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        raise SystemExit(
+            "ANTHROPIC_API_KEY must be set (in .env or env) for SoM stage."
+        )
+
+    send_mllm = partial(
+        send_claude_request,
+        model=args.claude_model,
+        api_key=anthropic_key,
+        max_tokens=args.max_completion_tokens,
+    )
+
+    # ---------------------------------------------------------------------------
+    # Build config and run
+    # ---------------------------------------------------------------------------
     # Stamp the output dir so reruns are isolated
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(args.output_dir, timestamp)
@@ -93,7 +175,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"[som] writing artefacts to {output_dir}")
-    stats = run_som_stage(cfg)
+    stats = run_som_stage(
+        cfg,
+        _call_sam_service=local_service.call_service,
+        _send_mllm_request=send_mllm,
+    )
     print(f"[som] done: {stats}")
     return 0
 
