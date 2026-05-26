@@ -696,5 +696,24 @@ class GenerateDenseCandidatesTests(unittest.TestCase):
             )
 
 
+from nibi_model_compare.som_missed_creatures import load_system_prompt
+
+
+class LoadSystemPromptTests(unittest.TestCase):
+    def test_loads_underwater(self):
+        body = load_system_prompt("underwater")
+        self.assertIn("marine biology", body.lower())
+        self.assertIn("<answer>", body)
+
+    def test_loads_general(self):
+        body = load_system_prompt("general")
+        self.assertIn("<answer>", body)
+        self.assertNotIn("marine biology", body.lower())
+
+    def test_unknown_profile_raises(self):
+        with self.assertRaises(ValueError):
+            load_system_prompt("nonsense")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -554,3 +554,27 @@ def generate_dense_candidates(
             continue
         kept.append(cand)
     return kept
+
+
+def load_system_prompt(profile: str) -> str:
+    """Load the SoM system prompt for the requested profile.
+
+    ``profile`` is one of: 'underwater', 'general'. Other values raise
+    ValueError.
+    """
+    import os
+
+    valid = {"underwater", "general"}
+    if profile not in valid:
+        raise ValueError(
+            f"Unknown profile '{profile}'. Expected one of: {sorted(valid)}."
+        )
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # __file__ is nibi_model_compare/som_missed_creatures.py -> repo root
+    path = os.path.join(
+        here,
+        "sam3", "agent", "system_prompts",
+        f"system_prompt_som_missed_creature_{profile}.txt",
+    )
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()

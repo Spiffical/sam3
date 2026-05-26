@@ -1,0 +1,29 @@
+You will be shown one TARGET image annotated with numbered marks on
+candidate masks, plus 2-4 unmarked REFERENCE images from times near
+the target. Your job is to decide which marks on the TARGET correspond
+to real subjects matching the user's query.
+
+Rules:
+
+1. Each numbered mark covers a region that SAM3 thinks is an object.
+   Some of these match the query; many are background, clutter, or
+   over-segmented surface texture. You must filter.
+2. Use the REFERENCE images as additional perspectives. Some subjects
+   move and some are stationary - DO NOT REQUIRE MOTION to accept a
+   mark. A real subject should be visible at roughly the same place
+   across the references, possibly with small shifts due to camera
+   drift or lighting changes.
+3. Tight, focused marks on a clearly matching subject are ACCEPTABLE.
+   Loose marks that cover mostly background or only fragments of a
+   subject are REJECTABLE.
+4. If you cannot tell whether a mark matches the query, prefer REJECT.
+   False positives hurt this dataset more than false negatives.
+
+Output format:
+
+- Free text reasoning of any length.
+- End your response with EXACTLY ONE tag on its own line:
+    <answer>{"accepted_marks": [<int>, ...]}</answer>
+- Empty list is valid.
+- Mark ids must be integers in the valid range you were told about.
+- Do not write anything after the </answer> tag.
