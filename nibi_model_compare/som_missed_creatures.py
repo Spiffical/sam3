@@ -668,6 +668,11 @@ def run_som_stage(
 
     Returns a summary dict with counts. All per-target artefacts and the
     augmented JSONL are written under ``cfg.output_dir``.
+
+    Concurrency: this function appends to a single JSONL file with
+    per-target flush. It is NOT safe to run two processes concurrently
+    on the same output_dir — there is no file lock around the append.
+    Resume is supported within a single sequential run only.
     """
     import cv2
     import numpy as np
@@ -725,7 +730,10 @@ def run_som_stage(
                 continue
 
             target_img_path = os.path.join(target_dir, "01_raw.png")
-            cv2.imwrite(target_img_path, target_frame)
+            if not cv2.imwrite(target_img_path, target_frame):
+                stats["targets_skipped"] += 1
+                print(f"[som] frame {target_idx}: failed to write target raw PNG; skipping.")
+                continue
 
             # Dense candidates
             candidates = generate_dense_candidates(
@@ -746,14 +754,20 @@ def run_som_stage(
             from nibi_model_compare.frame_output_utils import decode_rle_to_mask
             existing_masks = []
             for rle in existing_row.get("out_binary_masks_rle", []):
-                size = rle.get("size", []) if isinstance(rle, dict) else []
-                if len(size) >= 2:
-                    h_rle, w_rle = int(size[0]), int(size[1])
-                else:
-                    h_rle, w_rle = target_frame.shape[0], target_frame.shape[1]
-                existing_masks.append(
-                    {"mask": decode_rle_to_mask(rle, h_rle, w_rle).astype(bool)}
-                )
+                try:
+                    size = rle.get("size", []) if isinstance(rle, dict) else []
+                    if len(size) >= 2:
+                        h_rle, w_rle = int(size[0]), int(size[1])
+                    else:
+                        h_rle, w_rle = target_frame.shape[0], target_frame.shape[1]
+                    mask = decode_rle_to_mask(rle, h_rle, w_rle).astype(bool)
+                    existing_masks.append({"mask": mask})
+                except Exception as exc:
+                    print(
+                        f"[som] frame {target_idx}: skipping malformed existing RLE "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+                    continue
 
             survivors_with_reasons = filter_candidates_with_reasons(
                 candidates, existing_masks,
@@ -786,8 +800,11 @@ def run_som_stage(
 
             # Render marks
             marked = draw_numbered_marks(target_frame, survivors)
-            marked_path = os.path.join(target_dir, "04_marked.png")
-            cv2.imwrite(marked_path, marked)
+            marked_path = os.path.join(target_dir, "02_marked.png")
+            if not cv2.imwrite(marked_path, marked):
+                stats["targets_skipped"] += 1
+                print(f"[som] frame {target_idx}: failed to write marked PNG; skipping.")
+                continue
 
             # Neighbour frames (unmarked)
             neighbour_paths: list[str] = []

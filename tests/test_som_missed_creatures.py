@@ -906,8 +906,8 @@ class RunSomStageTests(unittest.TestCase):
             _call_sam_service=self.fake_sam,
             _send_mllm_request=self.fake_mllm,
         )
-        # Stopped after 2 MLLM calls (1 per target)
-        self.assertLessEqual(result["mllm_calls"], 2)
+        # Stopped after exactly 2 MLLM calls (1 per target)
+        self.assertEqual(result["mllm_calls"], 2)
 
     def test_resume_skips_already_processed_targets(self):
         cfg = self._config(num_target_frames=3)
@@ -935,6 +935,41 @@ class RunSomStageTests(unittest.TestCase):
         # Target 0 should have been resumed (not reprocessed)
         self.assertEqual(result["targets_skipped_resume"], 1)
         self.assertEqual(result["targets_processed"], 2)
+
+    def test_input_frame_outputs_not_mutated(self):
+        import hashlib
+        cfg = self._config(num_target_frames=2)
+        digest_before = hashlib.sha256(
+            open(self.frame_outputs_path, "rb").read()
+        ).hexdigest()
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _call_sam_service=self.fake_sam,
+            _send_mllm_request=self.fake_mllm,
+        )
+        digest_after = hashlib.sha256(
+            open(self.frame_outputs_path, "rb").read()
+        ).hexdigest()
+        self.assertEqual(digest_before, digest_after)
+
+    def test_malformed_existing_rle_does_not_crash(self):
+        # Corrupt the existing frame_outputs to have a bad RLE on one frame
+        with open(self.frame_outputs_path) as f:
+            fo = _json.load(f)
+        fo["frames"][0]["out_binary_masks_rle"][0] = {"size": [64, 64], "counts": "INVALID"}
+        with open(self.frame_outputs_path, "w") as f:
+            _json.dump(fo, f)
+
+        cfg = self._config(num_target_frames=3, target_frames_explicit=[0, 5, 10])
+        # Should not raise; frame 0 just has its bad RLE silently dropped
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _call_sam_service=self.fake_sam,
+            _send_mllm_request=self.fake_mllm,
+        )
+        self.assertGreaterEqual(result["targets_processed"], 1)
 
 
 if __name__ == "__main__":
