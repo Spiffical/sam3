@@ -479,6 +479,14 @@ def generate_dense_candidates(
     The contract is the only thing other components depend on; if smoke
     tests show poor recall, a real grid-sampled AMG can replace this
     body without touching downstream code.
+
+    Production caller note: the default ``_call_sam_service`` resolves
+    to ``sam3.agent.client_sam3.call_sam_service``, which takes a
+    ``sam3_processor`` as its leading positional argument in real
+    deployments. The driver in scripts/run_som_missed_creatures.py is
+    responsible for pre-currying that argument (see how agent_core does
+    it) before invoking this function. The injectable seam exists
+    primarily for tests.
     """
     import json
     import os
@@ -503,11 +511,30 @@ def generate_dense_candidates(
         )
         with open(result_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        h = payload.get("orig_img_h", 0)
-        w = payload.get("orig_img_w", 0)
+        h = payload.get("orig_img_h")
+        w = payload.get("orig_img_w")
+        if not isinstance(h, int) or not isinstance(w, int) or h <= 0 or w <= 0:
+            raise ValueError(
+                f"SAM3 result for prompt {prompt!r} is missing valid orig_img_h/orig_img_w "
+                f"(got h={h!r}, w={w!r}); cannot decode masks."
+            )
         rles = payload.get("pred_masks") or []
         boxes = payload.get("pred_boxes") or []
         scores = payload.get("pred_scores") or [0.0] * len(rles)
+        if boxes and len(boxes) != len(rles):
+            print(
+                f"⚠️ SoM dense generator: pred_boxes length {len(boxes)} "
+                f"does not match pred_masks length {len(rles)} for prompt "
+                f"{prompt!r}; skipping this prompt's results."
+            )
+            continue
+        if scores and len(scores) != len(rles):
+            print(
+                f"⚠️ SoM dense generator: pred_scores length {len(scores)} "
+                f"does not match pred_masks length {len(rles)} for prompt "
+                f"{prompt!r}; substituting zeros."
+            )
+            scores = [0.0] * len(rles)
         for rle, bbox, score in zip(rles, boxes, scores):
             mask = decode_rle_to_mask(rle, h, w).astype(bool)
             pooled.append({

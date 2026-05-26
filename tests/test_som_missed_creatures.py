@@ -643,6 +643,58 @@ class GenerateDenseCandidatesTests(unittest.TestCase):
         # Two identical masks -> dedup keeps one
         self.assertEqual(len(out), 1)
 
+    def test_pred_boxes_length_mismatch_drops_prompt_results(self):
+        def fake_sam(image_path, text_prompt, output_folder_path):
+            import json
+            out_path = os.path.join(output_folder_path, f"out_{text_prompt}.json")
+            # 2 masks, but only 1 box — corrupted-looking payload
+            yy, xx = np.ogrid[:64, :64]
+            m1 = ((yy - 20) ** 2 + (xx - 20) ** 2) <= 5 * 5
+            m2 = ((yy - 40) ** 2 + (xx - 40) ** 2) <= 5 * 5
+            from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+            payload = {
+                "original_image_path": image_path,
+                "orig_img_h": 64,
+                "orig_img_w": 64,
+                "pred_masks": [encode_binary_mask_to_rle(m1),
+                               encode_binary_mask_to_rle(m2)],
+                "pred_boxes": [[15, 15, 11, 11]],  # short!
+                "pred_scores": [0.9, 0.9],
+            }
+            with open(out_path, "w") as f:
+                json.dump(payload, f)
+            return out_path
+
+        out = generate_dense_candidates(
+            image_path=self.img_path,
+            broad_prompts=["creature"],
+            output_folder=self.tmp.name,
+            _call_sam_service=fake_sam,
+        )
+        self.assertEqual(out, [])
+
+    def test_missing_image_dimensions_raises(self):
+        def fake_sam(image_path, text_prompt, output_folder_path):
+            import json
+            out_path = os.path.join(output_folder_path, "broken.json")
+            with open(out_path, "w") as f:
+                json.dump({
+                    "original_image_path": image_path,
+                    # NO orig_img_h / orig_img_w
+                    "pred_masks": [{"size": [64, 64], "counts": "0"}],
+                    "pred_boxes": [[0, 0, 1, 1]],
+                    "pred_scores": [0.5],
+                }, f)
+            return out_path
+
+        with self.assertRaises(ValueError):
+            generate_dense_candidates(
+                image_path=self.img_path,
+                broad_prompts=["creature"],
+                output_folder=self.tmp.name,
+                _call_sam_service=fake_sam,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
