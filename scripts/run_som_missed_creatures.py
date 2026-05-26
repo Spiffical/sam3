@@ -105,7 +105,6 @@ def main(argv: list[str] | None = None) -> int:
     # Load SAM3 runtime dependencies (mirrors run_sam3_agent_every_frame_video.py)
     # ---------------------------------------------------------------------------
     from scripts.run_sam3_agent_every_frame_video import (  # noqa: E402
-        LocalSam3Service,
         ensure_runtime_deps,
         find_bpe_path,
     )
@@ -118,24 +117,23 @@ def main(argv: list[str] | None = None) -> int:
 
     bpe_path = args.bpe_path or find_bpe_path()
 
-    # Build the image model without enabling inst_interactivity (matches
-    # run_sam3_agent_every_frame_video.py; the interactive predictor's backbone
-    # is None in this checkout and would crash on set_image -- see Sam3PointService
-    # docstring for details).
+    # Build the image model with enable_inst_interactivity=True so that
+    # model.predict_inst is available for SAM3 click-mode segmentation.
     image_model = build_sam3_image_model(
         bpe_path=bpe_path,
         device=args.device,
         checkpoint_path=args.checkpoint_path,
         compile=args.compile,
+        enable_inst_interactivity=True,
     )
     image_processor = Sam3Processor(
         image_model, confidence_threshold=args.confidence_threshold
     )
-    local_service = LocalSam3Service(image_processor)
 
-    # Sam3PointService now uses text-mode + spatial-filter (workaround for the
-    # backbone-less inst_interactive_predictor bug in this checkout).
-    sam3_point_service = Sam3PointService(local_service.call_service)
+    # Sam3PointService uses the real SAM3 click API:
+    #   processor.set_image(image) -> inference_state
+    #   model.predict_inst(state, point_coords, point_labels, multimask_output=True)
+    sam3_point_service = Sam3PointService(image_model, image_processor)
 
     # ---------------------------------------------------------------------------
     # Bind the Anthropic Claude callable
