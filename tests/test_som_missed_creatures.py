@@ -149,6 +149,16 @@ class SelectTargetFramesTests(unittest.TestCase):
         )
         self.assertEqual(out, [0, 1, 2])
 
+    def test_unknown_strategy_raises(self):
+        frame_results = [self._row(i) for i in range(5)]
+        with self.assertRaises(ValueError):
+            select_target_frames(frame_results, strategy="unifrom", k=3)
+
+    def test_k_equals_one_returns_first_valid(self):
+        frame_results = [self._row(i) for i in range(10)]
+        out = select_target_frames(frame_results, strategy="uniform", k=1)
+        self.assertEqual(out, [0])
+
 
 if __name__ == "__main__":
     unittest.main()

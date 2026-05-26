@@ -63,6 +63,18 @@ def parse_som_response(text: str, *, valid_ids: set[int] | None = None) -> list[
     return out
 
 
+def _uniform_pick(indices: list[int], k: int) -> list[int]:
+    """Pick ``k`` indices uniformly spaced across ``indices``. Returns a
+    sorted, deduplicated list. If ``k >= len(indices)`` returns all
+    indices; ``k == 1`` returns the first.
+    """
+    if k >= len(indices):
+        return sorted(indices)
+    step = (len(indices) - 1) / (k - 1) if k > 1 else 0
+    picked = [indices[round(i * step)] for i in range(k)]
+    return sorted(set(picked))
+
+
 def select_target_frames(
     frame_results: list[dict],
     *,
@@ -78,7 +90,10 @@ def select_target_frames(
         frame_results: rows from ``frame_results.jsonl`` (per-frame agent results).
         strategy: ``"uniform"`` (default, K-evenly-spaced) or ``"motion"``
             (delegates to nibi_model_compare.keyframe_discovery).
-        k: number of target frames to pick.
+        k: number of target frames to pick. When ``k == 1`` the FIRST
+            valid frame is returned; callers that want a middle-pick
+            should pass ``k=1`` only when frame ordering is irrelevant
+            or should construct the index themselves.
         explicit: if given, return this list filtered to indices that appear
             in ``frame_results``. Overrides ``strategy`` and ``k``.
         include_zero_mask_frames: if True, frames where the text-agent
@@ -92,6 +107,11 @@ def select_target_frames(
 
     if explicit is not None:
         return sorted(idx for idx in explicit if idx in all_indices)
+
+    if strategy not in ("uniform", "motion"):
+        raise ValueError(
+            f"Unknown strategy {strategy!r}; expected 'uniform' or 'motion'."
+        )
 
     valid_rows = [
         row for row in frame_results
@@ -109,15 +129,10 @@ def select_target_frames(
         return sorted(selector(valid_rows, k))
 
     # uniform spacing
-    if k >= len(valid_indices):
-        return valid_indices
-    # pick k indices spread across valid_indices: 0%, ..., 100%
     # Python's built-in round() (banker's rounding) is used so that the
     # middle element of an odd-length list lands at the correct position
     # (e.g. round(1.5) == 2 keeps the bias toward the later, richer half).
-    step = (len(valid_indices) - 1) / (k - 1) if k > 1 else 0
-    picked = [valid_indices[round(i * step)] for i in range(k)]
-    return sorted(set(picked))
+    return _uniform_pick(valid_indices, k)
 
 
 def _motion_keyframe_selector(valid_rows: list[dict], k: int) -> list[int]:
@@ -135,8 +150,4 @@ def _motion_keyframe_selector(valid_rows: list[dict], k: int) -> list[int]:
     indices = sorted(int(r["frame_index"]) for r in valid_rows)
     if not indices:
         return []
-    if k >= len(indices):
-        return indices
-    step = (len(indices) - 1) / (k - 1) if k > 1 else 0
-    picked = [indices[round(i * step)] for i in range(k)]
-    return sorted(set(picked))
+    return _uniform_pick(indices, k)
