@@ -438,5 +438,84 @@ class BuildSomPromptMessagesTests(unittest.TestCase):
         self.assertIn("accepted_marks", last_item["text"])
 
 
+from nibi_model_compare.som_missed_creatures import merge_accepted_masks_into_row
+
+
+class MergeAcceptedMasksTests(unittest.TestCase):
+    def _disk_cand(self, cy, cx, r, h=64, w=64):
+        yy, xx = np.ogrid[:h, :w]
+        m = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+        ys, xs = np.where(m)
+        bbox = [int(xs.min()), int(ys.min()),
+                int(xs.max() - xs.min() + 1),
+                int(ys.max() - ys.min() + 1)]
+        return {"mask": m, "bbox_xywh": bbox, "score": 0.8}
+
+    def test_appends_new_objs_with_unique_ids(self):
+        existing_row = {
+            "frame_index": 5,
+            "out_obj_ids": [1, 2, 3],
+            "out_binary_masks_rle": [{}, {}, {}],   # opaque payloads
+            "out_boxes_xywh": [[0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 1, 1]],
+            "out_probs": [0.9, 0.9, 0.9],
+            "out_tracker_probs": [0.9, 0.9, 0.9],
+        }
+        accepted = [self._disk_cand(20, 20, 6), self._disk_cand(40, 40, 6)]
+        out = merge_accepted_masks_into_row(existing_row, accepted)
+        self.assertEqual(out["frame_index"], 5)
+        self.assertEqual(out["out_obj_ids"], [1, 2, 3, 4, 5])
+        self.assertEqual(out["added_obj_ids"], [4, 5])
+        self.assertEqual(out["source"], "som")
+        self.assertEqual(out["source_per_obj_id"], {
+            "1": "text_agent", "2": "text_agent", "3": "text_agent",
+            "4": "som", "5": "som",
+        })
+        self.assertEqual(len(out["out_binary_masks_rle"]), 5)
+        self.assertEqual(len(out["out_boxes_xywh"]), 5)
+
+    def test_empty_accepted_returns_passthrough_row(self):
+        existing_row = {
+            "frame_index": 5,
+            "out_obj_ids": [1, 2],
+            "out_binary_masks_rle": [{}, {}],
+            "out_boxes_xywh": [[0, 0, 1, 1], [0, 0, 1, 1]],
+            "out_probs": [0.9, 0.9],
+            "out_tracker_probs": [0.9, 0.9],
+        }
+        out = merge_accepted_masks_into_row(existing_row, [])
+        self.assertEqual(out["out_obj_ids"], [1, 2])
+        self.assertEqual(out["added_obj_ids"], [])
+        self.assertEqual(out["source"], "som")
+        self.assertEqual(out["source_per_obj_id"], {
+            "1": "text_agent", "2": "text_agent",
+        })
+
+    def test_no_existing_objs_starts_from_id_1(self):
+        existing_row = {
+            "frame_index": 5,
+            "out_obj_ids": [],
+            "out_binary_masks_rle": [],
+            "out_boxes_xywh": [],
+            "out_probs": [],
+            "out_tracker_probs": [],
+        }
+        accepted = [self._disk_cand(20, 20, 6)]
+        out = merge_accepted_masks_into_row(existing_row, accepted)
+        self.assertEqual(out["out_obj_ids"], [1])
+        self.assertEqual(out["added_obj_ids"], [1])
+
+    def test_input_row_not_mutated(self):
+        existing_row = {
+            "frame_index": 5,
+            "out_obj_ids": [1],
+            "out_binary_masks_rle": [{}],
+            "out_boxes_xywh": [[0, 0, 1, 1]],
+            "out_probs": [0.9],
+            "out_tracker_probs": [0.9],
+        }
+        merge_accepted_masks_into_row(existing_row, [self._disk_cand(20, 20, 6)])
+        self.assertEqual(existing_row["out_obj_ids"], [1])
+
+
 if __name__ == "__main__":
     unittest.main()

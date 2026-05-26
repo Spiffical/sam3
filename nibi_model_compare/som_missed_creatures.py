@@ -366,6 +366,48 @@ def build_som_prompt_messages(
     ]
 
 
+def merge_accepted_masks_into_row(
+    existing_row: dict, accepted_candidates: list[dict],
+) -> dict:
+    """Return a new frame row that appends accepted SoM candidates to the
+    existing per-frame outputs without mutating the input.
+
+    Accepted candidates get fresh ``obj_id``s above ``max(existing) + 1``
+    (or starting at 1 if there are no existing objects). The new row
+    carries:
+      - ``source: "som"`` at the top level
+      - ``added_obj_ids: [ids that this stage added]``
+      - ``source_per_obj_id: {"<id>": "text_agent"|"som"}`` for every id
+    """
+    import copy
+
+    from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+
+    row = copy.deepcopy(existing_row)
+    existing_ids = list(row.get("out_obj_ids", []))
+    next_id = (max(existing_ids) + 1) if existing_ids else 1
+
+    added_ids: list[int] = []
+    for cand in accepted_candidates:
+        row["out_obj_ids"].append(next_id)
+        row["out_binary_masks_rle"].append(
+            encode_binary_mask_to_rle(cand["mask"])
+        )
+        row["out_boxes_xywh"].append(list(cand["bbox_xywh"]))
+        row["out_probs"].append(float(cand.get("score", 0.0)))
+        row["out_tracker_probs"].append(float(cand.get("score", 0.0)))
+        added_ids.append(next_id)
+        next_id += 1
+
+    row["source"] = "som"
+    row["added_obj_ids"] = added_ids
+    row["source_per_obj_id"] = {
+        str(oid): ("som" if oid in added_ids else "text_agent")
+        for oid in row["out_obj_ids"]
+    }
+    return row
+
+
 def filter_candidates_with_reasons(
     candidates: list[dict],
     existing_masks: list[dict],
