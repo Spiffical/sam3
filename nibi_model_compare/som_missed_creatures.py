@@ -16,6 +16,7 @@ Spec: docs/superpowers/specs/2026-05-26-som-missed-creature-loop-design.md
 from __future__ import annotations
 
 import json
+import os
 import re
 
 _ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
@@ -562,8 +563,6 @@ def load_system_prompt(profile: str) -> str:
     ``profile`` is one of: 'underwater', 'general'. Other values raise
     ValueError.
     """
-    import os
-
     valid = {"underwater", "general"}
     if profile not in valid:
         raise ValueError(
@@ -578,3 +577,285 @@ def load_system_prompt(profile: str) -> str:
     )
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+from dataclasses import dataclass
+
+
+@dataclass
+class SomStageConfig:
+    video_path: str
+    frame_results_path: str
+    frame_outputs_path: str
+    output_dir: str
+    prompt_profile: str
+    initial_text_prompt: str
+    num_target_frames: int
+    frame_selection_strategy: str
+    target_frames_explicit: list[int] | None
+    broad_prompts: list[str]
+    num_neighbours: int
+    neighbour_offset_frames: int
+    iou_dedup: float
+    min_area_px: float
+    max_area_frac: float
+    edge_tol_px: int
+    internal_iou_dedup: float
+    max_mllm_calls: int
+
+
+def _load_video_frame_default(video_path: str, frame_index: int):
+    """Default video frame loader via OpenCV. Tests pass in a fake."""
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ok, frame = cap.read()
+        if not ok:
+            return None
+        return frame
+    finally:
+        cap.release()
+
+
+def _send_mllm_request_default(messages, **kwargs):
+    """Default MLLM client. Tests pass in a fake."""
+    from sam3.agent.client_claude import send_claude_request
+    return send_claude_request(messages, **kwargs)
+
+
+def _read_jsonl(path):
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def _existing_row_for_frame(frame_outputs: dict, frame_index: int) -> dict:
+    """Find the existing-output row for a given frame index, or return an
+    empty placeholder if the frame isn't in the outputs file."""
+    for row in frame_outputs.get("frames", []):
+        if int(row.get("frame_index", -1)) == int(frame_index):
+            return row
+    return {
+        "frame_index": int(frame_index),
+        "out_obj_ids": [],
+        "out_binary_masks_rle": [],
+        "out_boxes_xywh": [],
+        "out_probs": [],
+        "out_tracker_probs": [],
+    }
+
+
+def run_som_stage(
+    cfg: SomStageConfig,
+    *,
+    _load_video_frame=None,
+    _call_sam_service=None,
+    _send_mllm_request=None,
+) -> dict:
+    """Run the SoM missed-creature stage end-to-end.
+
+    Returns a summary dict with counts. All per-target artefacts and the
+    augmented JSONL are written under ``cfg.output_dir``.
+    """
+    import cv2
+    import numpy as np
+
+    load_frame = _load_video_frame or _load_video_frame_default
+    call_sam = _call_sam_service
+    send_mllm = _send_mllm_request or _send_mllm_request_default
+
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    frame_results = _read_jsonl(cfg.frame_results_path)
+    with open(cfg.frame_outputs_path, "r", encoding="utf-8") as f:
+        frame_outputs = json.load(f)
+
+    targets = select_target_frames(
+        frame_results,
+        strategy=cfg.frame_selection_strategy,
+        k=cfg.num_target_frames,
+        explicit=cfg.target_frames_explicit,
+    )
+
+    # Resume support: read the augmented JSONL if it already exists
+    augmented_path = os.path.join(cfg.output_dir, "augmented_frame_outputs.jsonl")
+    already_done = {int(row["frame_index"])
+                    for row in _read_jsonl(augmented_path)}
+
+    system_prompt = load_system_prompt(cfg.prompt_profile)
+
+    stats = {
+        "targets_total": len(targets),
+        "targets_processed": 0,
+        "targets_skipped": 0,
+        "targets_skipped_resume": 0,
+        "mllm_calls": 0,
+        "masks_accepted": 0,
+    }
+
+    # Open augmented JSONL in append mode (one row flushed per target)
+    with open(augmented_path, "a", encoding="utf-8") as out_handle:
+        for target_idx in targets:
+            if target_idx in already_done:
+                stats["targets_skipped_resume"] += 1
+                continue
+            if stats["mllm_calls"] >= cfg.max_mllm_calls:
+                print(f"[som] budget cap reached at {stats['mllm_calls']} mllm calls; stopping.")
+                break
+
+            target_dir = os.path.join(cfg.output_dir, f"target_{target_idx:06d}")
+            os.makedirs(target_dir, exist_ok=True)
+
+            target_frame = load_frame(cfg.video_path, target_idx)
+            if target_frame is None:
+                stats["targets_skipped"] += 1
+                print(f"[som] frame {target_idx} unreadable; skipping.")
+                continue
+
+            target_img_path = os.path.join(target_dir, "01_raw.png")
+            cv2.imwrite(target_img_path, target_frame)
+
+            # Dense candidates
+            candidates = generate_dense_candidates(
+                image_path=target_img_path,
+                broad_prompts=list(cfg.broad_prompts),
+                output_folder=os.path.join(target_dir, "sam_out"),
+                internal_iou_dedup=cfg.internal_iou_dedup,
+                _call_sam_service=call_sam,
+            )
+
+            if not candidates:
+                stats["targets_skipped"] += 1
+                print(f"[som] frame {target_idx} no_candidates; skipping.")
+                continue
+
+            # Existing text-agent masks for this frame
+            existing_row = _existing_row_for_frame(frame_outputs, target_idx)
+            from nibi_model_compare.frame_output_utils import decode_rle_to_mask
+            existing_masks = []
+            for rle in existing_row.get("out_binary_masks_rle", []):
+                size = rle.get("size", []) if isinstance(rle, dict) else []
+                if len(size) >= 2:
+                    h_rle, w_rle = int(size[0]), int(size[1])
+                else:
+                    h_rle, w_rle = target_frame.shape[0], target_frame.shape[1]
+                existing_masks.append(
+                    {"mask": decode_rle_to_mask(rle, h_rle, w_rle).astype(bool)}
+                )
+
+            survivors_with_reasons = filter_candidates_with_reasons(
+                candidates, existing_masks,
+                iou_dedup=cfg.iou_dedup,
+                min_area_px=cfg.min_area_px,
+                max_area_frac=cfg.max_area_frac,
+                edge_tol_px=cfg.edge_tol_px,
+            )
+            survivors = [c for c, r in survivors_with_reasons if r is None]
+
+            # Save candidate decisions for debug
+            with open(os.path.join(target_dir, "candidates.json"), "w") as f:
+                json.dump([
+                    {
+                        "bbox_xywh": c["bbox_xywh"],
+                        "score": c["score"],
+                        "source_prompt": c.get("source_prompt"),
+                        "drop_reason": r,
+                    }
+                    for c, r in survivors_with_reasons
+                ], f, indent=2)
+
+            if not survivors:
+                stats["targets_skipped"] += 1
+                print(f"[som] frame {target_idx} nothing_after_dedup; skipping.")
+                continue
+
+            # Sort by descending area so larger marks get lower ids
+            survivors.sort(key=lambda c: -int(np.asarray(c["mask"], dtype=bool).sum()))
+
+            # Render marks
+            marked = draw_numbered_marks(target_frame, survivors)
+            marked_path = os.path.join(target_dir, "04_marked.png")
+            cv2.imwrite(marked_path, marked)
+
+            # Neighbour frames (unmarked)
+            neighbour_paths: list[str] = []
+            nb_dir = os.path.join(target_dir, "neighbours")
+            os.makedirs(nb_dir, exist_ok=True)
+            for offset_idx in range(1, cfg.num_neighbours + 1):
+                for sign, label in ((-1, "neg"), (+1, "pos")):
+                    nb_idx = target_idx + sign * cfg.neighbour_offset_frames * offset_idx
+                    if nb_idx < 0:
+                        continue
+                    nb_frame = load_frame(cfg.video_path, nb_idx)
+                    if nb_frame is None:
+                        continue
+                    nb_path = os.path.join(nb_dir, f"{label}{offset_idx}.png")
+                    cv2.imwrite(nb_path, nb_frame)
+                    neighbour_paths.append(nb_path)
+
+            # MLLM call
+            messages = build_som_prompt_messages(
+                system_prompt=system_prompt,
+                target_image_path=marked_path,
+                neighbour_image_paths=neighbour_paths,
+                initial_text_prompt=cfg.initial_text_prompt,
+                num_marks=len(survivors),
+            )
+            with open(os.path.join(target_dir, "mllm_request.json"), "w") as f:
+                # Don't serialise raw image bytes; just record the structure
+                redacted = []
+                for msg in messages:
+                    if isinstance(msg.get("content"), list):
+                        items = [
+                            ({"type": "image", "image": item["image"]}
+                             if item.get("type") == "image"
+                             else item)
+                            for item in msg["content"]
+                        ]
+                        redacted.append({"role": msg["role"], "content": items})
+                    else:
+                        redacted.append(msg)
+                json.dump(redacted, f, indent=2)
+
+            response_text = send_mllm(messages)
+            stats["mllm_calls"] += 1
+            with open(os.path.join(target_dir, "mllm_response.txt"), "w") as f:
+                f.write(response_text or "")
+
+            accepted_ids = parse_som_response(
+                response_text,
+                valid_ids=set(range(1, len(survivors) + 1)),
+            )
+            accepted_candidates = [
+                survivors[i - 1] for i in accepted_ids
+            ]
+            with open(os.path.join(target_dir, "accepted.json"), "w") as f:
+                json.dump(accepted_ids, f)
+
+            new_row = merge_accepted_masks_into_row(
+                existing_row, accepted_candidates,
+            )
+            out_handle.write(json.dumps(new_row) + "\n")
+            out_handle.flush()
+
+            stats["targets_processed"] += 1
+            stats["masks_accepted"] += len(accepted_candidates)
+
+    # Write summary
+    summary_path = os.path.join(cfg.output_dir, "summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    return stats

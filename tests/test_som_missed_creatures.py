@@ -715,5 +715,227 @@ class LoadSystemPromptTests(unittest.TestCase):
             load_system_prompt("nonsense")
 
 
+import json as _json
+
+from nibi_model_compare.som_missed_creatures import (
+    run_som_stage,
+    SomStageConfig,
+)
+
+
+class RunSomStageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workdir = self.tmp.name
+
+        # Fake video: 60 black frames @ 30fps as PNG sequence (we mock
+        # the frame loader, so we don't need an actual mp4 here)
+        self.video_path = os.path.join(self.workdir, "fake.mp4")
+        with open(self.video_path, "w") as f:
+            f.write("(stub)")
+
+        # Existing frame_results.jsonl
+        self.frame_results_path = os.path.join(self.workdir, "frame_results.jsonl")
+        with open(self.frame_results_path, "w") as f:
+            for i in range(60):
+                row = {
+                    "frame_index": i,
+                    "num_masks": 2,
+                    "error": None,
+                    "skipped": False,
+                }
+                f.write(_json.dumps(row) + "\n")
+
+        # Existing frame_outputs_rle.json with two text-agent masks per frame
+        self.frame_outputs_path = os.path.join(self.workdir, "frame_outputs_rle.json")
+        from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+        frames = []
+        for i in range(60):
+            yy, xx = np.ogrid[:64, :64]
+            m1 = ((yy - 10) ** 2 + (xx - 10) ** 2) <= 4 * 4
+            m2 = ((yy - 50) ** 2 + (xx - 50) ** 2) <= 4 * 4
+            frames.append({
+                "frame_index": i,
+                "out_obj_ids": [1, 2],
+                "out_binary_masks_rle": [
+                    encode_binary_mask_to_rle(m1),
+                    encode_binary_mask_to_rle(m2),
+                ],
+                "out_boxes_xywh": [[6, 6, 9, 9], [46, 46, 9, 9]],
+                "out_probs": [0.9, 0.9],
+                "out_tracker_probs": [0.9, 0.9],
+            })
+        with open(self.frame_outputs_path, "w") as f:
+            _json.dump({"format_version": 2, "frames": frames}, f)
+
+        # Fake video frame loader: every frame is a 64x64 grey image
+        def fake_load_frame(video_path, frame_index):
+            return np.full((64, 64, 3), 80, dtype=np.uint8)
+        self.fake_load_frame = fake_load_frame
+
+        # Fake SAM3 service: always returns one "new" mask in the centre
+        # (not covered by the existing two corner masks)
+        def fake_sam(image_path, text_prompt, output_folder_path):
+            out_path = os.path.join(
+                output_folder_path,
+                f"sam_{text_prompt}_{os.path.basename(image_path)}.json",
+            )
+            from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+            yy, xx = np.ogrid[:64, :64]
+            m = ((yy - 32) ** 2 + (xx - 32) ** 2) <= 5 * 5
+            ys, xs = np.where(m)
+            payload = {
+                "original_image_path": image_path,
+                "orig_img_h": 64,
+                "orig_img_w": 64,
+                "pred_masks": [encode_binary_mask_to_rle(m)],
+                "pred_boxes": [[int(xs.min()), int(ys.min()),
+                                int(xs.max() - xs.min() + 1),
+                                int(ys.max() - ys.min() + 1)]],
+                "pred_scores": [0.85],
+            }
+            with open(out_path, "w") as f:
+                _json.dump(payload, f)
+            return out_path
+        self.fake_sam = fake_sam
+
+        # Fake MLLM: always accepts mark 1
+        def fake_mllm(messages, **_kw):
+            return '<answer>{"accepted_marks": [1]}</answer>'
+        self.fake_mllm = fake_mllm
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _config(self, **overrides):
+        cfg = dict(
+            video_path=self.video_path,
+            frame_results_path=self.frame_results_path,
+            frame_outputs_path=self.frame_outputs_path,
+            output_dir=os.path.join(self.workdir, "som_out"),
+            prompt_profile="underwater",
+            initial_text_prompt="small creatures",
+            num_target_frames=3,
+            frame_selection_strategy="uniform",
+            target_frames_explicit=None,
+            broad_prompts=["creature"],
+            num_neighbours=2,
+            neighbour_offset_frames=15,
+            iou_dedup=0.3,
+            min_area_px=4,
+            max_area_frac=0.5,
+            edge_tol_px=2,
+            internal_iou_dedup=0.5,
+            max_mllm_calls=100,
+        )
+        cfg.update(overrides)
+        return SomStageConfig(**cfg)
+
+    def test_end_to_end_appends_one_mask_per_target_frame(self):
+        cfg = self._config()
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _call_sam_service=self.fake_sam,
+            _send_mllm_request=self.fake_mllm,
+        )
+
+        self.assertEqual(result["targets_processed"], 3)
+        # Augmented JSONL exists with one row per target
+        augmented = os.path.join(cfg.output_dir, "augmented_frame_outputs.jsonl")
+        with open(augmented) as f:
+            rows = [_json.loads(line) for line in f]
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            # Each row has the 2 original + 1 new mask
+            self.assertEqual(len(row["out_obj_ids"]), 3)
+            self.assertEqual(row["added_obj_ids"], [3])
+            self.assertEqual(row["source"], "som")
+
+    def test_skips_frame_when_amg_returns_zero(self):
+        def empty_sam(image_path, text_prompt, output_folder_path):
+            out_path = os.path.join(output_folder_path, "empty.json")
+            with open(out_path, "w") as f:
+                _json.dump({
+                    "original_image_path": image_path,
+                    "orig_img_h": 64, "orig_img_w": 64,
+                    "pred_masks": [], "pred_boxes": [], "pred_scores": [],
+                }, f)
+            return out_path
+
+        cfg = self._config(num_target_frames=2)
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _call_sam_service=empty_sam,
+            _send_mllm_request=self.fake_mllm,
+        )
+
+        self.assertEqual(result["targets_processed"], 0)
+        self.assertEqual(result["targets_skipped"], 2)
+        # Augmented JSONL exists but is empty
+        augmented = os.path.join(cfg.output_dir, "augmented_frame_outputs.jsonl")
+        with open(augmented) as f:
+            self.assertEqual(f.read().strip(), "")
+
+    def test_mllm_returns_out_of_range_logs_and_continues(self):
+        def oob_mllm(messages, **_kw):
+            return '<answer>{"accepted_marks": [99]}</answer>'
+
+        cfg = self._config(num_target_frames=2)
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _call_sam_service=self.fake_sam,
+            _send_mllm_request=oob_mllm,
+        )
+
+        self.assertEqual(result["targets_processed"], 2)
+        # No new masks were appended because all proposed ids were OOB
+        augmented = os.path.join(cfg.output_dir, "augmented_frame_outputs.jsonl")
+        with open(augmented) as f:
+            rows = [_json.loads(line) for line in f]
+        for row in rows:
+            self.assertEqual(row["added_obj_ids"], [])
+
+    def test_budget_cap_stops_early(self):
+        cfg = self._config(num_target_frames=10, max_mllm_calls=2)
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _call_sam_service=self.fake_sam,
+            _send_mllm_request=self.fake_mllm,
+        )
+        # Stopped after 2 MLLM calls (1 per target)
+        self.assertLessEqual(result["mllm_calls"], 2)
+
+    def test_resume_skips_already_processed_targets(self):
+        cfg = self._config(num_target_frames=3)
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        augmented = os.path.join(cfg.output_dir, "augmented_frame_outputs.jsonl")
+        with open(augmented, "w") as f:
+            # Pretend target 0 was already processed
+            f.write(_json.dumps({
+                "frame_index": 0,
+                "source": "som",
+                "added_obj_ids": [3],
+                "out_obj_ids": [1, 2, 3],
+                "out_binary_masks_rle": [],
+                "out_boxes_xywh": [],
+                "out_probs": [],
+                "out_tracker_probs": [],
+            }) + "\n")
+
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _call_sam_service=self.fake_sam,
+            _send_mllm_request=self.fake_mllm,
+        )
+        # Target 0 should have been resumed (not reprocessed)
+        self.assertEqual(result["targets_skipped_resume"], 1)
+        self.assertEqual(result["targets_processed"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
