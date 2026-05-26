@@ -139,4 +139,4 @@ def _motion_keyframe_selector(valid_rows: list[dict], k: int) -> list[int]:
         return indices
     step = (len(indices) - 1) / (k - 1) if k > 1 else 0
     picked = [indices[round(i * step)] for i in range(k)]
-    return sorted(set(picked))  # type: ignore[return-value]
+    return sorted(set(picked))
