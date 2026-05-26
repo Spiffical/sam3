@@ -213,6 +213,75 @@ def filter_candidates(
     ) if reason is None]
 
 
+def draw_numbered_marks(
+    frame_bgr,
+    candidates: list[dict],
+    *,
+    alpha: float = 0.35,
+    palette_seed: int = 7,
+):
+    """Render numbered marks on top of a frame.
+
+    Each candidate gets a translucent mask overlay (so the MLLM sees both
+    the dot location and the implied shape) and a numeric label at the
+    centroid. Marks are numbered 1..N in the order candidates are given
+    (callers should pre-sort by descending area so larger objects get
+    lower ids).
+
+    Returns a new BGR (uint8) array of the same shape as the input frame.
+
+    Color source: ColorPalette.default().by_idx(idx) -- wraps at palette
+    length (~20 colours). ``palette_seed`` is ignored (kept for API
+    stability) because ColorPalette.by_idx takes no seed argument; callers
+    that need reproducible-but-different colours should wrap or subclass.
+    """
+    import cv2
+    import numpy as np
+
+    from sam3.agent.helpers.som_utils import ColorPalette
+
+    out = frame_bgr.copy()
+    if not candidates:
+        return out
+
+    # ColorPalette.by_idx(idx) -> Color; use .as_bgr() for cv2 compatibility.
+    palette = ColorPalette.default()
+
+    for idx, cand in enumerate(candidates, start=1):
+        mask = np.asarray(cand["mask"], dtype=bool)
+        color_obj = palette.by_idx(idx)          # Color dataclass (r, g, b)
+        color_bgr = color_obj.as_bgr()           # (b, g, r) tuple of ints
+
+        # Translucent mask overlay
+        overlay = out.copy()
+        overlay[mask] = (
+            (1.0 - alpha) * out[mask].astype(np.float32)
+            + alpha * np.asarray(color_bgr, dtype=np.float32)
+        ).astype(np.uint8)
+        out = overlay
+
+        # Outline contour for crisp boundary
+        contours, _ = cv2.findContours(
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(out, contours, -1, [int(c) for c in color_bgr], 1)
+
+        # Label at centroid, with shadow for readability
+        ys, xs = np.where(mask)
+        cy, cx = int(ys.mean()), int(xs.mean())
+        label = str(idx)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.6
+        thickness = 1
+        (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+        org = (max(2, cx - tw // 2), max(th + 2, cy + th // 2))
+        cv2.putText(out, label, org, font, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(out, label, org, font, scale,
+                    [int(c) for c in color_bgr], thickness, cv2.LINE_AA)
+
+    return out
+
+
 def filter_candidates_with_reasons(
     candidates: list[dict],
     existing_masks: list[dict],

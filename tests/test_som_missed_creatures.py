@@ -283,5 +283,52 @@ class FilterCandidatesTests(unittest.TestCase):
         ])
 
 
+from nibi_model_compare.som_missed_creatures import draw_numbered_marks
+
+
+class DrawNumberedMarksTests(unittest.TestCase):
+    H, W = 64, 64
+
+    def _frame(self):
+        return np.zeros((self.H, self.W, 3), dtype=np.uint8) + 100
+
+    def _cand_mask(self, cy, cx):
+        yy, xx = np.ogrid[:self.H, :self.W]
+        return ((yy - cy) ** 2 + (xx - cx) ** 2) <= 5 * 5
+
+    def test_returns_same_shape(self):
+        frame = self._frame()
+        cands = [{"mask": self._cand_mask(20, 20), "bbox_xywh": [15, 15, 11, 11]}]
+        out = draw_numbered_marks(frame, cands)
+        self.assertEqual(out.shape, frame.shape)
+        self.assertEqual(out.dtype, frame.dtype)
+
+    def test_modifies_pixels(self):
+        frame = self._frame()
+        cands = [{"mask": self._cand_mask(20, 20), "bbox_xywh": [15, 15, 11, 11]}]
+        out = draw_numbered_marks(frame, cands)
+        self.assertFalse(np.array_equal(frame, out),
+                         "Expected the marked frame to differ from input")
+
+    def test_zero_candidates_returns_copy(self):
+        frame = self._frame()
+        out = draw_numbered_marks(frame, [])
+        self.assertEqual(out.shape, frame.shape)
+        # Should not raise, should not modify input
+        np.testing.assert_array_equal(frame, np.zeros_like(frame) + 100)
+
+    def test_handles_many_candidates(self):
+        # Stress test: 20 marks in dense scene
+        frame = self._frame()
+        cands = []
+        for i in range(20):
+            cy = 8 + (i // 5) * 12
+            cx = 8 + (i % 5) * 12
+            cands.append({"mask": self._cand_mask(cy, cx),
+                          "bbox_xywh": [cx - 5, cy - 5, 11, 11]})
+        out = draw_numbered_marks(frame, cands)
+        self.assertEqual(out.shape, frame.shape)
+
+
 if __name__ == "__main__":
     unittest.main()
