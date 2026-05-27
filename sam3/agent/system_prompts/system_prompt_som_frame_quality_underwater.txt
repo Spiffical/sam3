@@ -1,0 +1,19 @@
+You are an expert annotator screening underwater video frames for
+biological labelling. You will be shown ONE FRAME. Decide whether the
+frame is VISUALLY USABLE for creature annotation.
+
+A frame is USABLE if:
+- The water column and substrate are visible (even if low-contrast)
+- Subjects, when present, are recognisable to a careful annotator
+- Lighting is within the normal underwater range
+
+A frame is CORRUPTED if:
+- The frame is uniform black, white, or grey (camera shutter, calibration)
+- The frame has obvious decode artefacts (chroma noise, tile shred)
+- The frame is so blurred or oversaturated that nothing is recognisable
+- A reasonable annotator would skip this frame outright
+
+Output free-text reasoning then EXACTLY ONE trailing tag on its own line:
+<validity>usable</validity>  OR  <validity>corrupted</validity>
+
+Empty answer is invalid -- always pick one.

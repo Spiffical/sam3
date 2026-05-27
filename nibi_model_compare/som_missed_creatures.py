@@ -1073,6 +1073,28 @@ class Sam3PointService:
 
         return out
 
+    def refine_segment(
+        self,
+        image_path: str,
+        group: dict,
+        *,
+        add_points: list[dict],
+        output_folder: str | None = None,
+    ) -> dict:
+        """Re-run SAM3 click mode with the group's original clicks PLUS
+        the new add_points (foreground or background by label). Returns
+        the same shape group_segment returns, with select_reason and
+        area_px reflecting the refinement run."""
+        existing_clicks = list(group.get("clicks_used") or group.get("clicks") or [])
+        combined_clicks = existing_clicks + list(add_points or [])
+        refined_group = {
+            "id": group.get("creature_id", group.get("id", -1)),
+            "description": group.get("description", ""),
+            "clicks": combined_clicks,
+        }
+        results = self.group_segment(image_path, [refined_group], output_folder=output_folder)
+        return results[0]
+
     def point_segment(
         self, image_path: str, clicks: list[dict], output_folder: str | None = None,
     ) -> list[dict]:
@@ -1226,7 +1248,321 @@ def generate_click_based_candidates(
     return candidates, groups, response_text
 
 
-from dataclasses import dataclass
+def parse_frame_validity(text: str) -> str | None:
+    """Returns 'usable', 'corrupted', or None (malformed)."""
+    import re
+    m = re.findall(r"<validity>\s*(usable|corrupted)\s*</validity>", text or "", flags=re.IGNORECASE)
+    if not m:
+        return None
+    return m[-1].lower()
+
+
+def parse_refinement_response(text: str) -> dict | None:
+    """Returns {"action": "accept"|"reject"|"refine",
+                "add_points": list of {x,y,label}} or None (malformed)."""
+    import json as _json_mod
+    import re as _re_mod
+
+    if not isinstance(text, str) or not text:
+        return None
+    matches = _re_mod.findall(r"<refine>\s*(.*?)\s*</refine>", text, flags=_re_mod.DOTALL)
+    if not matches:
+        return None
+    raw = matches[-1].strip()
+    try:
+        payload = _json_mod.loads(raw)
+    except _json_mod.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    action = payload.get("action")
+    if action not in ("accept", "reject", "refine"):
+        return None
+    if action == "refine":
+        raw_points = payload.get("add_points")
+        if not isinstance(raw_points, list):
+            return None
+        good_points = []
+        for pt in raw_points:
+            if not isinstance(pt, dict):
+                continue
+            x = pt.get("x")
+            y = pt.get("y")
+            label = pt.get("label")
+            if isinstance(x, bool) or not isinstance(x, (int, float)):
+                continue
+            if isinstance(y, bool) or not isinstance(y, (int, float)):
+                continue
+            if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
+                continue
+            if label not in (0, 1):
+                continue
+            good_points.append({"x": float(x), "y": float(y), "label": int(label)})
+        return {"action": "refine", "add_points": good_points}
+    return {"action": action, "add_points": []}
+
+
+def load_frame_quality_system_prompt(profile: str) -> str:
+    """Load the SoM frame-quality screening system prompt for the requested profile.
+
+    ``profile`` is one of: 'underwater', 'general'. Other values raise ValueError.
+    """
+    valid = {"underwater", "general"}
+    if profile not in valid:
+        raise ValueError(
+            f"Unknown profile '{profile}'. Expected one of: {sorted(valid)}."
+        )
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(
+        here,
+        "sam3", "agent", "system_prompts",
+        f"system_prompt_som_frame_quality_{profile}.txt",
+    )
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def load_refinement_system_prompt(profile: str) -> str:
+    """Load the SoM per-mark refinement system prompt for the requested profile.
+
+    ``profile`` is one of: 'underwater', 'general'. Other values raise ValueError.
+    """
+    valid = {"underwater", "general"}
+    if profile not in valid:
+        raise ValueError(
+            f"Unknown profile '{profile}'. Expected one of: {sorted(valid)}."
+        )
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(
+        here,
+        "sam3", "agent", "system_prompts",
+        f"system_prompt_som_mark_refinement_{profile}.txt",
+    )
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def screen_target_frames_for_quality(
+    target_indices: list[int],
+    *,
+    video_path: str,
+    load_frame,
+    output_folder: str,
+    mllm_send,
+    valid_frame_pool: list[int],
+    max_replacements_per_slot: int = 5,
+) -> tuple[list[int], list[dict]]:
+    """For each frame in target_indices, run an MLLM usability check.
+    Replace any frame the MLLM flags as corrupted/unusable with the
+    nearest frame in valid_frame_pool that hasn't been used and passes
+    the same check, up to max_replacements_per_slot attempts.
+
+    Saves each tested frame as a PNG under output_folder/quality_checks/
+    so debug artefacts capture the screening.
+
+    Returns (final_target_indices, screening_report) where
+    screening_report is a list of {original_index, replaced_with,
+    verdicts: [{frame_index, validity, reason}]}.
+    """
+    import cv2
+
+    qc_dir = os.path.join(output_folder, "quality_checks")
+    os.makedirs(qc_dir, exist_ok=True)
+
+    try:
+        system_prompt_text = load_frame_quality_system_prompt("underwater")
+    except Exception:
+        try:
+            system_prompt_text = load_frame_quality_system_prompt("general")
+        except Exception:
+            system_prompt_text = (
+                "Classify this frame. Output exactly one trailing tag: "
+                "<validity>usable</validity> or <validity>corrupted</validity>."
+            )
+
+    pool_sorted = sorted(valid_frame_pool)
+    used_indices: set[int] = set(target_indices)
+    final_targets: list[int] = list(target_indices)
+    screening_report: list[dict] = []
+
+    for slot_idx, orig_idx in enumerate(target_indices):
+        # Build candidate queue: original first, then nearest neighbours from pool
+        # sweeping outward by distance.
+        other_pool = [i for i in pool_sorted if i != orig_idx]
+        other_pool.sort(key=lambda i: abs(i - orig_idx))
+        candidates_to_try = [orig_idx] + other_pool
+
+        verdicts: list[dict] = []
+        replaced_with: int | None = None
+        current = orig_idx
+
+        for attempt_idx, candidate_idx in enumerate(candidates_to_try):
+            if attempt_idx > 0 and attempt_idx > max_replacements_per_slot:
+                # Exhausted replacement budget; keep original
+                final_targets[slot_idx] = orig_idx
+                break
+            # Skip indices already claimed by other slots (except the original itself)
+            if attempt_idx > 0 and candidate_idx in used_indices:
+                continue
+
+            frame_bgr = load_frame(video_path, candidate_idx)
+            if frame_bgr is None:
+                verdicts.append({
+                    "frame_index": candidate_idx,
+                    "validity": "corrupted",
+                    "reason": "frame_unreadable",
+                })
+                continue
+
+            # Save frame for debug
+            frame_png = os.path.join(qc_dir, f"slot{slot_idx:02d}_f{candidate_idx:06d}.png")
+            cv2.imwrite(frame_png, frame_bgr)
+
+            user_content = [
+                {"type": "image", "image": frame_png},
+                {"type": "text", "text": (
+                    "Is this frame visually usable for biological annotation? "
+                    "Output exactly one tag at the end: "
+                    "<validity>usable</validity> or <validity>corrupted</validity>. "
+                    "Brief reasoning above is fine."
+                )},
+            ]
+            messages = [
+                {"role": "system", "content": system_prompt_text},
+                {"role": "user", "content": user_content},
+            ]
+            try:
+                response = mllm_send(messages)
+            except Exception as exc:
+                response = f"error: {exc}"
+
+            validity = parse_frame_validity(response or "")
+            if validity is None:
+                validity = "usable"  # lenient default on malformed response
+
+            verdicts.append({
+                "frame_index": candidate_idx,
+                "validity": validity,
+                "reason": (response or "")[:200],
+            })
+
+            if validity == "usable":
+                final_targets[slot_idx] = candidate_idx
+                if candidate_idx != orig_idx:
+                    replaced_with = candidate_idx
+                    used_indices.add(candidate_idx)
+                break
+        else:
+            # All candidates exhausted without finding a usable frame;
+            # keep the original so we don't silently drop the slot.
+            final_targets[slot_idx] = orig_idx
+
+        screening_report.append({
+            "original_index": orig_idx,
+            "replaced_with": replaced_with,
+            "verdicts": verdicts,
+        })
+
+    return final_targets, screening_report
+
+
+def render_refinement_crop(
+    frame_bgr,
+    candidate: dict,
+    pad_frac: float = 0.25,
+) -> "np.ndarray":
+    """Crop the frame around the candidate mask with padding, render
+    the mask as a translucent green overlay, and overlay the original
+    click points as small dots. Returns a cropped BGR array suitable
+    for MLLM consumption."""
+    import cv2
+    import numpy as np
+
+    h, w = frame_bgr.shape[:2]
+    mask = np.asarray(candidate.get("mask"), dtype=bool)
+    if not mask.any():
+        # Fall back to full frame if no mask pixels
+        return frame_bgr.copy()
+
+    ys, xs = np.where(mask)
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+
+    bw = x1 - x0 + 1
+    bh = y1 - y0 + 1
+    pad_x = max(1, int(round(bw * pad_frac)))
+    pad_y = max(1, int(round(bh * pad_frac)))
+
+    cx0 = max(0, x0 - pad_x)
+    cy0 = max(0, y0 - pad_y)
+    cx1 = min(w - 1, x1 + pad_x)
+    cy1 = min(h - 1, y1 + pad_y)
+
+    crop = frame_bgr[cy0:cy1 + 1, cx0:cx1 + 1].copy()
+    crop_mask = mask[cy0:cy1 + 1, cx0:cx1 + 1]
+
+    # Green translucent overlay
+    green = np.array([0, 255, 0], dtype=np.float32)
+    crop_f = crop.astype(np.float32)
+    crop_f[crop_mask] = 0.65 * crop_f[crop_mask] + 0.35 * green
+    crop = crop_f.astype(np.uint8)
+
+    # Overlay original click points
+    clicks_used = candidate.get("clicks_used") or []
+    for c in clicks_used:
+        px = int(round(float(c["x"]) * w)) - cx0
+        py = int(round(float(c["y"]) * h)) - cy0
+        if 0 <= px < crop.shape[1] and 0 <= py < crop.shape[0]:
+            color = (0, 0, 255) if int(c.get("label", 1)) == 1 else (255, 0, 0)
+            cv2.circle(crop, (px, py), 6, color, 2)
+            cv2.circle(crop, (px, py), 2, (255, 255, 255), -1)
+
+    return crop
+
+
+def build_refinement_messages(
+    *,
+    system_prompt: str,
+    crop_image_path: str,
+    original_clicks: list[dict],
+    neighbour_paths: list[str],
+    description: str | None,
+) -> list[dict]:
+    """Build the MLLM message list for a per-mark refinement call."""
+    desc_text = description or "(unknown creature)"
+    click_text = (
+        ", ".join(
+            f"({'fg' if int(c.get('label', 1)) == 1 else 'bg'} @ "
+            f"{float(c['x']):.3f},{float(c['y']):.3f})"
+            for c in (original_clicks or [])
+        )
+        or "(none)"
+    )
+    user_text = (
+        f"Candidate creature: '{desc_text}'.\n"
+        f"Original SAM3 clicks: {click_text}.\n"
+        f"The first image shows the candidate mask (green overlay) in a zoomed crop.\n"
+        f"The mask was REJECTED by the judge. Please review and output one of:\n"
+        f"  <refine>{{\"action\":\"accept\"}}</refine>  — mask is actually fine\n"
+        f"  <refine>{{\"action\":\"reject\"}}</refine>  — mask is unsalvageable\n"
+        f"  <refine>{{\"action\":\"refine\",\"add_points\":[{{\"x\":<float>,\"y\":<float>,\"label\":1}},...]}}</refine>"
+        f"  — propose new SAM3 clicks (coords in FULL-FRAME normalized [0,1])\n"
+        f"Keep add_points to 1-2 entries. Always output exactly one tag."
+    )
+    user_content: list[dict] = [
+        {"type": "image", "image": crop_image_path},
+        {"type": "text", "text": user_text},
+    ]
+    for nb_path in (neighbour_paths or []):
+        user_content.append({"type": "image", "image": nb_path})
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -1249,6 +1585,10 @@ class SomStageConfig:
     internal_iou_dedup: float
     max_mllm_calls: int
     discovery_num_neighbours: int = 4
+    screen_frame_quality: bool = True
+    quality_check_max_replacements_per_slot: int = 5
+    enable_refinement: bool = True
+    max_refinement_iters: int = 2
 
 
 def _load_video_frame_default(video_path: str, frame_index: int):
@@ -1357,17 +1697,21 @@ def run_som_stage(
     _load_video_frame=None,
     _send_mllm_request=None,
     _sam3_point_service=None,
+    _screen_frame_quality=None,
 ) -> dict:
     """Run the SoM missed-creature stage end-to-end.
 
     New architecture (click-discovery):
+      0. (A) MLLM frame-quality screen: verify each target frame is usable,
+             replace corrupted frames with nearest valid neighbours.
       1. Render existing masks as overlay → 02_existing_masks.png
       2. MLLM discovery call: proposes click (x,y) for missed creatures
       3. SAM3 image point-mode → candidate masks per click
       4. filter_candidates_with_reasons (size, dedup)
       5. draw_numbered_marks → 04_marked.png
       6. MLLM judge call: accepts/rejects numbered marks
-      7. merge accepted masks into augmented JSONL row
+      7. (C) Per-mark refinement sub-loop for rejected candidates
+      8. merge accepted masks into augmented JSONL row
 
     Returns a summary dict with counts. All per-target artefacts and the
     augmented JSONL are written under ``cfg.output_dir``.
@@ -1376,6 +1720,10 @@ def run_som_stage(
     per-target flush. It is NOT safe to run two processes concurrently
     on the same output_dir -- there is no file lock around the append.
     Resume is supported within a single sequential run only.
+
+    Test seams:
+      _screen_frame_quality: if provided, replaces screen_target_frames_for_quality.
+                             Signature: (target_indices, ...) -> (list[int], list[dict])
     """
     import cv2
     import numpy as np
@@ -1397,6 +1745,29 @@ def run_som_stage(
         explicit=cfg.target_frames_explicit,
     )
 
+    # --- (A) MLLM frame-quality screening ---
+    screening_report: list[dict] = []
+    if cfg.screen_frame_quality and targets:
+        # Build the full valid pool from frame_results (same filtering as select_target_frames)
+        valid_pool = sorted(
+            int(row["frame_index"]) for row in frame_results
+            if not row.get("error") and not row.get("skipped")
+            and (row.get("num_masks") or 0) > 0
+        )
+        screen_fn = _screen_frame_quality or screen_target_frames_for_quality
+        targets, screening_report = screen_fn(
+            targets,
+            video_path=cfg.video_path,
+            load_frame=load_frame,
+            output_folder=cfg.output_dir,
+            mllm_send=send_mllm,
+            valid_frame_pool=valid_pool,
+            max_replacements_per_slot=cfg.quality_check_max_replacements_per_slot,
+        )
+        # Save screening report
+        with open(os.path.join(cfg.output_dir, "screening_report.json"), "w") as f:
+            json.dump(screening_report, f, indent=2)
+
     # Resume support: read the augmented JSONL if it already exists
     augmented_path = os.path.join(cfg.output_dir, "augmented_frame_outputs.jsonl")
     already_done = {int(row["frame_index"])
@@ -1412,6 +1783,15 @@ def run_som_stage(
         "targets_skipped_resume": 0,
         "mllm_calls": 0,
         "masks_accepted": 0,
+        "targets_quality_replaced": sum(
+            1 for r in screening_report if r.get("replaced_with") is not None
+        ),
+        "targets_quality_kept_corrupted": sum(
+            1 for r in screening_report
+            if r.get("replaced_with") is None
+            and r.get("verdicts")
+            and r["verdicts"][0].get("validity") == "corrupted"
+        ),
     }
 
     # Open augmented JSONL in append mode (one row flushed per target)
@@ -1575,8 +1955,81 @@ def run_som_stage(
                 valid_ids=set(range(1, len(survivors) + 1)),
             )
             accepted_candidates = [survivors[i - 1] for i in accepted_ids]
+            rejected_candidates = [
+                survivors[i - 1]
+                for i in range(1, len(survivors) + 1)
+                if i not in set(accepted_ids)
+            ]
+
             with open(os.path.join(target_dir, "06_accepted.json"), "w") as f:
                 json.dump(accepted_ids, f)
+
+            # --- (C) REFINEMENT sub-loop ---
+            if (cfg.enable_refinement
+                    and rejected_candidates
+                    and point_service is not None
+                    and stats["mllm_calls"] < cfg.max_mllm_calls):
+                refinement_system_prompt = load_refinement_system_prompt(cfg.prompt_profile)
+                for cand in rejected_candidates:
+                    cand_id = cand.get("creature_id", "unknown")
+                    ref_dir = os.path.join(target_dir, "refinement", str(cand_id))
+                    os.makedirs(ref_dir, exist_ok=True)
+                    for iter_idx in range(cfg.max_refinement_iters):
+                        if stats["mllm_calls"] >= cfg.max_mllm_calls:
+                            break
+                        # Render crop with mask overlay and clicks
+                        crop_bgr = render_refinement_crop(target_frame, cand)
+                        crop_path = os.path.join(
+                            ref_dir, f"iter_{iter_idx:02d}_crop.png"
+                        )
+                        cv2.imwrite(crop_path, crop_bgr)
+
+                        ref_messages = build_refinement_messages(
+                            system_prompt=refinement_system_prompt,
+                            crop_image_path=crop_path,
+                            original_clicks=cand.get("clicks_used", []),
+                            neighbour_paths=judge_nb_paths,
+                            description=cand.get("description"),
+                        )
+                        ref_resp = send_mllm(ref_messages)
+                        stats["mllm_calls"] += 1
+
+                        # Save artefacts
+                        with open(
+                            os.path.join(ref_dir, f"iter_{iter_idx:02d}_response.txt"), "w"
+                        ) as f:
+                            f.write(ref_resp or "")
+
+                        parsed_ref = parse_refinement_response(ref_resp)
+                        if parsed_ref is None or parsed_ref["action"] == "reject":
+                            break
+                        if parsed_ref["action"] == "accept":
+                            accepted_candidates.append(cand)
+                            break
+                        # action == "refine": re-run SAM3 with new points
+                        new_points = parsed_ref.get("add_points") or []
+                        if not new_points:
+                            # No actionable points; treat as reject
+                            break
+                        ref_result = point_service.refine_segment(
+                            target_img_path, cand,
+                            add_points=new_points,
+                            output_folder=ref_dir,
+                        )
+                        # Update candidate in-place for next iteration
+                        cand["mask"] = ref_result["mask"]
+                        cand["area_px"] = ref_result.get("area_px", int(np.asarray(ref_result["mask"], dtype=bool).sum()))
+                        cand["select_reason"] = ref_result.get("select_reason", "refined")
+                        cand["clicks_used"] = (
+                            list(cand.get("clicks_used") or []) + new_points
+                        )
+                        # Save refined mask vis
+                        ref_mask_vis = draw_numbered_marks(target_frame, [cand])
+                        cv2.imwrite(
+                            os.path.join(ref_dir, f"iter_{iter_idx:02d}_mask.png"),
+                            ref_mask_vis,
+                        )
+                        # Loop continues; next iteration checks the new mask
 
             # Render accepted masks → 07_accepted_masks.png
             accepted_vis = draw_numbered_marks(target_frame, accepted_candidates)

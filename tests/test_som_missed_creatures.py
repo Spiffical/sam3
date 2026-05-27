@@ -936,6 +936,9 @@ class RunSomStageTests(unittest.TestCase):
             internal_iou_dedup=0.5,
             max_mllm_calls=100,
             discovery_num_neighbours=4,
+            # Disable new features so legacy tests run the same code path
+            screen_frame_quality=False,
+            enable_refinement=False,
         )
         cfg.update(overrides)
         return SomStageConfig(**cfg)
@@ -1588,6 +1591,759 @@ class RenderProposedClickGroupsTests(unittest.TestCase):
         out = render_proposed_click_groups_overlay(frame, groups, existing_masks=[{"mask": mask}])
         self.assertEqual(out.shape, frame.shape)
         self.assertFalse(np.array_equal(frame, out))
+
+
+from nibi_model_compare.som_missed_creatures import parse_frame_validity
+
+
+class ParseFrameValidityTests(unittest.TestCase):
+    def test_usable_tag_detected(self):
+        text = "Looks good.\n<validity>usable</validity>"
+        self.assertEqual(parse_frame_validity(text), "usable")
+
+    def test_corrupted_tag_detected(self):
+        text = "All black.\n<validity>corrupted</validity>"
+        self.assertEqual(parse_frame_validity(text), "corrupted")
+
+    def test_takes_last_tag(self):
+        text = "<validity>usable</validity>\nActually,\n<validity>corrupted</validity>"
+        self.assertEqual(parse_frame_validity(text), "corrupted")
+
+    def test_case_insensitive(self):
+        self.assertEqual(parse_frame_validity("<validity>USABLE</validity>"), "usable")
+        self.assertEqual(parse_frame_validity("<validity>Corrupted</validity>"), "corrupted")
+
+    def test_missing_tag_returns_none(self):
+        self.assertIsNone(parse_frame_validity("no tag here"))
+
+    def test_empty_string_returns_none(self):
+        self.assertIsNone(parse_frame_validity(""))
+
+    def test_none_input_returns_none(self):
+        self.assertIsNone(parse_frame_validity(None))
+
+    def test_whitespace_inside_tag_accepted(self):
+        self.assertEqual(parse_frame_validity("<validity>  usable  </validity>"), "usable")
+
+    def test_returns_lowercase(self):
+        result = parse_frame_validity("<validity>CORRUPTED</validity>")
+        self.assertEqual(result, "corrupted")
+
+
+from nibi_model_compare.som_missed_creatures import parse_refinement_response
+
+
+class ParseRefinementResponseTests(unittest.TestCase):
+    def test_accept_action(self):
+        text = 'Looks fine.\n<refine>{"action":"accept"}</refine>'
+        result = parse_refinement_response(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "accept")
+        self.assertEqual(result["add_points"], [])
+
+    def test_reject_action(self):
+        text = 'Unsalvageable.\n<refine>{"action":"reject"}</refine>'
+        result = parse_refinement_response(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "reject")
+
+    def test_refine_action_with_points(self):
+        text = (
+            'Tighten it.\n'
+            '<refine>{"action":"refine","add_points":['
+            '{"x":0.3,"y":0.4,"label":1},'
+            '{"x":0.5,"y":0.6,"label":0}'
+            ']}</refine>'
+        )
+        result = parse_refinement_response(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "refine")
+        self.assertEqual(len(result["add_points"]), 2)
+        self.assertAlmostEqual(result["add_points"][0]["x"], 0.3)
+        self.assertEqual(result["add_points"][0]["label"], 1)
+        self.assertEqual(result["add_points"][1]["label"], 0)
+
+    def test_takes_last_tag(self):
+        text = (
+            '<refine>{"action":"accept"}</refine>\n'
+            'Wait,\n'
+            '<refine>{"action":"reject"}</refine>'
+        )
+        result = parse_refinement_response(text)
+        self.assertEqual(result["action"], "reject")
+
+    def test_missing_tag_returns_none(self):
+        self.assertIsNone(parse_refinement_response("no tag"))
+
+    def test_malformed_json_returns_none(self):
+        self.assertIsNone(parse_refinement_response("<refine>{bad json}</refine>"))
+
+    def test_invalid_action_returns_none(self):
+        self.assertIsNone(parse_refinement_response('<refine>{"action":"unknown"}</refine>'))
+
+    def test_none_input_returns_none(self):
+        self.assertIsNone(parse_refinement_response(None))
+
+    def test_empty_input_returns_none(self):
+        self.assertIsNone(parse_refinement_response(""))
+
+    def test_out_of_range_coords_dropped(self):
+        text = (
+            '<refine>{"action":"refine","add_points":['
+            '{"x":1.5,"y":0.5,"label":1},'
+            '{"x":0.5,"y":0.5,"label":1}'
+            ']}</refine>'
+        )
+        result = parse_refinement_response(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result["add_points"]), 1)
+        self.assertAlmostEqual(result["add_points"][0]["x"], 0.5)
+
+    def test_invalid_label_filtered(self):
+        text = (
+            '<refine>{"action":"refine","add_points":['
+            '{"x":0.5,"y":0.5,"label":2},'
+            '{"x":0.3,"y":0.3,"label":1}'
+            ']}</refine>'
+        )
+        result = parse_refinement_response(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result["add_points"]), 1)
+        self.assertEqual(result["add_points"][0]["label"], 1)
+
+    def test_refine_missing_add_points_returns_none(self):
+        text = '<refine>{"action":"refine"}</refine>'
+        self.assertIsNone(parse_refinement_response(text))
+
+
+from nibi_model_compare.som_missed_creatures import screen_target_frames_for_quality
+
+
+class ScreenTargetFramesForQualityTests(unittest.TestCase):
+    def _make_frame(self, h=32, w=32):
+        return np.full((h, w, 3), 100, dtype=np.uint8)
+
+    def test_all_usable_no_replacement(self):
+        frames = {0: self._make_frame(), 5: self._make_frame(), 10: self._make_frame()}
+
+        def load_frame(video_path, idx):
+            return frames.get(idx)
+
+        def mllm(messages, **_):
+            return "<validity>usable</validity>"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            final, report = screen_target_frames_for_quality(
+                [0, 5, 10],
+                video_path="fake.mp4",
+                load_frame=load_frame,
+                output_folder=tmp,
+                mllm_send=mllm,
+                valid_frame_pool=[0, 5, 10],
+            )
+        self.assertEqual(final, [0, 5, 10])
+        self.assertEqual(len(report), 3)
+        for r in report:
+            self.assertIsNone(r["replaced_with"])
+
+    def test_corrupted_frame_replaced_with_nearest(self):
+        """Frame 5 is corrupted; nearest valid neighbour is 4."""
+        frames = {
+            0: self._make_frame(), 4: self._make_frame(),
+            5: self._make_frame(), 10: self._make_frame()
+        }
+        call_count = {"n": 0}
+
+        def load_frame(video_path, idx):
+            return frames.get(idx)
+
+        def mllm(messages, **_):
+            call_count["n"] += 1
+            # Find which frame was saved in the message
+            img_path = messages[1]["content"][0]["image"]
+            fname = os.path.basename(img_path)
+            # slot0_f000005 -> corrupted, slot0_f000004 -> usable
+            if "000005" in fname or "000000" in fname:
+                return "<validity>corrupted</validity>"
+            return "<validity>usable</validity>"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            final, report = screen_target_frames_for_quality(
+                [5],
+                video_path="fake.mp4",
+                load_frame=load_frame,
+                output_folder=tmp,
+                mllm_send=mllm,
+                valid_frame_pool=[0, 4, 5, 10],
+            )
+        # Should have replaced 5 with 4 (nearest)
+        self.assertEqual(final[0], 4)
+        self.assertEqual(report[0]["original_index"], 5)
+        self.assertEqual(report[0]["replaced_with"], 4)
+
+    def test_no_usable_replacement_keeps_original(self):
+        """When all candidates are corrupted, keep original."""
+        frames = {0: self._make_frame(), 1: self._make_frame()}
+
+        def load_frame(video_path, idx):
+            return frames.get(idx)
+
+        def mllm(messages, **_):
+            return "<validity>corrupted</validity>"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            final, report = screen_target_frames_for_quality(
+                [0],
+                video_path="fake.mp4",
+                load_frame=load_frame,
+                output_folder=tmp,
+                mllm_send=mllm,
+                valid_frame_pool=[0, 1],
+                max_replacements_per_slot=2,
+            )
+        self.assertEqual(final[0], 0)
+
+    def test_empty_target_indices(self):
+        def load_frame(video_path, idx):
+            return None
+
+        def mllm(messages, **_):
+            return "<validity>usable</validity>"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            final, report = screen_target_frames_for_quality(
+                [],
+                video_path="fake.mp4",
+                load_frame=load_frame,
+                output_folder=tmp,
+                mllm_send=mllm,
+                valid_frame_pool=[0, 1, 2],
+            )
+        self.assertEqual(final, [])
+        self.assertEqual(report, [])
+
+    def test_quality_checks_dir_created(self):
+        frames = {0: self._make_frame()}
+
+        def load_frame(video_path, idx):
+            return frames.get(idx)
+
+        def mllm(messages, **_):
+            return "<validity>usable</validity>"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            screen_target_frames_for_quality(
+                [0],
+                video_path="fake.mp4",
+                load_frame=load_frame,
+                output_folder=tmp,
+                mllm_send=mllm,
+                valid_frame_pool=[0],
+            )
+            qc_dir = os.path.join(tmp, "quality_checks")
+            self.assertTrue(os.path.isdir(qc_dir))
+
+
+class LoadFrameQualitySystemPromptTests(unittest.TestCase):
+    from nibi_model_compare.som_missed_creatures import load_frame_quality_system_prompt
+
+    def test_loads_underwater(self):
+        from nibi_model_compare.som_missed_creatures import load_frame_quality_system_prompt
+        body = load_frame_quality_system_prompt("underwater")
+        self.assertIn("<validity>", body)
+        self.assertIn("underwater", body.lower())
+
+    def test_loads_general(self):
+        from nibi_model_compare.som_missed_creatures import load_frame_quality_system_prompt
+        body = load_frame_quality_system_prompt("general")
+        self.assertIn("<validity>", body)
+
+    def test_unknown_profile_raises(self):
+        from nibi_model_compare.som_missed_creatures import load_frame_quality_system_prompt
+        with self.assertRaises(ValueError):
+            load_frame_quality_system_prompt("bogus")
+
+
+class LoadRefinementSystemPromptTests(unittest.TestCase):
+    def test_loads_underwater(self):
+        from nibi_model_compare.som_missed_creatures import load_refinement_system_prompt
+        body = load_refinement_system_prompt("underwater")
+        self.assertIn("<refine>", body)
+        self.assertIn("marine biology", body.lower())
+
+    def test_loads_general(self):
+        from nibi_model_compare.som_missed_creatures import load_refinement_system_prompt
+        body = load_refinement_system_prompt("general")
+        self.assertIn("<refine>", body)
+
+    def test_unknown_profile_raises(self):
+        from nibi_model_compare.som_missed_creatures import load_refinement_system_prompt
+        with self.assertRaises(ValueError):
+            load_refinement_system_prompt("bogus")
+
+
+class RenderRefinementCropTests(unittest.TestCase):
+    H, W = 64, 64
+
+    def _frame(self):
+        return np.zeros((self.H, self.W, 3), dtype=np.uint8) + 80
+
+    def _disk_mask(self, cy, cx, r):
+        yy, xx = np.ogrid[:self.H, :self.W]
+        return ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+
+    def test_returns_array(self):
+        from nibi_model_compare.som_missed_creatures import render_refinement_crop
+        frame = self._frame()
+        mask = self._disk_mask(32, 32, 8)
+        cand = {"mask": mask, "clicks_used": [{"x": 0.5, "y": 0.5, "label": 1}]}
+        crop = render_refinement_crop(frame, cand)
+        self.assertIsInstance(crop, np.ndarray)
+        self.assertEqual(crop.ndim, 3)
+
+    def test_crop_smaller_than_frame(self):
+        from nibi_model_compare.som_missed_creatures import render_refinement_crop
+        frame = self._frame()
+        mask = self._disk_mask(32, 32, 8)
+        cand = {"mask": mask, "clicks_used": []}
+        crop = render_refinement_crop(frame, cand)
+        self.assertLessEqual(crop.shape[0], frame.shape[0])
+        self.assertLessEqual(crop.shape[1], frame.shape[1])
+
+    def test_empty_mask_returns_full_frame(self):
+        from nibi_model_compare.som_missed_creatures import render_refinement_crop
+        frame = self._frame()
+        empty = np.zeros((self.H, self.W), dtype=bool)
+        cand = {"mask": empty, "clicks_used": []}
+        crop = render_refinement_crop(frame, cand)
+        self.assertEqual(crop.shape, frame.shape)
+
+    def test_modifies_masked_pixels(self):
+        from nibi_model_compare.som_missed_creatures import render_refinement_crop
+        frame = self._frame()
+        mask = self._disk_mask(32, 32, 8)
+        cand = {"mask": mask, "clicks_used": []}
+        crop = render_refinement_crop(frame, cand)
+        self.assertFalse(np.array_equal(crop, frame[0:crop.shape[0], 0:crop.shape[1]]))
+
+
+class Sam3PointServiceRefineSegmentTests(unittest.TestCase):
+    """Tests for Sam3PointService.refine_segment."""
+
+    def test_refine_segment_combines_clicks(self):
+        """refine_segment should merge existing + new clicks before calling SAM3."""
+        from nibi_model_compare.som_missed_creatures import Sam3PointService
+        from PIL import Image
+
+        calls = []
+
+        class FakeProcessor:
+            def set_image(self, image):
+                return {}
+
+        class FakeModel:
+            H, W = 64, 64
+
+            def predict_inst(self, state, point_coords, point_labels,
+                             multimask_output=True):
+                calls.append(point_coords.tolist())
+                mask = np.zeros((self.H, self.W), dtype=bool)
+                mask[20:40, 20:40] = True
+                masks = np.stack([mask], axis=0)
+                scores = np.array([0.9], dtype=np.float32)
+                return masks, scores, np.zeros((1, 64, 64), dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = os.path.join(tmp, "f.png")
+            Image.new("RGB", (64, 64)).save(img_path)
+            svc = Sam3PointService(FakeModel(), FakeProcessor())
+            group = {
+                "creature_id": 1,
+                "description": "test crab",
+                "clicks_used": [{"x": 0.3, "y": 0.3, "label": 1}],
+            }
+            new_pts = [{"x": 0.5, "y": 0.5, "label": 0}]
+            result = svc.refine_segment(img_path, group, add_points=new_pts)
+        # Should have called predict_inst with 2 points total
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), 2)
+        self.assertIn("mask", result)
+        self.assertIn("area_px", result)
+
+    def test_fake_service_refine_segment(self):
+        """FakeSam3PointService.refine_segment should behave consistently."""
+        fake_svc = FakeSam3PointService(h=64, w=64, radius=5)
+        group = {
+            "creature_id": 1,
+            "description": "crab",
+            "clicks_used": [{"x": 0.5, "y": 0.5, "label": 1}],
+        }
+        new_pts = [{"x": 0.4, "y": 0.4, "label": 0}]
+        result = fake_svc.refine_segment("fake.png", group, add_points=new_pts)
+        self.assertIn("mask", result)
+        self.assertGreater(result["area_px"], 0)
+
+
+# --- Extend FakeSam3PointService to also implement refine_segment ---
+# (patched below; keep definition above in the original class area)
+
+# We monkey-patch FakeSam3PointService here since the original class
+# definition is earlier in this file and can't be easily edited mid-test.
+def _fake_refine_segment(self, image_path, group, *, add_points, output_folder=None):
+    """Fake refine_segment: delegates to group_segment with merged clicks."""
+    existing = list(group.get("clicks_used") or group.get("clicks") or [])
+    merged = existing + list(add_points or [])
+    merged_group = {
+        "id": group.get("creature_id", group.get("id", -1)),
+        "description": group.get("description", ""),
+        "clicks": merged,
+    }
+    results = self.group_segment(image_path, [merged_group], output_folder=output_folder)
+    return results[0]
+
+
+FakeSam3PointService.refine_segment = _fake_refine_segment
+
+
+class RunSomStageRefinementTests(unittest.TestCase):
+    """Tests for the per-mark refinement sub-loop (evolution path C)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workdir = self.tmp.name
+
+        self.video_path = os.path.join(self.workdir, "fake.mp4")
+        with open(self.video_path, "w") as f:
+            f.write("(stub)")
+
+        self.frame_results_path = os.path.join(self.workdir, "frame_results.jsonl")
+        with open(self.frame_results_path, "w") as f:
+            for i in range(60):
+                f.write(_json.dumps({
+                    "frame_index": i, "num_masks": 2,
+                    "error": None, "skipped": False,
+                }) + "\n")
+
+        self.frame_outputs_path = os.path.join(self.workdir, "frame_outputs_rle.json")
+        from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+        frames = []
+        for i in range(60):
+            yy, xx = np.ogrid[:64, :64]
+            m1 = ((yy - 10) ** 2 + (xx - 10) ** 2) <= 4 * 4
+            m2 = ((yy - 50) ** 2 + (xx - 50) ** 2) <= 4 * 4
+            frames.append({
+                "frame_index": i,
+                "out_obj_ids": [1, 2],
+                "out_binary_masks_rle": [
+                    encode_binary_mask_to_rle(m1),
+                    encode_binary_mask_to_rle(m2),
+                ],
+                "out_boxes_xywh": [[6, 6, 9, 9], [46, 46, 9, 9]],
+                "out_probs": [0.9, 0.9],
+                "out_tracker_probs": [0.9, 0.9],
+            })
+        with open(self.frame_outputs_path, "w") as f:
+            _json.dump({"format_version": 2, "frames": frames}, f)
+
+        def fake_load_frame(video_path, frame_index):
+            return np.full((64, 64, 3), 80, dtype=np.uint8)
+
+        self.fake_load_frame = fake_load_frame
+        self.fake_point_service = FakeSam3PointService(h=64, w=64, radius=5)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _config(self, **overrides):
+        cfg = dict(
+            video_path=self.video_path,
+            frame_results_path=self.frame_results_path,
+            frame_outputs_path=self.frame_outputs_path,
+            output_dir=os.path.join(self.workdir, "som_out"),
+            prompt_profile="underwater",
+            initial_text_prompt="small creatures",
+            num_target_frames=1,
+            frame_selection_strategy="uniform",
+            target_frames_explicit=[5],
+            num_neighbours=1,
+            neighbour_offset_frames=5,
+            iou_dedup=0.3,
+            min_area_px=4,
+            max_area_frac=0.5,
+            edge_tol_px=2,
+            internal_iou_dedup=0.5,
+            max_mllm_calls=100,
+            discovery_num_neighbours=2,
+            screen_frame_quality=False,
+            quality_check_max_replacements_per_slot=5,
+            enable_refinement=True,
+            max_refinement_iters=2,
+        )
+        cfg.update(overrides)
+        return SomStageConfig(**cfg)
+
+    def test_refinement_flips_rejected_to_accepted(self):
+        """When judge rejects, refinement MLLM replies 'accept', so candidate joins accepted."""
+        call_log = []
+
+        def mllm(messages, **_):
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                call_log.append("discovery")
+                return (
+                    '<answer>{"missed_creatures":[{"id":1,"description":"crab",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
+                )
+            if "Candidate creature" in joined or "REJECTED" in joined:
+                call_log.append("refinement")
+                return '<refine>{"action":"accept"}</refine>'
+            # Judge: reject everything
+            call_log.append("judge")
+            return '<answer>{"accepted_marks": []}</answer>'
+
+        cfg = self._config()
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=mllm,
+            _sam3_point_service=self.fake_point_service,
+            _screen_frame_quality=lambda *a, **kw: (list(a[0]), []),
+        )
+        self.assertEqual(result["targets_processed"], 1)
+        # Refinement flipped rejected->accepted, so 1 mask added
+        self.assertGreaterEqual(result["masks_accepted"], 1)
+        self.assertIn("refinement", call_log)
+
+    def test_refinement_disabled_skips_loop(self):
+        """With enable_refinement=False, no refinement calls should happen."""
+        call_log = []
+
+        def mllm(messages, **_):
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                return (
+                    '<answer>{"missed_creatures":[{"id":1,"description":"crab",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
+                )
+            if "Candidate creature" in joined or "REJECTED" in joined:
+                call_log.append("refinement_called")
+                return '<refine>{"action":"accept"}</refine>'
+            return '<answer>{"accepted_marks": []}</answer>'
+
+        cfg = self._config(enable_refinement=False)
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=mllm,
+            _sam3_point_service=self.fake_point_service,
+            _screen_frame_quality=lambda *a, **kw: (list(a[0]), []),
+        )
+        self.assertNotIn("refinement_called", call_log)
+
+    def test_refinement_with_new_points_calls_sam3(self):
+        """When refinement proposes new points, SAM3 should be called again."""
+        iteration = {"n": 0}
+
+        def mllm(messages, **_):
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                return (
+                    '<answer>{"missed_creatures":[{"id":1,"description":"crab",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
+                )
+            if "Candidate creature" in joined or "REJECTED" in joined:
+                iteration["n"] += 1
+                if iteration["n"] == 1:
+                    # First refinement: propose new points
+                    return (
+                        '<refine>{"action":"refine","add_points":['
+                        '{"x":0.4,"y":0.4,"label":0}'
+                        ']}</refine>'
+                    )
+                # Second: accept
+                return '<refine>{"action":"accept"}</refine>'
+            return '<answer>{"accepted_marks": []}</answer>'
+
+        initial_calls = len(self.fake_point_service.calls)
+        cfg = self._config(max_refinement_iters=2)
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=mllm,
+            _sam3_point_service=self.fake_point_service,
+            _screen_frame_quality=lambda *a, **kw: (list(a[0]), []),
+        )
+        # SAM3 should have been called at least once for refinement beyond initial
+        self.assertGreater(len(self.fake_point_service.calls), initial_calls + 1)
+
+
+class RunSomStageQualityScreeningTests(unittest.TestCase):
+    """Tests for the frame-quality screening integration in run_som_stage."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workdir = self.tmp.name
+        self.video_path = os.path.join(self.workdir, "fake.mp4")
+        with open(self.video_path, "w") as f:
+            f.write("(stub)")
+
+        self.frame_results_path = os.path.join(self.workdir, "frame_results.jsonl")
+        with open(self.frame_results_path, "w") as f:
+            for i in range(60):
+                f.write(_json.dumps({
+                    "frame_index": i, "num_masks": 2,
+                    "error": None, "skipped": False,
+                }) + "\n")
+
+        self.frame_outputs_path = os.path.join(self.workdir, "frame_outputs_rle.json")
+        from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+        frames = []
+        for i in range(60):
+            yy, xx = np.ogrid[:64, :64]
+            m1 = ((yy - 10) ** 2 + (xx - 10) ** 2) <= 4 * 4
+            frames.append({
+                "frame_index": i,
+                "out_obj_ids": [1],
+                "out_binary_masks_rle": [encode_binary_mask_to_rle(m1)],
+                "out_boxes_xywh": [[6, 6, 9, 9]],
+                "out_probs": [0.9],
+                "out_tracker_probs": [0.9],
+            })
+        with open(self.frame_outputs_path, "w") as f:
+            _json.dump({"format_version": 2, "frames": frames}, f)
+
+        self.fake_load_frame = lambda vp, idx: np.full((64, 64, 3), 80, dtype=np.uint8)
+        self.fake_point_service = FakeSam3PointService(h=64, w=64, radius=5)
+
+        def fake_mllm(messages, **_):
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                return (
+                    '<answer>{"missed_creatures":[{"id":1,"description":"crab",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
+                )
+            if "Candidate creature" in joined or "REJECTED" in joined:
+                return '<refine>{"action":"reject"}</refine>'
+            return '<answer>{"accepted_marks": [1]}</answer>'
+
+        self.fake_mllm = fake_mllm
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _config(self, **overrides):
+        cfg = dict(
+            video_path=self.video_path,
+            frame_results_path=self.frame_results_path,
+            frame_outputs_path=self.frame_outputs_path,
+            output_dir=os.path.join(self.workdir, "som_out"),
+            prompt_profile="underwater",
+            initial_text_prompt="small creatures",
+            num_target_frames=2,
+            frame_selection_strategy="uniform",
+            target_frames_explicit=None,
+            num_neighbours=1,
+            neighbour_offset_frames=5,
+            iou_dedup=0.3,
+            min_area_px=4,
+            max_area_frac=0.5,
+            edge_tol_px=2,
+            internal_iou_dedup=0.5,
+            max_mllm_calls=50,
+            discovery_num_neighbours=2,
+            screen_frame_quality=True,
+            quality_check_max_replacements_per_slot=3,
+            enable_refinement=False,
+            max_refinement_iters=2,
+        )
+        cfg.update(overrides)
+        return SomStageConfig(**cfg)
+
+    def test_screening_seam_called_and_report_saved(self):
+        """_screen_frame_quality seam should be invoked and screening_report.json written."""
+        seam_called = {"n": 0}
+
+        def fake_screen(target_indices, **kw):
+            seam_called["n"] += 1
+            return target_indices, [{"original_index": i, "replaced_with": None, "verdicts": []} for i in target_indices]
+
+        cfg = self._config()
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
+            _screen_frame_quality=fake_screen,
+        )
+        self.assertGreater(seam_called["n"], 0)
+        report_path = os.path.join(cfg.output_dir, "screening_report.json")
+        self.assertTrue(os.path.exists(report_path))
+
+    def test_screening_disabled_skips_seam(self):
+        """With screen_frame_quality=False, the seam should NOT be called."""
+        seam_called = {"n": 0}
+
+        def fake_screen(target_indices, **kw):
+            seam_called["n"] += 1
+            return target_indices, []
+
+        cfg = self._config(screen_frame_quality=False)
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
+            _screen_frame_quality=fake_screen,
+        )
+        self.assertEqual(seam_called["n"], 0)
+
+    def test_quality_stats_in_summary(self):
+        """Stats dict should contain targets_quality_replaced and targets_quality_kept_corrupted."""
+        def fake_screen(target_indices, **kw):
+            # Report one replacement
+            report = [
+                {"original_index": target_indices[0], "replaced_with": target_indices[0] + 1,
+                 "verdicts": [{"frame_index": target_indices[0], "validity": "corrupted", "reason": "black"}]},
+            ]
+            if len(target_indices) > 1:
+                report.append(
+                    {"original_index": target_indices[1], "replaced_with": None,
+                     "verdicts": [{"frame_index": target_indices[1], "validity": "usable", "reason": "ok"}]}
+                )
+                return target_indices, report
+            return target_indices, report
+
+        cfg = self._config()
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=self.fake_mllm,
+            _sam3_point_service=self.fake_point_service,
+            _screen_frame_quality=fake_screen,
+        )
+        self.assertIn("targets_quality_replaced", result)
+        self.assertIn("targets_quality_kept_corrupted", result)
+        self.assertEqual(result["targets_quality_replaced"], 1)
 
 
 if __name__ == "__main__":

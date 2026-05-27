@@ -45,7 +45,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    default="underwater")
     p.add_argument("--prompt", default="small creatures",
                    help="Original creature query echoed into the MLLM prompt.")
-    p.add_argument("--num-target-frames", type=int, default=8)
+    p.add_argument("--num-target-frames", type=int, default=5,
+                   help="Number of target frames to pick uniformly from the valid pool "
+                        "(default 5).")
     p.add_argument("--frame-selection-strategy",
                    choices=["uniform", "motion"], default="uniform")
     p.add_argument("--target-frames", type=_csv_ints, default=None,
@@ -70,6 +72,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--edge-tol-px", type=int, default=2)
     p.add_argument("--internal-iou-dedup", type=float, default=0.5)
     p.add_argument("--max-mllm-calls", type=int, default=200)
+
+    # Frame-quality screening (A)
+    p.add_argument("--frame-quality-screening", choices=["none", "mllm"],
+                   default="mllm",
+                   help="MLLM-based usability check for each target frame "
+                        "(default mllm). Set to 'none' to disable.")
+    p.add_argument("--frame-quality-system-prompt-profile",
+                   choices=["underwater", "general"],
+                   default=None,
+                   help="System-prompt profile for frame-quality check. "
+                        "Defaults to --prompt-profile if not set.")
+    p.add_argument("--quality-check-max-replacements-per-slot", type=int, default=5,
+                   help="Max nearest-neighbour replacement attempts per corrupted frame slot.")
+
+    # Per-mark refinement sub-loop (C)
+    p.add_argument("--no-refinement", dest="enable_refinement",
+                   action="store_false",
+                   help="Disable per-mark refinement sub-loop.")
+    p.add_argument("--max-refinement-iters", type=int, default=2,
+                   help="Maximum refinement iterations per rejected candidate (default 2).")
 
     # SAM3 model loading
     p.add_argument("--device", default="cuda")
@@ -188,6 +210,10 @@ def main(argv: list[str] | None = None) -> int:
         internal_iou_dedup=args.internal_iou_dedup,
         max_mllm_calls=args.max_mllm_calls,
         discovery_num_neighbours=args.discovery_num_neighbours,
+        screen_frame_quality=(args.frame_quality_screening != "none"),
+        quality_check_max_replacements_per_slot=args.quality_check_max_replacements_per_slot,
+        enable_refinement=args.enable_refinement,
+        max_refinement_iters=args.max_refinement_iters,
     )
 
     print(f"[som] writing artefacts to {output_dir}")
