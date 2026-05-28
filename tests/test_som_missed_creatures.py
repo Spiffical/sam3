@@ -2346,5 +2346,462 @@ class RunSomStageQualityScreeningTests(unittest.TestCase):
         self.assertEqual(result["targets_quality_replaced"], 1)
 
 
+from nibi_model_compare.som_missed_creatures import _count_significant_components
+
+
+class CountSignificantComponentsTests(unittest.TestCase):
+    """Tests for _count_significant_components (A)."""
+
+    H, W = 64, 64
+
+    def _disk_mask(self, cy, cx, r):
+        yy, xx = np.ogrid[:self.H, :self.W]
+        return ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+
+    def test_single_circular_mask_gives_one_component(self):
+        mask = self._disk_mask(32, 32, 10).astype(np.uint8)
+        self.assertEqual(_count_significant_components(mask), 1)
+
+    def test_two_disjoint_circles_gives_two_components(self):
+        m1 = self._disk_mask(10, 10, 6)
+        m2 = self._disk_mask(50, 50, 6)
+        mask = (m1 | m2).astype(np.uint8)
+        self.assertEqual(_count_significant_components(mask), 2)
+
+    def test_small_noise_speck_filtered_by_min_frac(self):
+        # Large main disk + tiny 1-pixel speck
+        main = self._disk_mask(32, 32, 10)
+        speck = np.zeros((self.H, self.W), dtype=bool)
+        speck[2, 2] = True
+        mask = (main | speck).astype(np.uint8)
+        # The speck is << 15% of total area, so it should be ignored -> 1 component
+        self.assertEqual(_count_significant_components(mask, min_component_frac=0.15), 1)
+
+
+class FilterCandidatesMultiComponentTests(unittest.TestCase):
+    """Verify multi_component_blob drop_reason from filter_candidates_with_reasons (A)."""
+
+    H, W = 64, 64
+
+    def _disk_mask(self, cy, cx, r):
+        yy, xx = np.ogrid[:self.H, :self.W]
+        return ((yy - cy) ** 2 + (xx - cx) ** 2) <= r * r
+
+    def test_two_equal_disjoint_regions_dropped_with_multi_component_blob(self):
+        m1 = self._disk_mask(10, 10, 6)
+        m2 = self._disk_mask(50, 50, 6)
+        blob_mask = (m1 | m2).astype(bool)
+        cand = {"mask": blob_mask, "bbox_xywh": [0, 0, 64, 64], "score": 0.9}
+        from nibi_model_compare.som_missed_creatures import filter_candidates_with_reasons
+        results = filter_candidates_with_reasons(
+            [cand], [],
+            iou_dedup=0.3, min_area_px=4, max_area_frac=0.9,
+            edge_tol_px=0,
+        )
+        self.assertEqual(len(results), 1)
+        _c, reason = results[0]
+        self.assertEqual(reason, "multi_component_blob",
+                         f"Expected 'multi_component_blob', got {reason!r}")
+
+
+from nibi_model_compare.som_missed_creatures import render_grid_overlay
+
+
+class RenderGridOverlayTests(unittest.TestCase):
+    """Tests for render_grid_overlay (C)."""
+
+    H, W = 200, 200
+
+    def _frame(self):
+        return np.zeros((self.H, self.W, 3), dtype=np.uint8) + 60
+
+    def test_returns_same_shape(self):
+        frame = self._frame()
+        out = render_grid_overlay(frame)
+        self.assertEqual(out.shape, frame.shape)
+        self.assertEqual(out.dtype, frame.dtype)
+
+    def test_modifies_pixels(self):
+        frame = self._frame()
+        out = render_grid_overlay(frame)
+        # Grid lines and labels should change at least some pixels
+        self.assertFalse(np.array_equal(frame, out))
+
+
+from nibi_model_compare.som_missed_creatures import parse_creature_click_groups
+
+
+class ParseCreatureClickGroupsCellAltTests(unittest.TestCase):
+    """Tests for cell-alternative coordinate path in parse_creature_click_groups (C)."""
+
+    def test_cell_only_click_converted_to_normalised_xy(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"crab","clicks":['
+            '{"cell":[5,5],"label":1}'
+            ']}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0]["clicks"]), 1)
+        c = result[0]["clicks"][0]
+        # Cell [5,5] in a 10x10 grid -> center = (5.5/10, 5.5/10) = 0.55, 0.55
+        self.assertAlmostEqual(c["x"], 0.55, places=5)
+        self.assertAlmostEqual(c["y"], 0.55, places=5)
+        self.assertEqual(c["label"], 1)
+
+    def test_mixed_xy_and_cell_entries(self):
+        """A click list with one xy click and one cell click should both be accepted."""
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"worm","clicks":['
+            '{"x":0.2,"y":0.3,"label":1},'
+            '{"cell":[0,9],"label":1}'
+            ']}'
+            ']}</answer>'
+        )
+        result = parse_creature_click_groups(text)
+        self.assertEqual(len(result), 1)
+        clicks = result[0]["clicks"]
+        self.assertEqual(len(clicks), 2)
+        # First click: xy as-is
+        self.assertAlmostEqual(clicks[0]["x"], 0.2, places=5)
+        self.assertAlmostEqual(clicks[0]["y"], 0.3, places=5)
+        # Second click: cell [0,9] -> (9.5/10, 0.5/10) = (0.95, 0.05)
+        self.assertAlmostEqual(clicks[1]["x"], 0.95, places=5)
+        self.assertAlmostEqual(clicks[1]["y"], 0.05, places=5)
+
+
+from nibi_model_compare.som_missed_creatures import parse_click_refinement_response
+
+
+class ParseClickRefinementResponseTests(unittest.TestCase):
+    """Tests for parse_click_refinement_response (D)."""
+
+    def test_ok_action(self):
+        text = 'Click looks good.\n<click_refine>{"action":"ok"}</click_refine>'
+        result = parse_click_refinement_response(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "ok")
+        self.assertEqual(result["new_clicks"], [])
+
+    def test_move_action_with_new_click(self):
+        text = (
+            'Move slightly.\n'
+            '<click_refine>{"action":"move","new_clicks":[{"x":0.4,"y":0.6,"label":1}]}'
+            '</click_refine>'
+        )
+        result = parse_click_refinement_response(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "move")
+        self.assertEqual(len(result["new_clicks"]), 1)
+        self.assertAlmostEqual(result["new_clicks"][0]["x"], 0.4)
+        self.assertEqual(result["new_clicks"][0]["label"], 1)
+
+    def test_drop_action(self):
+        text = 'No creature here.\n<click_refine>{"action":"drop"}</click_refine>'
+        result = parse_click_refinement_response(text)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "drop")
+
+    def test_malformed_json_returns_none(self):
+        self.assertIsNone(parse_click_refinement_response("<click_refine>{bad json}</click_refine>"))
+
+    def test_wrong_action_returns_none(self):
+        self.assertIsNone(parse_click_refinement_response('<click_refine>{"action":"unknown"}</click_refine>'))
+
+
+from nibi_model_compare.som_missed_creatures import refine_creature_clicks
+
+
+class RefineCreatureClicksTests(unittest.TestCase):
+    """Tests for refine_creature_clicks (D)."""
+
+    H, W = 64, 64
+
+    def _frame(self):
+        return np.zeros((self.H, self.W, 3), dtype=np.uint8) + 80
+
+    def test_ok_on_first_try_returns_group_unchanged(self):
+        group = {
+            "id": 1,
+            "description": "crab",
+            "clicks": [{"x": 0.5, "y": 0.5, "label": 1}],
+        }
+        target_frame = self._frame()
+
+        def mllm(messages, **_):
+            return '<click_refine>{"action":"ok"}</click_refine>'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = refine_creature_clicks(
+                group, target_frame, os.path.join(tmp, "f.png"),
+                neighbour_paths=[], mllm_send=mllm,
+                output_folder=tmp,
+                click_refinement_system_prompt="SYS",
+                max_iters=2,
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["id"], 1)
+        self.assertAlmostEqual(result["clicks"][0]["x"], 0.5)
+
+    def test_move_then_ok_returns_updated_group(self):
+        group = {
+            "id": 2,
+            "description": "snail",
+            "clicks": [{"x": 0.1, "y": 0.1, "label": 1}],
+        }
+        target_frame = self._frame()
+        call_count = {"n": 0}
+
+        def mllm(messages, **_):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return (
+                    '<click_refine>{"action":"move","new_clicks":[{"x":0.6,"y":0.6,"label":1}]}'
+                    '</click_refine>'
+                )
+            return '<click_refine>{"action":"ok"}</click_refine>'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = refine_creature_clicks(
+                group, target_frame, os.path.join(tmp, "f.png"),
+                neighbour_paths=[], mllm_send=mllm,
+                output_folder=tmp,
+                click_refinement_system_prompt="SYS",
+                max_iters=2,
+            )
+        self.assertIsNotNone(result)
+        # After move, clicks should be updated to the new position
+        self.assertAlmostEqual(result["clicks"][0]["x"], 0.6)
+        self.assertAlmostEqual(result["clicks"][0]["y"], 0.6)
+
+
+class LoadClickRefinementSystemPromptTests(unittest.TestCase):
+    def test_loads_underwater(self):
+        from nibi_model_compare.som_missed_creatures import load_click_refinement_system_prompt
+        body = load_click_refinement_system_prompt("underwater")
+        self.assertIn("<click_refine>", body)
+        self.assertIn("marine biology", body.lower())
+
+    def test_loads_general(self):
+        from nibi_model_compare.som_missed_creatures import load_click_refinement_system_prompt
+        body = load_click_refinement_system_prompt("general")
+        self.assertIn("<click_refine>", body)
+
+    def test_unknown_profile_raises(self):
+        from nibi_model_compare.som_missed_creatures import load_click_refinement_system_prompt
+        with self.assertRaises(ValueError):
+            load_click_refinement_system_prompt("bogus")
+
+
+class RunSomStageClickRefinementTests(unittest.TestCase):
+    """Tests for click-refinement integration in run_som_stage (D)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workdir = self.tmp.name
+
+        self.video_path = os.path.join(self.workdir, "fake.mp4")
+        with open(self.video_path, "w") as f:
+            f.write("(stub)")
+
+        self.frame_results_path = os.path.join(self.workdir, "frame_results.jsonl")
+        with open(self.frame_results_path, "w") as f:
+            for i in range(60):
+                f.write(_json.dumps({
+                    "frame_index": i, "num_masks": 2,
+                    "error": None, "skipped": False,
+                }) + "\n")
+
+        self.frame_outputs_path = os.path.join(self.workdir, "frame_outputs_rle.json")
+        from nibi_model_compare.frame_output_utils import encode_binary_mask_to_rle
+        frames = []
+        for i in range(60):
+            yy, xx = np.ogrid[:64, :64]
+            m1 = ((yy - 10) ** 2 + (xx - 10) ** 2) <= 4 * 4
+            m2 = ((yy - 50) ** 2 + (xx - 50) ** 2) <= 4 * 4
+            frames.append({
+                "frame_index": i,
+                "out_obj_ids": [1, 2],
+                "out_binary_masks_rle": [
+                    encode_binary_mask_to_rle(m1),
+                    encode_binary_mask_to_rle(m2),
+                ],
+                "out_boxes_xywh": [[6, 6, 9, 9], [46, 46, 9, 9]],
+                "out_probs": [0.9, 0.9],
+                "out_tracker_probs": [0.9, 0.9],
+            })
+        with open(self.frame_outputs_path, "w") as f:
+            _json.dump({"format_version": 2, "frames": frames}, f)
+
+        self.fake_load_frame = lambda vp, idx: np.full((64, 64, 3), 80, dtype=np.uint8)
+        self.fake_point_service = FakeSam3PointService(h=64, w=64, radius=5)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _config(self, **overrides):
+        cfg = dict(
+            video_path=self.video_path,
+            frame_results_path=self.frame_results_path,
+            frame_outputs_path=self.frame_outputs_path,
+            output_dir=os.path.join(self.workdir, "som_out"),
+            prompt_profile="underwater",
+            initial_text_prompt="small creatures",
+            num_target_frames=1,
+            frame_selection_strategy="uniform",
+            target_frames_explicit=[5],
+            num_neighbours=0,
+            neighbour_offset_frames=5,
+            iou_dedup=0.3,
+            min_area_px=4,
+            max_area_frac=0.5,
+            edge_tol_px=0,
+            internal_iou_dedup=0.5,
+            max_mllm_calls=100,
+            discovery_num_neighbours=0,
+            screen_frame_quality=False,
+            quality_check_max_replacements_per_slot=5,
+            enable_refinement=False,
+            max_refinement_iters=2,
+            enable_click_refinement=True,
+            max_click_refinement_iters=2,
+        )
+        cfg.update(overrides)
+        return SomStageConfig(**cfg)
+
+    def test_drop_during_click_refinement_removes_creature(self):
+        """When click-refinement says 'drop', that creature should not reach group_segment."""
+
+        def mllm(messages, **_):
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                return (
+                    '<answer>{"missed_creatures":[{"id":1,"description":"center crab",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
+                )
+            if "click_refine" in joined.lower() or "click is" in joined.lower():
+                return '<click_refine>{"action":"drop"}</click_refine>'
+            # Judge: accept mark 1
+            return '<answer>{"accepted_marks": [1]}</answer>'
+
+        initial_calls = len(self.fake_point_service.calls)
+        cfg = self._config()
+        result = run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=mllm,
+            _sam3_point_service=self.fake_point_service,
+        )
+        # After drop, no groups should reach SAM3
+        final_calls = len(self.fake_point_service.calls)
+        self.assertEqual(final_calls, initial_calls,
+                         "group_segment should not have been called when drop was issued")
+
+    def test_click_refinement_artefacts_saved(self):
+        """Refinement artefact files should be written under click_refinement/<id>/."""
+        call_count = {"n": 0}
+
+        def mllm(messages, **_):
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            call_count["n"] += 1
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                return (
+                    '<answer>{"missed_creatures":[{"id":1,"description":"crab",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
+                )
+            if "click_refine" in joined.lower() or "click is" in joined.lower():
+                return '<click_refine>{"action":"ok"}</click_refine>'
+            return '<answer>{"accepted_marks": [1]}</answer>'
+
+        cfg = self._config()
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=mllm,
+            _sam3_point_service=self.fake_point_service,
+        )
+        target_dir = os.path.join(cfg.output_dir, "target_000005")
+        ref_dir = os.path.join(target_dir, "click_refinement", "1")
+        # At least iter_00_proposed.png and iter_00_response.txt should exist
+        self.assertTrue(
+            os.path.exists(os.path.join(ref_dir, "iter_00_proposed.png")),
+            "Expected iter_00_proposed.png in click_refinement/1/"
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(ref_dir, "iter_00_response.txt")),
+            "Expected iter_00_response.txt in click_refinement/1/"
+        )
+
+    def test_click_refinement_disabled_skips_loop(self):
+        """With enable_click_refinement=False, no <click_refine> calls should happen."""
+        click_refine_called = {"n": 0}
+
+        def mllm(messages, **_):
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                return (
+                    '<answer>{"missed_creatures":[{"id":1,"description":"crab",'
+                    '"clicks":[{"x":0.5,"y":0.5,"label":1}]}]}</answer>'
+                )
+            if "click_refine" in joined.lower() or "click is" in joined.lower():
+                click_refine_called["n"] += 1
+                return '<click_refine>{"action":"ok"}</click_refine>'
+            return '<answer>{"accepted_marks": [1]}</answer>'
+
+        cfg = self._config(enable_click_refinement=False)
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=mllm,
+            _sam3_point_service=self.fake_point_service,
+        )
+        self.assertEqual(click_refine_called["n"], 0)
+
+    def test_grid_overlay_file_saved(self):
+        """02_existing_masks_grid.png should be saved during run_som_stage."""
+
+        def mllm(messages, **_):
+            user_content = messages[1]["content"] if len(messages) > 1 else []
+            text_items = [
+                item["text"] for item in user_content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = " ".join(text_items)
+            if "missed_creatures" in joined or "NORMALIZED" in joined:
+                return '<answer>{"missed_creatures":[]}</answer>'
+            return '<answer>{"accepted_marks": []}</answer>'
+
+        cfg = self._config()
+        run_som_stage(
+            cfg,
+            _load_video_frame=self.fake_load_frame,
+            _send_mllm_request=mllm,
+            _sam3_point_service=self.fake_point_service,
+        )
+        target_dir = os.path.join(cfg.output_dir, "target_000005")
+        self.assertTrue(
+            os.path.exists(os.path.join(target_dir, "02_existing_masks_grid.png")),
+            "Expected 02_existing_masks_grid.png to be saved",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

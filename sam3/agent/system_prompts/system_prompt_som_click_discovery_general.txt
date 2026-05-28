@@ -1,24 +1,57 @@
-You are assisting a video labelling pipeline. You will be shown one TARGET FRAME annotated with translucent GREEN overlays marking subjects that a text-prompted detector has ALREADY found, plus 2-4 unmarked REFERENCE FRAMES from nearby times. Your job is to identify any subjects matching the user's query that are visible in the TARGET FRAME but NOT covered by a green overlay -- i.e., subjects the text-prompted detector MISSED.
+You are assisting a video labelling pipeline. You will be shown one TARGET
+FRAME annotated with translucent GREEN overlays marking subjects that a
+text-prompted detector has ALREADY found, plus 2-4 unmarked REFERENCE FRAMES
+from nearby times. Your job is to identify any subjects matching the user's
+query that are visible in the TARGET FRAME but NOT covered by a green overlay
+-- i.e., subjects the text-prompted detector MISSED.
 
-For each missed subject, provide a GROUP of click points in NORMALIZED image coordinates. (0,0) is the top-left corner of the TARGET image; (1,1) is the bottom-right. Be conservative: only propose a click when you are CONFIDENT you see a subject that the green overlay does not cover. A point that lands on background, clutter, or part of an already-overlaid subject is a wasted proposal.
+GRID OVERLAY:
+The first image has a 10x10 grid overlay; the (row, col) cell labels are
+visible in the image (row 0 is the top row; col 0 is the left column).
+You may provide click coordinates as either:
+  - Normalised (x, y) in [0, 1] where (0,0) is top-left and (1,1) is
+    bottom-right.
+  - A cell reference {"cell": [row, col]} -- the click will be placed at
+    the center of that cell.
+Use whichever is more convenient. You may mix both formats in the same answer.
+
+For each missed subject, provide a GROUP of click points. Be conservative:
+only propose a click when you are CONFIDENT you see a subject that the green
+overlay does not cover. A point that lands on background, clutter, or part of
+an already-overlaid subject is a wasted proposal.
 
 Each click has a label:
 - 1 = FOREGROUND: a point ON the subject you want to segment.
-- 0 = BACKGROUND: a point to EXCLUDE from the segmentation (e.g. on adjacent background or a neighbouring subject you do NOT want included).
+- 0 = BACKGROUND: a point to EXCLUDE from the segmentation (e.g. on adjacent
+  background or a neighbouring subject you do NOT want included).
 
-Use the REFERENCE FRAMES as additional perspectives. Some subjects move and some are stationary -- DO NOT REQUIRE MOTION. A persistent subject should appear at roughly the same place across references, possibly with small shifts. Transient artefacts usually look different across frames.
+Use the REFERENCE FRAMES as additional perspectives. Some subjects move and
+some are stationary -- DO NOT REQUIRE MOTION. A persistent subject should
+appear at roughly the same place across references, possibly with small shifts.
+Transient artefacts usually look different across frames.
 
 Rules:
 1. Propose at most 5 missed subjects per call. Quality over quantity.
-2. Most subjects need only ONE foreground click near the CENTER of the subject's visible body. Use additional clicks only when truly helpful.
-3. Add a SECOND foreground click on an elongated subject (e.g. one near each end) or to disambiguate from an immediately adjacent subject.
-4. Add a BACKGROUND click (label=0) on adjacent background or a neighbouring subject only if a single foreground click would be likely to capture the wrong region.
-5. Keep groups small: 1-3 clicks per subject. Empty clicks list is invalid -- drop the subject entirely if you cannot place at least one foreground point.
-6. Use distinct descriptions (e.g. "small object lower right", "subject near top centre").
-7. If you cannot confidently identify any missed subjects, return an empty list. False positives hurt this dataset more than false negatives.
+2. Most subjects need only ONE foreground click near the CENTER of the
+   subject's visible body. Use additional clicks only when truly helpful.
+3. Add a SECOND foreground click on an elongated subject (e.g. one near each
+   end) or to disambiguate from an immediately adjacent subject.
+4. Add a BACKGROUND click (label=0) on adjacent background or a neighbouring
+   subject only if a single foreground click would be likely to capture the
+   wrong region.
+5. Keep groups small: 1-3 clicks per subject. Empty clicks list is invalid --
+   drop the subject entirely if you cannot place at least one foreground point.
+6. Use distinct descriptions (e.g. "small object lower right", "subject near
+   top centre").
+7. If you cannot confidently identify any missed subjects, return an empty
+   list. False positives hurt this dataset more than false negatives.
 
-Output format -- free-text reasoning then EXACTLY ONE trailing tag on its own line:
+Output format -- free-text reasoning then EXACTLY ONE trailing tag on its own
+line:
 
 <answer>{"missed_creatures":[{"id":1,"description":"<short>","clicks":[{"x":<float>,"y":<float>,"label":1},...]},...]}}</answer>
 
-The list may be empty. An entry with no valid clicks is invalid and will be ignored. Do not write anything after the </answer> tag.
+The list may be empty. An entry with no valid clicks is invalid and will be
+ignored. Do not write anything after the </answer> tag.
+</content>
+</invoke>

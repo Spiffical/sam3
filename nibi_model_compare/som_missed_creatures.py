@@ -416,6 +416,25 @@ def merge_accepted_masks_into_row(
     return row
 
 
+def _count_significant_components(mask, *, min_component_frac: float = 0.15) -> int:
+    """Count connected components in the mask that each contain at least
+    ``min_component_frac`` of the total mask area. Single-creature masks
+    typically yield 1; blob masks covering multiple distinct objects yield
+    2+.
+    """
+    import cv2
+    import numpy as np
+    arr = np.asarray(mask, dtype=np.uint8)
+    if arr.sum() == 0:
+        return 0
+    n_lbl, _labels, stats, _cent = cv2.connectedComponentsWithStats(arr, connectivity=8)
+    total = int(arr.sum())
+    threshold = max(1, int(min_component_frac * total))
+    # stats: [N, 5] where col 4 is component area (skip background = label 0)
+    sig = sum(1 for i in range(1, n_lbl) if int(stats[i, 4]) >= threshold)
+    return sig
+
+
 def filter_candidates_with_reasons(
     candidates: list[dict],
     existing_masks: list[dict],
@@ -454,6 +473,12 @@ def filter_candidates_with_reasons(
         dup = any(_mask_iou(mask, em) > iou_dedup for em in existing_arrays)
         if dup:
             results.append((cand, "duplicate_of_existing"))
+            continue
+
+        # (A) Connected-components filter: drop blobs covering multiple distinct objects
+        n_components = _count_significant_components(mask, min_component_frac=0.15)
+        if n_components > 1:
+            results.append((cand, "multi_component_blob"))
             continue
 
         results.append((cand, None))
@@ -634,6 +659,42 @@ def render_existing_masks_overlay(
     return out
 
 
+def render_grid_overlay(frame_bgr, *, grid_n: int = 10, alpha: float = 0.35) -> "np.ndarray":
+    """Draw a grid_n x grid_n grid on the frame with light-coloured lines
+    and cell labels. Cell at row R, col C labelled 'R,C' (0-indexed) at
+    its top-left corner. Used by the discovery and click-refinement
+    prompts to give the MLLM coarse-grained coordinates that map back to
+    pixels reliably.
+
+    Returns a new BGR ndarray of the same shape.
+    """
+    import cv2
+    import numpy as np
+    out = frame_bgr.copy()
+    h, w = out.shape[:2]
+    step_y = h / grid_n
+    step_x = w / grid_n
+    line_color = (200, 200, 200)
+    # vertical lines
+    for c in range(1, grid_n):
+        x = int(round(c * step_x))
+        cv2.line(out, (x, 0), (x, h), line_color, 1, cv2.LINE_AA)
+    # horizontal lines
+    for r in range(1, grid_n):
+        y = int(round(r * step_y))
+        cv2.line(out, (0, y), (w, y), line_color, 1, cv2.LINE_AA)
+    # cell labels at top-left of each cell
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for r in range(grid_n):
+        for c in range(grid_n):
+            x = int(round(c * step_x)) + 4
+            y = int(round(r * step_y)) + 14
+            label = f"{r},{c}"
+            cv2.putText(out, label, (x, y), font, 0.36, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(out, label, (x, y), font, 0.36, (240, 240, 240), 1, cv2.LINE_AA)
+    return out
+
+
 def parse_click_proposals(text: str) -> list[dict]:
     """Extract list of {x: float, y: float, description: str} from
     <answer>{"missed_creatures": [{"x": ..., "y": ..., "description": ...}, ...]}</answer>.
@@ -739,8 +800,27 @@ def parse_creature_click_groups(text: str) -> list[dict]:
             label = c.get("label")
             # Drop non-numeric coords (bool counts as int in Python, reject it)
             if isinstance(x, bool) or not isinstance(x, (int, float)):
-                continue
+                x = None
             if isinstance(y, bool) or not isinstance(y, (int, float)):
+                y = None
+
+            # (C) Also accept a "cell" alternative: {"cell": [row, col], "label": ...}
+            cell = c.get("cell")
+            if (x is None or y is None) and isinstance(cell, list) and len(cell) == 2:
+                r_cell, c_cell = cell
+                if not isinstance(r_cell, (int, float)) or not isinstance(c_cell, (int, float)):
+                    continue
+                if isinstance(r_cell, bool) or isinstance(c_cell, bool):
+                    continue
+                GRID_N = 10
+                r_cell = int(r_cell)
+                c_cell = int(c_cell)
+                if not (0 <= r_cell < GRID_N and 0 <= c_cell < GRID_N):
+                    continue
+                x = (c_cell + 0.5) / GRID_N
+                y = (r_cell + 0.5) / GRID_N
+
+            if x is None or y is None:
                 continue
             if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
                 continue
@@ -1167,16 +1247,24 @@ def generate_click_based_candidates(
     overlay_path = os.path.join(output_folder, "02_existing_masks.png")
     cv2.imwrite(overlay_path, overlay)
 
+    # (C) Render grid overlay on top of the existing-masks overlay
+    overlay_grid = render_grid_overlay(overlay)
+    overlay_grid_path = os.path.join(output_folder, "02_existing_masks_grid.png")
+    cv2.imwrite(overlay_grid_path, overlay_grid)
+
     # 2. Build discovery messages (new grouped-click contract)
     user_text = (
         f"The first image is the TARGET FRAME with translucent green overlays "
         f"showing masks already produced by a text-prompted detector with query "
-        f"'{initial_text_prompt}'. The subsequent images are REFERENCE FRAMES "
+        f"'{initial_text_prompt}', and a 10x10 grid overlay with cell labels 'row,col' "
+        f"(0-indexed). The subsequent images are REFERENCE FRAMES "
         f"from nearby times. Identify any creatures matching '{initial_text_prompt}' "
         f"that are visible in the TARGET FRAME but NOT covered by the green overlays. "
         f"For each missed creature, output a GROUP of click points in NORMALIZED "
         f"coordinates where (0,0) is the top-left and (1,1) is the bottom-right of "
-        f"the TARGET image. Also include a 1-5 word description and a sequential id.\n\n"
+        f"the TARGET image. You may also provide click coordinates as a cell reference "
+        f'{{\"cell\": [row, col]}} -- the click will be placed at the center of that cell. '
+        f"Also include a 1-5 word description and a sequential id.\n\n"
         f"Each click has a label: 1=FOREGROUND (on the creature) or 0=BACKGROUND "
         f"(on substrate or a neighbouring creature to EXCLUDE from segmentation).\n\n"
         f"Output format -- free-text reasoning then EXACTLY ONE trailing tag:\n"
@@ -1190,7 +1278,7 @@ def generate_click_based_candidates(
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": overlay_path},
+                {"type": "image", "image": overlay_grid_path},
                 {"type": "text", "text": user_text},
                 *[{"type": "image", "image": p} for p in neighbour_image_paths],
             ],
@@ -1300,6 +1388,227 @@ def parse_refinement_response(text: str) -> dict | None:
             good_points.append({"x": float(x), "y": float(y), "label": int(label)})
         return {"action": "refine", "add_points": good_points}
     return {"action": action, "add_points": []}
+
+
+def parse_click_refinement_response(text: str) -> dict | None:
+    """Parse a click-refinement MLLM response.
+
+    Expected tag::
+
+        <click_refine>{"action": "ok"|"move"|"drop", "new_clicks": [...]}</click_refine>
+
+    Returns::
+
+        {"action": "ok"|"move"|"drop", "new_clicks": list of {x, y, label}}
+        or None on malformed / missing tag.
+
+    * "ok"   -> keep the group unchanged.
+    * "move" -> replace with new_clicks (must be non-empty, validated same as
+                parse_creature_click_groups clicks).
+    * "drop" -> discard this creature entirely.
+    """
+    import json as _json_mod
+    import re as _re_mod
+
+    if not isinstance(text, str) or not text:
+        return None
+    _CLICK_REFINE_RE = _re_mod.compile(r"<click_refine>\s*(.*?)\s*</click_refine>", _re_mod.DOTALL)
+    matches = _CLICK_REFINE_RE.findall(text)
+    if not matches:
+        return None
+    raw = matches[-1].strip()
+    try:
+        payload = _json_mod.loads(raw)
+    except _json_mod.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    action = payload.get("action")
+    if action not in ("ok", "move", "drop"):
+        return None
+    raw_clicks = payload.get("new_clicks") or []
+    good_clicks: list[dict] = []
+    for c in raw_clicks:
+        if not isinstance(c, dict):
+            continue
+        x = c.get("x")
+        y = c.get("y")
+        label = c.get("label")
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            x = None
+        if isinstance(y, bool) or not isinstance(y, (int, float)):
+            y = None
+        # Also accept cell-based coords
+        cell = c.get("cell")
+        if (x is None or y is None) and isinstance(cell, list) and len(cell) == 2:
+            r_cell, c_cell = cell
+            if (isinstance(r_cell, (int, float)) and not isinstance(r_cell, bool)
+                    and isinstance(c_cell, (int, float)) and not isinstance(c_cell, bool)):
+                GRID_N = 10
+                r_cell = int(r_cell)
+                c_cell = int(c_cell)
+                if 0 <= r_cell < GRID_N and 0 <= c_cell < GRID_N:
+                    x = (c_cell + 0.5) / GRID_N
+                    y = (r_cell + 0.5) / GRID_N
+        if x is None or y is None:
+            continue
+        if not (0.0 <= float(x) <= 1.0 and 0.0 <= float(y) <= 1.0):
+            continue
+        if label not in (0, 1):
+            continue
+        good_clicks.append({"x": float(x), "y": float(y), "label": int(label)})
+    return {"action": action, "new_clicks": good_clicks}
+
+
+def load_click_refinement_system_prompt(profile: str) -> str:
+    """Load the click-refinement step system prompt for the requested profile.
+
+    ``profile`` is one of: 'underwater', 'general'. Other values raise ValueError.
+    """
+    valid = {"underwater", "general"}
+    if profile not in valid:
+        raise ValueError(
+            f"Unknown profile '{profile}'. Expected one of: {sorted(valid)}."
+        )
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(
+        here,
+        "sam3", "agent", "system_prompts",
+        f"system_prompt_som_click_refinement_{profile}.txt",
+    )
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def render_click_on_frame(
+    frame_bgr,
+    group: dict,
+    *,
+    grid: bool = True,
+    existing_masks: list[dict] | None = None,
+) -> "np.ndarray":
+    """Render a frame with the existing-masks overlay (if any), the proposed
+    click group markers, and optionally a 10x10 grid overlay.
+
+    Used to generate the visual presented to the MLLM during click refinement.
+    Returns a new BGR ndarray of the same shape.
+    """
+    import cv2
+    import numpy as np
+
+    out = (
+        render_existing_masks_overlay(frame_bgr, existing_masks, alpha=0.2)
+        if existing_masks
+        else frame_bgr.copy()
+    )
+    h, w = out.shape[:2]
+
+    clicks = group.get("clicks") or []
+    for click_idx, c in enumerate(clicks, start=1):
+        cx = int(round(c["x"] * w))
+        cy = int(round(c["y"] * h))
+        if int(c.get("label", 1)) == 1:
+            cv2.circle(out, (cx, cy), 12, (0, 0, 255), 2)
+            cv2.circle(out, (cx, cy), 2, (255, 255, 255), -1)
+        else:
+            cv2.drawMarker(out, (cx, cy), (255, 0, 0), cv2.MARKER_TILTED_CROSS, 20, 2)
+        cv2.putText(out, str(click_idx), (cx + 14, cy + 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, str(click_idx), (cx + 14, cy + 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+
+    if grid:
+        out = render_grid_overlay(out)
+
+    return out
+
+
+def refine_creature_clicks(
+    group: dict,
+    target_frame_bgr,
+    target_image_path: str,
+    neighbour_paths: list[str],
+    mllm_send,
+    output_folder: str,
+    click_refinement_system_prompt: str,
+    *,
+    max_iters: int = 2,
+) -> dict | None:
+    """Iteratively refine the click coordinates for one creature group.
+
+    For each iteration:
+    1. Render the target frame with the current clicks + grid overlay.
+    2. Ask the MLLM if the click is on the creature or should move.
+    3. If "ok" -> return the (possibly updated) group unchanged from this point.
+    4. If "move" -> replace clicks with new_clicks and iterate.
+    5. If "drop" -> return None (caller should remove this group).
+
+    Artefacts are saved under ``output_folder/click_refinement/<creature_id>/``.
+    Returns the (possibly updated) group, or None if the MLLM says "drop".
+    """
+    import cv2
+
+    creature_id = group.get("id", "unknown")
+    ref_dir = os.path.join(output_folder, "click_refinement", str(creature_id))
+    os.makedirs(ref_dir, exist_ok=True)
+
+    current_group = dict(group)
+
+    for iter_idx in range(max_iters):
+        # Render proposed click on frame with grid
+        rendered = render_click_on_frame(target_frame_bgr, current_group, grid=True)
+        rendered_path = os.path.join(ref_dir, f"iter_{iter_idx:02d}_proposed.png")
+        cv2.imwrite(rendered_path, rendered)
+
+        desc = current_group.get("description", "(unknown creature)")
+        clicks_text = ", ".join(
+            f"({'fg' if int(c.get('label', 1)) == 1 else 'bg'} @ {float(c['x']):.3f},{float(c['y']):.3f})"
+            for c in (current_group.get("clicks") or [])
+        ) or "(none)"
+
+        user_text = (
+            f"Creature: '{desc}'.\n"
+            f"Current click(s): {clicks_text}.\n"
+            f"The image shows the target frame with the click position(s) marked and a 10x10 grid overlay.\n"
+            f"Is the foreground click ON the creature, or should it move?\n\n"
+            f"Output exactly one trailing tag:\n"
+            f'  <click_refine>{{"action":"ok"}}</click_refine>  -- click is on the creature\n'
+            f'  <click_refine>{{"action":"move","new_clicks":[{{"x":<float>,"y":<float>,"label":1}},...]}}'
+            f'</click_refine>  -- propose a corrected click (normalised [0,1] or cell ref)\n'
+            f'  <click_refine>{{"action":"drop"}}</click_refine>  -- no creature here\n'
+            f"Brief reasoning above the tag is fine."
+        )
+        messages = [
+            {"role": "system", "content": click_refinement_system_prompt},
+            {"role": "user", "content": [
+                {"type": "image", "image": rendered_path},
+                {"type": "text", "text": user_text},
+                *[{"type": "image", "image": p} for p in (neighbour_paths or [])],
+            ]},
+        ]
+
+        resp = mllm_send(messages)
+        # Save response
+        with open(os.path.join(ref_dir, f"iter_{iter_idx:02d}_response.txt"), "w") as f:
+            f.write(resp or "")
+
+        parsed = parse_click_refinement_response(resp)
+        if parsed is None:
+            # Malformed response: treat as "ok" (conservative, keep the proposal)
+            break
+        if parsed["action"] == "ok":
+            break
+        if parsed["action"] == "drop":
+            return None
+        # action == "move"
+        new_clicks = parsed.get("new_clicks") or []
+        if not new_clicks:
+            # No usable clicks in move response: treat as "ok"
+            break
+        current_group = dict(current_group)
+        current_group["clicks"] = new_clicks
+
+    return current_group
 
 
 def load_frame_quality_system_prompt(profile: str) -> str:
@@ -1589,6 +1898,8 @@ class SomStageConfig:
     quality_check_max_replacements_per_slot: int = 5
     enable_refinement: bool = True
     max_refinement_iters: int = 2
+    enable_click_refinement: bool = True
+    max_click_refinement_iters: int = 2
 
 
 def _load_video_frame_default(video_path: str, frame_index: int):
@@ -1776,6 +2087,17 @@ def run_som_stage(
     judge_system_prompt = load_system_prompt(cfg.prompt_profile)
     discovery_system_prompt = load_click_discovery_system_prompt(cfg.prompt_profile)
 
+    # Load click-refinement prompt once (may not exist if feature disabled)
+    _click_refinement_system_prompt: str | None = None
+    if cfg.enable_click_refinement:
+        try:
+            _click_refinement_system_prompt = load_click_refinement_system_prompt(cfg.prompt_profile)
+        except FileNotFoundError:
+            print(
+                f"[som] click-refinement system prompt not found for profile "
+                f"'{cfg.prompt_profile}'; disabling click refinement."
+            )
+
     stats = {
         "targets_total": len(targets),
         "targets_processed": 0,
@@ -1850,30 +2172,133 @@ def run_som_stage(
             )
 
             if point_service is not None:
-                candidates, groups, discovery_resp = generate_click_based_candidates(
-                    target_frame_bgr=target_frame,
-                    target_image_path=target_img_path,
-                    existing_masks=existing_masks,
-                    neighbour_image_paths=discovery_nb_paths,
-                    initial_text_prompt=cfg.initial_text_prompt,
-                    discovery_system_prompt=discovery_system_prompt,
-                    output_folder=target_dir,
-                    mllm_send=send_mllm,
-                    sam3_point_service=point_service,
-                )
-                stats["mllm_calls"] += 1
+                # --- Inline discovery (split from SAM3 so click-refinement can run between) ---
+                _overlay = render_existing_masks_overlay(target_frame, existing_masks)
+                _overlay_path = os.path.join(target_dir, "02_existing_masks.png")
+                cv2.imwrite(_overlay_path, _overlay)
+                _overlay_grid = render_grid_overlay(_overlay)
+                _overlay_grid_path = os.path.join(target_dir, "02_existing_masks_grid.png")
+                cv2.imwrite(_overlay_grid_path, _overlay_grid)
 
-                # Save discovery artefacts (groups = new grouped-click contract)
+                _disc_user_text = (
+                    f"The first image is the TARGET FRAME with translucent green overlays "
+                    f"showing masks already produced by a text-prompted detector with query "
+                    f"'{cfg.initial_text_prompt}', and a 10x10 grid overlay with cell labels "
+                    f"'row,col' (0-indexed). The subsequent images are REFERENCE FRAMES "
+                    f"from nearby times. Identify any creatures matching '{cfg.initial_text_prompt}' "
+                    f"that are visible in the TARGET FRAME but NOT covered by the green overlays. "
+                    f"For each missed creature, output a GROUP of click points in NORMALIZED "
+                    f"coordinates where (0,0) is the top-left and (1,1) is the bottom-right of "
+                    f"the TARGET image. You may also provide click coordinates as a cell reference "
+                    f'{{\"cell\": [row, col]}} -- the click will be placed at the center of that cell. '
+                    f"Also include a 1-5 word description and a sequential id.\n\n"
+                    f"Each click has a label: 1=FOREGROUND (on the creature) or 0=BACKGROUND "
+                    f"(on substrate or a neighbouring creature to EXCLUDE from segmentation).\n\n"
+                    f"Output format -- free-text reasoning then EXACTLY ONE trailing tag:\n"
+                    f'<answer>{{"missed_creatures":[{{"id":1,"description":"<text>",'
+                    f'"clicks":[{{"x":<float>,"y":<float>,"label":1}},...]}},...]}}'
+                    f'</answer>\n\n'
+                    f"An empty list is valid if you see no missed creatures. Prefer fewer "
+                    f"high-confidence proposals over many uncertain ones."
+                )
+                _disc_messages = [
+                    {"role": "system", "content": discovery_system_prompt},
+                    {"role": "user", "content": [
+                        {"type": "image", "image": _overlay_grid_path},
+                        {"type": "text", "text": _disc_user_text},
+                        *[{"type": "image", "image": p} for p in discovery_nb_paths],
+                    ]},
+                ]
+                discovery_resp = send_mllm(_disc_messages)
+                stats["mllm_calls"] += 1
+                groups = parse_creature_click_groups(discovery_resp)
+
+                # Save discovery artefacts
                 with open(os.path.join(target_dir, "discovery_request.json"), "w") as f:
                     json.dump(groups, f, indent=2)
                 with open(os.path.join(target_dir, "discovery_response.txt"), "w") as f:
                     f.write(discovery_resp or "")
+
+                # --- (D) Click refinement: verify each click before sending to SAM3 ---
+                if (cfg.enable_click_refinement
+                        and _click_refinement_system_prompt is not None
+                        and groups
+                        and stats["mllm_calls"] < cfg.max_mllm_calls):
+                    refined_groups: list[dict] = []
+                    for grp in groups:
+                        if stats["mllm_calls"] >= cfg.max_mllm_calls:
+                            refined_groups.append(grp)
+                            continue
+                        # Wrap send_mllm to count calls for this group's refinement
+                        _refine_calls_for_grp = {"n": 0}
+                        def _tracked_mllm(messages, _orig=send_mllm,
+                                          _counter=_refine_calls_for_grp, **kw):
+                            _counter["n"] += 1
+                            return _orig(messages, **kw)
+                        result_grp = refine_creature_clicks(
+                            grp,
+                            target_frame,
+                            target_img_path,
+                            discovery_nb_paths,
+                            _tracked_mllm,
+                            target_dir,
+                            _click_refinement_system_prompt,
+                            max_iters=cfg.max_click_refinement_iters,
+                        )
+                        stats["mllm_calls"] += _refine_calls_for_grp["n"]
+                        if result_grp is not None:
+                            refined_groups.append(result_grp)
+                    groups = refined_groups
 
                 # Render proposed click groups → 03_proposed_clicks.png
                 clicks_vis = render_proposed_click_groups_overlay(
                     target_frame, groups, existing_masks=existing_masks
                 )
                 cv2.imwrite(os.path.join(target_dir, "03_proposed_clicks.png"), clicks_vis)
+
+                if not groups:
+                    candidates = []
+                else:
+                    # --- SAM3 click-mode per refined group ---
+                    sam_results = point_service.group_segment(
+                        target_img_path, groups, output_folder=target_dir,
+                    )
+                    candidates = []
+                    for grp, sam_out in zip(groups, sam_results):
+                        mask = sam_out["mask"]
+                        if not mask.any():
+                            candidates.append({
+                                "mask": mask,
+                                "bbox_xywh": [0, 0, 0, 0],
+                                "score": 0.0,
+                                "source_prompt": f"click_group[{grp.get('description', '')}]",
+                                "creature_id": grp.get("id"),
+                                "description": grp.get("description", ""),
+                                "clicks_used": sam_out.get("clicks_used", []),
+                                "sam_text_prompt": "",
+                                "spatial_match": sam_out["spatial_match"],
+                                "select_reason": sam_out.get("select_reason", ""),
+                            })
+                            continue
+                        ys, xs = np.where(mask)
+                        bbox = [
+                            int(xs.min()), int(ys.min()),
+                            int(xs.max() - xs.min() + 1),
+                            int(ys.max() - ys.min() + 1),
+                        ]
+                        candidates.append({
+                            "mask": mask,
+                            "bbox_xywh": bbox,
+                            "score": float(sam_out["score"]),
+                            "source_prompt": f"click_group[{grp.get('description', '')}]",
+                            "creature_id": grp.get("id"),
+                            "description": grp.get("description", ""),
+                            "clicks_used": sam_out.get("clicks_used", []),
+                            "sam_text_prompt": "",
+                            "spatial_match": sam_out["spatial_match"],
+                            "select_reason": sam_out.get("select_reason", ""),
+                            "area_px": sam_out.get("area_px", int(mask.sum())),
+                        })
             else:
                 # No point service provided (test / fallback): skip discovery
                 candidates = []

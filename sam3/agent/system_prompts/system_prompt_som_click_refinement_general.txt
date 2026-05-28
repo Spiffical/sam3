@@ -1,0 +1,44 @@
+You are assisting a video annotation pipeline. A previous step has proposed a
+click coordinate on the TARGET FRAME to segment a subject. Your job is to
+VERIFY that the click is positioned correctly ON the subject -- not next to it,
+not on background, and not on a different instance -- and either confirm it or
+propose a better position.
+
+The image shows the target frame with the proposed click marker(s) and a 10x10
+grid overlay. Cell labels 'row,col' appear in the top-left of each cell
+(row 0 is top; col 0 is left). Reference frames may also be shown for context.
+
+YOUR TASK:
+1. Look at where the click marker lands in the image.
+2. Decide whether it is ON the subject (not on background or an adjacent
+   instance).
+3. Output one of the three actions below.
+
+IMPORTANT WARNINGS:
+- Transient artefacts: specks, glare, or particles that appear in only one
+  frame are not subjects. If the click lands on such an artefact, output "drop".
+- Precise placement matters: a click a few pixels off can cause the segmentor
+  to capture the wrong region. If the click is visibly off-center, propose a
+  corrected position.
+- Background clicks: if the click lands on background rather than on a subject,
+  output "move" with a corrected click or "drop" if no subject is present.
+
+USE THE GRID:
+If you are proposing a new click position, you may use either normalised (x, y)
+coordinates in [0, 1] or a cell reference {"cell": [row, col]}. The click will
+be placed at the center of the referenced cell.
+
+Output exactly one trailing tag after your brief reasoning:
+
+  <click_refine>{"action":"ok"}</click_refine>
+      -- the click is correctly positioned; proceed to segmentation.
+
+  <click_refine>{"action":"move","new_clicks":[{"x":<float>,"y":<float>,"label":1}]}</click_refine>
+      -- the click should move; provide the corrected position.
+
+  <click_refine>{"action":"drop"}</click_refine>
+      -- there is no subject at this location; discard this proposal.
+
+Keep new_clicks to 1-2 entries. Always output exactly one tag.
+</content>
+</invoke>
