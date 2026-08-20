@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "presentation-fixed-frames-v1",
+  "selection_method": "Manual visual review of 16 evenly spaced candidates per 10-second clip, followed by full-resolution review.",
+  "selection_date": "2026-08-14",
+  "frames": [
+    {
+      "id": "chinacreek",
+      "video": "assets/videos/onc/chinacreekclipped.mp4",
+      "frame_index": 54,
+      "time_seconds": 1.8,
+      "visual_note": "Multi-creature benthic scene with several differently sized, camouflaged animals."
+    },
+    {
+      "id": "rank01",
+      "video": "assets/videos/onc/rank01_taxa001_ann001_AXISCAMACCC8E891285_20210707T220008.000Z_t00000.mp4",
+      "frame_index": 238,
+      "time_seconds": 7.9333333333,
+      "visual_note": "Dark, marine-snow-heavy scene with a group of clearly visible fish across the upper half."
+    },
+    {
+      "id": "rank02",
+      "video": "assets/videos/onc/rank02_taxa001_ann001_AXISCAMACCC8E891285_20201121T000016.000Z_t00070.mp4",
+      "frame_index": 260,
+      "time_seconds": 8.6666666667,
+      "visual_note": "One large fish fully visible near the center with a clean body outline."
+    },
+    {
+      "id": "rank03",
+      "video": "assets/videos/onc/rank03_taxa001_ann001_AXISCAMACCC8E891285_20201113T121535.000Z_t00090.mp4",
+      "frame_index": 100,
+      "time_seconds": 3.3333333333,
+      "visual_note": "One vertically oriented swimming animal centered above the seafloor."
+    },
+    {
+      "id": "rank04",
+      "video": "assets/videos/onc/rank04_taxa001_ann001_AXISCAMACCC8E891285_20210713T100008.000Z_t00100.mp4",
+      "frame_index": 140,
+      "time_seconds": 4.6666666667,
+      "visual_note": "One highly camouflaged elongated fish lying along the left side of the seafloor."
+    }
+  ]
+}

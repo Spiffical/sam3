@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "seatube-annotation-matching-one-few-many-v1",
+  "selection_method": "Manual temporal review of source videos, followed by exact or explicitly bounded annotation-time selection. These samples remain fixed across segmentation and matching experiments.",
+  "samples": [
+    {
+      "id": "seatube_one_rockfish",
+      "difficulty": "one",
+      "metadata_file": "/home/sbialek/ONC/seatube-downloader/downloads/stationary2335_worms/matched_annotations.json",
+      "video": "/home/sbialek/ONC/seatube-downloader/downloads/stationary2335_worms/videos/AXISCAMACCC8E891285_20201121T000016.000Z.mp4",
+      "archive_filename": "AXISCAMACCC8E891285_20201121T000016.000Z.mp4",
+      "target_time_seconds": 77.0,
+      "annotation_tolerance_seconds": 0.05,
+      "creator_user_id": 140400,
+      "expected_annotation_candidates": 1,
+      "visual_note": "Single large, clearly visible rockfish-family animal; exact SeaTube annotation time."
+    },
+    {
+      "id": "seatube_few_anemone_stars",
+      "difficulty": "few",
+      "metadata_file": "/home/sbialek/ONC/seatube-downloader/downloads/fulltest_worms_dive6370/matched_annotations.json",
+      "video": "/home/sbialek/ONC/seatube-downloader/downloads/fulltest_worms_dive6370/videos/HERCULESROVINSPACZEUSPLUS_20230629T074811.000Z-1500.mp4",
+      "archive_filename": "HERCULESROVINSPACZEUSPLUS_20230629T074811.000Z-1500.mp4",
+      "target_time_seconds": 366.0,
+      "annotation_tolerance_seconds": 0.05,
+      "creator_user_id": 145400,
+      "expected_annotation_candidates": 1,
+      "visual_note": "Large pink anemone plus several small sea stars. The sole candidate is Calder Guimond's exact-frame anemone annotation; the stars intentionally remain unmatched rather than mixing in a second annotator."
+    },
+    {
+      "id": "seatube_many_pelagic",
+      "difficulty": "many",
+      "metadata_file": "/home/sbialek/ONC/seatube-downloader/downloads/dive1473_worms/matched_annotations.json",
+      "video": "/home/sbialek/ONC/seatube-downloader/downloads/dive1473_worms/videos/INSITEZEUSPLUS_DEEPDISCOVERER_20190706T215502.000Z-LOW.mp4",
+      "archive_filename": "INSITEZEUSPLUS_DEEPDISCOVERER_20190706T215502.000Z-LOW.mp4",
+      "target_time_seconds": 299.0,
+      "annotation_tolerance_seconds": 0.05,
+      "creator_user_id": 113530,
+      "expected_annotation_candidates": 13,
+      "visual_note": "Many clearly visible small pelagic animals; thirteen SeaTube annotation events share the exact target timestamp. Selected after visual comparison with four high-density alternatives."
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "taxonomy_filter": {
+    "taxonomy_code": "WoRMS",
+    "taxonomy_id": 1
+  },
+  "exports": [
+    {
+      "name": "Dive 1473",
+      "metadata_file": "/home/sbialek/ONC/seatube-downloader/downloads/dive1473_worms/matched_annotations.json"
+    },
+    {
+      "name": "Dive 6370",
+      "metadata_file": "/home/sbialek/ONC/seatube-downloader/downloads/fulltest_worms_dive6370/matched_annotations.json"
+    },
+    {
+      "name": "Stationary 2335",
+      "metadata_file": "/home/sbialek/ONC/seatube-downloader/downloads/stationary2335_worms/matched_annotations.json"
+    }
+  ]
+}

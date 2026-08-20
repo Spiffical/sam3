@@ -87,6 +87,7 @@ celerybeat-schedule
 *.sage.py
 
 # Environments
+.venv/
 env/
 ENV/
 env.bak/
@@ -150,8 +151,10 @@ Thumbs.db
 
 assets/videos/test*
 assets/videos/china*
+assets/videos/onc/
 assets/annotations
 assets/yolo_dataset*
+nibi_downloads/
 sam3_video_agent_out
 .env
 
@@ -159,4 +162,13 @@ debug_crops/
 videos/
 frame_0.jpg
 output_video.mp4
+output/
+outputs/
 drac_command.md
+
+# host-specific notes and tooling — local only, never committed
+AGENTS.md
+START_HERE_FOR_LLM.txt
+docs/DEVELOPMENT_WORKFLOW.md
+scripts/sync_to_gpu.sh
+scripts/gpu_python.sh

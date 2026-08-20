@@ -105,8 +105,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "the every-frame script.")
 
     # Anthropic / MLLM
+    # Claude Fable 5 is the recommended vision model: in the click-engine
+    # experiments it lifted e2e recall 0.874 -> 0.977 with fewer strays vs Sonnet
+    # 4.6 (see docs/click_engine_report.md). Override via --claude-model or
+    # ANTHROPIC_MODEL (e.g. claude-sonnet-4-6) if cost/availability requires.
     p.add_argument("--claude-model",
-                   default=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"))
+                   default=os.environ.get("ANTHROPIC_MODEL", "claude-fable-5"))
     p.add_argument("--max-completion-tokens", type=int, default=2048)
     p.add_argument("--image-detail", default="high", choices=["low", "high"])
     p.add_argument("--max-images-per-request", type=int, default=8)

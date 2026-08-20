@@ -693,6 +693,10 @@ def agent_inference(
     call_sam_service=call_sam_service,
     max_generations: int = 100,
     output_dir="../../sam3_agent_out",
+    initial_outputs: dict | None = None,
+    initial_text_prompts: list[str] | None = None,
+    verification_only: bool = False,
+    verification_context_images: list[str] | None = None,
 ):
     """
     Given a text prompt and an image, this tool will perform all aspects of agentic problem solving,
@@ -715,9 +719,7 @@ def agent_inference(
     # init variables
     PATH_TO_LATEST_OUTPUT_JSON = ""
     LATEST_SAM3_TEXT_PROMPT = ""
-    USED_TEXT_PROMPTS = (
-        set()
-    )  # Track all previously used text prompts for segment_phrase
+    USED_TEXT_PROMPTS = set(initial_text_prompts or [])
     generation_count = 0  # Counter for number of send_generate_request calls
 
     # debug setup
@@ -736,24 +738,90 @@ def agent_inference(
         iterative_checking_system_prompt,
         prompt_profile,
     ) = _load_system_prompts(current_dir)
+    if verification_only:
+        system_prompt = _read_prompt_file(
+            os.path.join(
+                current_dir,
+                "system_prompts/system_prompt_proposal_verification.txt",
+            )
+        )
     print(f"> Prompt profile: {prompt_profile}")
 
+    seeded_outputs = None
+    if initial_outputs is not None:
+        seeded_outputs = {
+            "original_image_path": img_path,
+            "orig_img_h": int(initial_outputs["orig_img_h"]),
+            "orig_img_w": int(initial_outputs["orig_img_w"]),
+            "pred_boxes": list(initial_outputs.get("pred_boxes", [])),
+            "pred_scores": list(initial_outputs.get("pred_scores", [])),
+            "pred_masks": list(initial_outputs.get("pred_masks", [])),
+        }
+        seeded_outputs = remove_overlapping_masks(seeded_outputs)
+        if seeded_outputs["pred_masks"]:
+            state_json_path, _ = _build_state_snapshot_paths(
+                sam_output_dir, img_path, "available_masks_seeded_proposals"
+            )
+            seeded_outputs = _persist_available_outputs(
+                seeded_outputs, state_json_path
+            )
+            PATH_TO_LATEST_OUTPUT_JSON = state_json_path
+
     # Construct the initial message list
+    initial_user_content = [
+        {"type": "image", "image": img_path},
+        {
+            "type": "text",
+            "text": f"The first image is the raw selected frame. The initial user input query is: '{initial_text_prompt}'.",
+        },
+    ]
+    for context_image in verification_context_images or []:
+        initial_user_content.extend(
+            [
+                {
+                    "type": "text",
+                    "text": "Adjacent video frames for temporal context:",
+                },
+                {"type": "image", "image": context_image},
+            ]
+        )
+    if seeded_outputs is not None and seeded_outputs.get("pred_masks"):
+        initial_user_content.extend(
+            [
+                {
+                    "type": "text",
+                    "text": (
+                        f"The final image contains all {len(seeded_outputs['pred_masks'])} "
+                        "deterministically generated, filtered, and numbered proposals. "
+                        "Return the subset that depicts visible biological life."
+                    ),
+                },
+                {"type": "image", "image": seeded_outputs["output_image_path"]},
+            ]
+        )
     messages = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
-            "content": [
-                {"type": "image", "image": img_path},
-                {
-                    "type": "text",
-                    "text": f"The above image is the raw input image. The initial user input query is: '{initial_text_prompt}'.",
-                },
-            ],
+            "content": initial_user_content,
         },
     ]
     print(f"> Text prompt: {initial_text_prompt}")
     print(f"> Image path: {img_path}")
+
+    if verification_only and (
+        seeded_outputs is None or not seeded_outputs.get("pred_masks")
+    ):
+        height, width = cv2.imread(img_path).shape[:2]
+        final_outputs = {
+            "original_image_path": img_path,
+            "orig_img_h": height,
+            "orig_img_w": width,
+            "pred_boxes": [],
+            "pred_scores": [],
+            "pred_masks": [],
+        }
+        return messages, final_outputs, Image.open(img_path)
 
     print("\n\n")
     print("-" * 30 + f" Round {str(generation_count + 1)}" + "-" * 30)
@@ -765,7 +833,27 @@ def agent_inference(
         save_debug_messages(messages, debug, debug_folder_path, debug_jsonl_path)
         parsed_tool_call = _parse_tool_call_from_generated_text(generated_text)
         if parsed_tool_call is None:
-            malformed_tool_call_retries += 1
+            if verification_only:
+                available_masks = _safe_count_available_masks(
+                    PATH_TO_LATEST_OUTPUT_JSON
+                ) or 0
+                tool_call = {
+                    "name": "select_masks_and_return",
+                    "parameters": {
+                        "final_answer_masks": list(
+                            range(1, available_masks + 1)
+                        )
+                    },
+                }
+                generated_text = _make_tool_call_text(tool_call)
+                print(
+                    "⚠️ Proposal verifier returned malformed output; "
+                    "using the recall-safe select-all fallback without another API call."
+                )
+                parsed_tool_call = (tool_call, generated_text)
+            else:
+                malformed_tool_call_retries += 1
+        if parsed_tool_call is None:
             if malformed_tool_call_retries > 3:
                 fallback_tool = _build_malformed_tool_call_fallback(
                     path_to_latest_output_json=PATH_TO_LATEST_OUTPUT_JSON,
@@ -838,6 +926,33 @@ def agent_inference(
         else:
             malformed_tool_call_retries = 0
             tool_call, generated_text = parsed_tool_call
+
+        if verification_only and tool_call["name"] != "select_masks_and_return":
+            available_masks = _safe_count_available_masks(
+                PATH_TO_LATEST_OUTPUT_JSON
+            ) or 0
+            if tool_call["name"] == "drop_masks":
+                requested_drops = set(
+                    tool_call.get("parameters", {}).get(
+                        "mask_indices_to_drop", []
+                    )
+                )
+                final_indices = [
+                    index
+                    for index in range(1, available_masks + 1)
+                    if index not in requested_drops
+                ]
+            else:
+                final_indices = list(range(1, available_masks + 1))
+            tool_call = {
+                "name": "select_masks_and_return",
+                "parameters": {"final_answer_masks": final_indices},
+            }
+            generated_text = _make_tool_call_text(tool_call)
+            print(
+                "⚠️ Proposal verifier requested a non-final tool; converted its "
+                "decision to one final selection without another API call."
+            )
 
         if PATH_TO_LATEST_OUTPUT_JSON == "":
             # The first tool call must be segment_phrase or report_no_mask

@@ -1337,6 +1337,16 @@ class ParseCreatureClickGroupsTests(unittest.TestCase):
         labels = [c["label"] for c in result[0]["clicks"]]
         self.assertEqual(labels, [1, 0])
 
+    def test_background_only_group_is_rejected(self):
+        text = (
+            '<answer>{"missed_creatures":['
+            '{"id":1,"description":"not a target","clicks":['
+            '{"x":0.5,"y":0.5,"label":0}'
+            ']}'
+            ']}</answer>'
+        )
+        self.assertEqual(parse_creature_click_groups(text), [])
+
     def test_out_of_range_coords_filtered(self):
         text = (
             '<answer>{"missed_creatures":['

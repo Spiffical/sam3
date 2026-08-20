@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "seatube-meagan-five-exact-annotation-frames-v1",
+  "selection_manifest": "/home/sbialek/ONC/seatube-downloader/downloads/sam3_seatube_matching_v1/meagan_five_clips_v1/selection_manifest.json",
+  "selection_method": "Five manually reviewed 10-second SeaTube clips from one annotator. Each benchmark frame is the decoded frame nearest the annotation-centered 5-second instant.",
+  "creator_user_id": 44113,
+  "creator_name": "Meagan Putts",
+  "taxonomy": "WoRMS",
+  "frames": [
+    {
+      "id": "01_isolated_crab",
+      "video": "/home/sbialek/ONC/seatube-downloader/downloads/sam3_seatube_matching_v1/meagan_five_clips_v1/01_isolated_crab/clip_10s.mp4",
+      "frame_index": 150,
+      "time_seconds": 5.005,
+      "sam3_proposal_prompts": ["small creatures", "crabs", "Brachyura"],
+      "proposal_exclusion_regions_xyxy_normalized": [[0.0, 0.0, 0.36, 0.12]],
+      "visual_note": "Large isolated crab against rock; easy single-creature control case."
+    },
+    {
+      "id": "02_seastars_on_coral",
+      "video": "/home/sbialek/ONC/seatube-downloader/downloads/sam3_seatube_matching_v1/meagan_five_clips_v1/02_seastars_on_coral/clip_10s.mp4",
+      "frame_index": 300,
+      "time_seconds": 5.005,
+      "sam3_proposal_prompts": ["small creatures", "coral", "branching coral", "Enallopsammia rostrata"],
+      "proposal_exclusion_regions_xyxy_normalized": [[0.0, 0.0, 0.36, 0.12]],
+      "visual_note": "Several curled sea stars on a branching stony coral; moderate overlap and fine boundaries."
+    },
+    {
+      "id": "03_anemone_tubeworm_field",
+      "video": "/home/sbialek/ONC/seatube-downloader/downloads/sam3_seatube_matching_v1/meagan_five_clips_v1/03_anemone_tubeworm_field/clip_10s.mp4",
+      "frame_index": 300,
+      "time_seconds": 5.005,
+      "sam3_proposal_prompts": ["sea anemone", "small fish", "Actiniaria", "Lamellibrachia", "Decapoda"],
+      "proposal_exclusion_regions_xyxy_normalized": [[0.0, 0.0, 0.36, 0.12]],
+      "visual_note": "Multiple anemones and red tube-associated animals in a moving-camera scene."
+    },
+    {
+      "id": "04_dense_coral_thicket",
+      "video": "/home/sbialek/ONC/seatube-downloader/downloads/sam3_seatube_matching_v1/meagan_five_clips_v1/04_dense_coral_thicket/clip_10s.mp4",
+      "frame_index": 300,
+      "time_seconds": 5.005,
+      "sam3_proposal_prompts": ["small creatures", "coral", "branching coral", "sea fan", "sponge", "Amphianthus", "Comatulida", "Ophiacanthidae", "Parazoanthidae"],
+      "proposal_exclusion_regions_xyxy_normalized": [[0.0, 0.0, 0.36, 0.12]],
+      "visual_note": "Dense whip/coral thicket with many fine branches, occlusions, and overlapping organisms."
+    },
+    {
+      "id": "05_wide_coral_garden",
+      "video": "/home/sbialek/ONC/seatube-downloader/downloads/sam3_seatube_matching_v1/meagan_five_clips_v1/05_wide_coral_garden/clip_10s.mp4",
+      "frame_index": 300,
+      "time_seconds": 5.005,
+      "sam3_proposal_prompts": ["small creatures", "coral", "branching coral", "sea fan", "sponge", "Walteria", "Chrysogorgia"],
+      "proposal_exclusion_regions_xyxy_normalized": [[0.0, 0.0, 0.36, 0.12]],
+      "visual_note": "Wide crowded coral garden containing many spatially separated organisms at varied scales."
+    }
+  ]
+}

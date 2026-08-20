@@ -34,6 +34,8 @@ send_generate_request_orig = None
 sam3_inference = None
 remove_overlapping_masks = None
 visualize = None
+build_proposal_union = None
+parse_normalized_region = None
 analyze_frame_quality = None
 scan_video_frame_quality = None
 discover_invalid_frames_with_mllm = None
@@ -45,6 +47,7 @@ def ensure_runtime_deps() -> None:
     global Sam3Processor, build_sam3_image_model
     global agent_inference, send_generate_request_orig
     global sam3_inference, remove_overlapping_masks, visualize
+    global build_proposal_union, parse_normalized_region
     global analyze_frame_quality, scan_video_frame_quality
     global discover_invalid_frames_with_mllm
     global encode_binary_mask_to_rle
@@ -92,6 +95,10 @@ def ensure_runtime_deps() -> None:
             sam3_inference as _sam3_inference,
         )
         from sam3.agent.viz import visualize as _visualize
+        from sam3.agent.proposal_bank import (
+            build_proposal_union as _build_proposal_union,
+            parse_normalized_region as _parse_normalized_region,
+        )
         from frame_quality import (
             analyze_frame_quality as _analyze_frame_quality,
             scan_video_frame_quality as _scan_video_frame_quality,
@@ -112,6 +119,8 @@ def ensure_runtime_deps() -> None:
         remove_overlapping_masks = _remove_overlapping_masks
         sam3_inference = _sam3_inference
         visualize = _visualize
+        build_proposal_union = _build_proposal_union
+        parse_normalized_region = _parse_normalized_region
         analyze_frame_quality = _analyze_frame_quality
         scan_video_frame_quality = _scan_video_frame_quality
         discover_invalid_frames_with_mllm = _discover_invalid_frames_with_mllm
@@ -270,6 +279,69 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="Maximum agent generations per frame. Default: 20",
+    )
+    parser.add_argument(
+        "--proposal-prompt",
+        action="append",
+        default=[],
+        help=(
+            "Deterministic SAM3 proposal phrase to run before the MLLM; may be "
+            "repeated. Proposals are unioned before review."
+        ),
+    )
+    parser.add_argument(
+        "--proposal-exclude-region",
+        action="append",
+        default=[],
+        metavar="X1,Y1,X2,Y2",
+        help=(
+            "Normalized region containing a known logo/overlay. Proposals mostly "
+            "inside it are suppressed; may be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--proposal-exclusion-overlap",
+        type=float,
+        default=0.80,
+        help="Minimum proposal-box fraction inside an exclusion region. Default: 0.80",
+    )
+    parser.add_argument(
+        "--proposal-iom-threshold",
+        type=float,
+        default=0.30,
+        help="Intersection-over-minimum threshold for proposal deduplication. Default: 0.30",
+    )
+    parser.add_argument(
+        "--proposal-fragment-merge-prompt",
+        action="append",
+        default=[],
+        help=(
+            "Evidence-backed prompt whose bbox-overlapping mask fragments should "
+            "be stitched into one instance; may be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--proposal-fragment-bbox-iom-threshold",
+        type=float,
+        default=0.15,
+        help="BBox IoM threshold for opt-in fragment stitching. Default: 0.15",
+    )
+    parser.add_argument(
+        "--verification-only",
+        action="store_true",
+        help=(
+            "After the deterministic proposal bank, make exactly one MLLM request "
+            "that selects the biological proposals without further SAM3 calls."
+        ),
+    )
+    parser.add_argument(
+        "--verification-context-image",
+        action="append",
+        default=[],
+        help=(
+            "Adjacent-frame collage to show during proposal verification; may be "
+            "repeated. Intended for fixed-frame runs."
+        ),
     )
     parser.add_argument(
         "--image-detail",
@@ -655,6 +727,65 @@ class LocalSam3Service:
         return output_json_path
 
 
+def prepare_deterministic_proposals(
+    *,
+    local_service: LocalSam3Service,
+    image_path: str,
+    prompts: list[str],
+    output_dir: str,
+    exclusion_regions: list[tuple[float, float, float, float]],
+    exclusion_overlap_fraction: float,
+    iom_threshold: float,
+    fragment_merge_prompts: list[str],
+    fragment_bbox_iom_threshold: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run every phrase before review and persist the filtered proposal union."""
+    bank_dir = os.path.join(output_dir, "proposal_bank")
+    os.makedirs(bank_dir, exist_ok=True)
+    prompt_outputs: list[tuple[str, dict[str, Any]]] = []
+    for prompt in prompts:
+        output_json_path = local_service.call_service(
+            image_path=image_path,
+            text_prompt=prompt,
+            output_folder_path=os.path.join(bank_dir, "per_prompt"),
+        )
+        with open(output_json_path, "r", encoding="utf-8") as handle:
+            prompt_outputs.append((prompt, json.load(handle)))
+
+    union_outputs, report = build_proposal_union(
+        prompt_outputs,
+        image_path=image_path,
+        exclusion_regions=exclusion_regions,
+        exclusion_overlap_fraction=exclusion_overlap_fraction,
+        iom_threshold=iom_threshold,
+        fragment_merge_prompts=fragment_merge_prompts,
+        fragment_bbox_iom_threshold=fragment_bbox_iom_threshold,
+    )
+    union_json_path = os.path.join(bank_dir, "proposal_union.json")
+    union_overlay_path = os.path.join(bank_dir, "proposal_union.png")
+    persisted = {"output_image_path": union_overlay_path, **union_outputs}
+    with open(union_json_path, "w", encoding="utf-8") as handle:
+        json.dump(persisted, handle, indent=2)
+        handle.write("\n")
+    if persisted["pred_masks"]:
+        visualize(persisted).save(union_overlay_path)
+    else:
+        Image.open(image_path).convert("RGB").save(union_overlay_path)
+
+    report.update(
+        {
+            "proposal_union_json": union_json_path,
+            "proposal_union_overlay": union_overlay_path,
+        }
+    )
+    with open(
+        os.path.join(bank_dir, "proposal_report.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+    return union_outputs, report
+
+
 def history_segment_prompts(history: list[dict[str, Any]]) -> list[str]:
     prompts: list[str] = []
     seen: set[str] = set()
@@ -769,6 +900,41 @@ def _summarize_llm_backend(args: argparse.Namespace) -> dict[str, str]:
 def main() -> int:
     args = parse_args()
     ensure_runtime_deps()
+    proposal_prompts = list(
+        dict.fromkeys(
+            prompt.strip() for prompt in args.proposal_prompt if prompt.strip()
+        )
+    )
+    if args.verification_only and not proposal_prompts:
+        raise ValueError("--verification-only requires at least one --proposal-prompt")
+    proposal_exclusion_regions = [
+        parse_normalized_region(value) for value in args.proposal_exclude_region
+    ]
+    if not 0.0 <= float(args.proposal_exclusion_overlap) <= 1.0:
+        raise ValueError("--proposal-exclusion-overlap must be between 0 and 1")
+    if not 0.0 <= float(args.proposal_iom_threshold) <= 1.0:
+        raise ValueError("--proposal-iom-threshold must be between 0 and 1")
+    fragment_merge_prompts = list(
+        dict.fromkeys(
+            prompt.strip()
+            for prompt in args.proposal_fragment_merge_prompt
+            if prompt.strip()
+        )
+    )
+    if not 0.0 <= float(args.proposal_fragment_bbox_iom_threshold) <= 1.0:
+        raise ValueError(
+            "--proposal-fragment-bbox-iom-threshold must be between 0 and 1"
+        )
+    verification_context_images = [
+        str(Path(value).resolve()) for value in args.verification_context_image
+    ]
+    missing_context = [
+        value for value in verification_context_images if not os.path.isfile(value)
+    ]
+    if missing_context:
+        raise FileNotFoundError(
+            f"verification context image(s) do not exist: {missing_context}"
+        )
 
     output_video_path, summary_path, frame_results_path, frame_outputs_path = (
         make_output_paths(args)
@@ -984,8 +1150,26 @@ def main() -> int:
                     "pred_masks": [],
                     "pred_scores": [],
                 }
+                proposal_report: dict[str, Any] = {}
 
                 try:
+                    initial_outputs = None
+                    if proposal_prompts:
+                        initial_outputs, proposal_report = prepare_deterministic_proposals(
+                            local_service=local_service,
+                            image_path=frame_path,
+                            prompts=proposal_prompts,
+                            output_dir=frame_agent_dir,
+                            exclusion_regions=proposal_exclusion_regions,
+                            exclusion_overlap_fraction=float(
+                                args.proposal_exclusion_overlap
+                            ),
+                            iom_threshold=float(args.proposal_iom_threshold),
+                            fragment_merge_prompts=fragment_merge_prompts,
+                            fragment_bbox_iom_threshold=float(
+                                args.proposal_fragment_bbox_iom_threshold
+                            ),
+                        )
                     history, final_outputs, rendered_img = agent_inference(
                         img_path=frame_path,
                         initial_text_prompt=args.prompt,
@@ -994,6 +1178,10 @@ def main() -> int:
                         call_sam_service=local_service.call_service,
                         max_generations=int(args.max_generations),
                         output_dir=frame_agent_dir,
+                        initial_outputs=initial_outputs,
+                        initial_text_prompts=proposal_prompts,
+                        verification_only=bool(args.verification_only),
+                        verification_context_images=verification_context_images,
                     )
                     overlaid_frame = pil_to_bgr(rendered_img)
                 except Exception as exc:
@@ -1029,6 +1217,8 @@ def main() -> int:
                     "frame_index": int(frame_index),
                     "num_masks": int(num_masks),
                     "segment_prompts": segment_prompts,
+                    "proposal_prompts": proposal_prompts,
+                    "proposal_report": proposal_report,
                     "history_len": int(len(history)),
                     "frame_runtime_sec": float(time.time() - frame_start),
                     "error": frame_error,
@@ -1077,6 +1267,18 @@ def main() -> int:
         **_summarize_llm_backend(args),
         "device": args.device,
         "max_generations": int(args.max_generations),
+        "proposal_prompts": proposal_prompts,
+        "proposal_exclusion_regions_xyxy_normalized": [
+            list(region) for region in proposal_exclusion_regions
+        ],
+        "proposal_exclusion_overlap": float(args.proposal_exclusion_overlap),
+        "proposal_iom_threshold": float(args.proposal_iom_threshold),
+        "proposal_fragment_merge_prompts": fragment_merge_prompts,
+        "proposal_fragment_bbox_iom_threshold": float(
+            args.proposal_fragment_bbox_iom_threshold
+        ),
+        "verification_only": bool(args.verification_only),
+        "verification_context_images": verification_context_images,
         "max_completion_tokens": int(args.max_completion_tokens),
         "image_detail": str(args.image_detail),
         "max_images_per_request": int(args.max_images_per_request),

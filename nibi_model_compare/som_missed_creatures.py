@@ -828,8 +828,11 @@ def parse_creature_click_groups(text: str) -> list[dict]:
                 continue
             good_clicks.append({"x": float(x), "y": float(y), "label": int(label)})
 
-        if not good_clicks:
-            continue  # creature has no usable clicks — drop it
+        if not any(click["label"] == 1 for click in good_clicks):
+            # A background-only group cannot seed a target mask. Negative
+            # clicks constrain one positive target; they are not standalone
+            # discovery proposals.
+            continue
 
         desc = item.get("description")
         if not isinstance(desc, str):
